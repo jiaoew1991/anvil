@@ -1,0 +1,357 @@
+syntax = "proto3";
+
+package anvil;
+
+option java_outer_classname = "AnvilProto";
+
+// ============================================================================
+// Anvil Service Definition (Protocol v2)
+//
+// Hot-path RPCs are unified:
+//   - Claim:            replaces Claim + ClaimFromGroup
+//   - Complete:         replaces Ack + Nack + AckAndForward + AckAndScatter
+//   - Push:             replaces Push + PushBatch
+//   - ClaimAndComplete: new combined RPC (halves round trips)
+//
+// Cold-path RPCs (admin, state, heartbeat) are unchanged.
+// ============================================================================
+
+service Anvil {
+  // === Unified Hot Path ===
+
+  // Claim messages from a queue or queue group
+  rpc Claim(ClaimRequest) returns (ClaimResponse);
+
+  // Complete message processing: ack, nack, forward, or scatter
+  rpc Complete(CompleteRequest) returns (CompleteResponse);
+
+  // Push one or more messages to a queue
+  rpc Push(PushRequest) returns (PushResponse);
+
+  // Combined: complete previous batch + claim next batch in one round trip
+  rpc ClaimAndComplete(ClaimAndCompleteRequest) returns (ClaimAndCompleteResponse);
+
+  // === Heartbeat ===
+
+  // Worker heartbeat to maintain lease
+  rpc HeartbeatStream(stream HeartbeatPing) returns (stream HeartbeatPong);
+
+  // === State API ===
+
+  // Get state values by keys
+  rpc StateGet(StateGetRequest) returns (StateGetResponse);
+
+  // Put/delete state values
+  rpc StatePut(StatePutRequest) returns (StatePutResponse);
+
+  // === Admin API ===
+
+  rpc CreateQueue(CreateQueueRequest) returns (CreateQueueResponse);
+  rpc DeleteQueue(DeleteQueueRequest) returns (DeleteQueueResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+
+  // === Queue Completion API ===
+
+  rpc MarkQueueFinished(MarkQueueFinishedRequest) returns (MarkQueueFinishedResponse);
+  rpc IsQueueFinished(IsQueueFinishedRequest) returns (IsQueueFinishedResponse);
+
+  // === QueueGroup API ===
+
+  rpc CreateQueueGroup(CreateQueueGroupRequest) returns (CreateQueueGroupResponse);
+  rpc IsGroupFinished(IsGroupFinishedRequest) returns (IsGroupFinishedResponse);
+  rpc GetGroupStats(GetGroupStatsRequest) returns (GetGroupStatsResponse);
+  rpc MarkGroupFinished(MarkGroupFinishedRequest) returns (MarkGroupFinishedResponse);
+}
+
+// ============================================================================
+// Unified Claim (replaces Claim + ClaimFromGroup)
+// ============================================================================
+
+message ClaimRequest {
+  oneof source {
+    string queue = 1;                    // plain queue claim
+    GroupClaimSource group = 2;          // group claim (broker picks partition)
+  }
+  string worker_id = 3;
+  string lease_id = 4;
+  int32 batch_size = 5;
+  int32 timeout_ms = 6;
+}
+
+message GroupClaimSource {
+  string group_name = 1;
+  repeated int32 assigned_partitions = 2;
+  bool allow_steal = 3;
+  int64 steal_pending_threshold = 4;
+}
+
+// Slim message — no queue (caller knows), no created_at (unused by workers)
+message ClaimMessage {
+  string msg_id = 1;
+  bytes payload = 2;
+  map<string, string> metadata = 3;
+  string claim_token = 4;               // inline with message (was separate list)
+}
+
+message ClaimResponse {
+  repeated ClaimMessage messages = 1;
+  bool has_more = 2;
+  // Group claim info (empty for plain queue claims)
+  string source_queue = 3;
+  int32 source_partition = 4;
+}
+
+// ============================================================================
+// Unified Complete (replaces Ack + Nack + AckAndForward + AckAndScatter)
+// ============================================================================
+
+message CompleteRequest {
+  string upstream_queue = 1;
+  repeated string msg_ids = 2;
+  repeated string claim_tokens = 3;
+  string worker_id = 4;
+  string lease_id = 5;
+
+  oneof action {
+    AckAction ack = 6;                   // acknowledge (delete messages)
+    ForwardAction forward = 7;           // ack + push to single downstream queue
+    ScatterAction scatter = 8;           // ack + push to partition group
+    NackAction nack = 9;                 // return messages to queue
+  }
+
+  // Optional atomic state update (applied with any action)
+  StateUpdate state = 10;
+}
+
+message AckAction {}                     // just ack, no downstream
+
+message ForwardAction {
+  string downstream_queue = 1;
+  repeated bytes payloads = 2;
+}
+
+message ScatterAction {
+  string group_name = 1;
+  repeated PartitionPayload partitions = 2;
+}
+
+message NackAction {}                    // return to queue for retry
+
+message StateUpdate {
+  string namespace = 1;
+  map<string, bytes> puts = 2;
+  repeated string deletes = 3;
+}
+
+message CompleteResponse {
+  bool success = 1;
+  int32 processed_count = 2;            // number of messages acked/nacked
+  repeated string new_msg_ids = 3;      // downstream message IDs (forward/scatter)
+}
+
+// ============================================================================
+// Unified Push (replaces Push + PushBatch)
+// ============================================================================
+
+message PushRequest {
+  string queue = 1;
+  repeated bytes payloads = 2;           // one or more payloads
+  map<string, string> metadata = 3;      // applied to all messages
+}
+
+message PushResponse {
+  repeated string msg_ids = 1;           // created message IDs (1:1 with payloads)
+}
+
+// ============================================================================
+// Combined ClaimAndComplete (halves round trips)
+// ============================================================================
+
+message ClaimAndCompleteRequest {
+  // Complete previous batch (optional — omit on first call)
+  CompleteRequest complete = 1;
+
+  // Claim next batch
+  ClaimRequest claim = 2;
+}
+
+message ClaimAndCompleteResponse {
+  // Result of complete (if complete was provided)
+  CompleteResponse complete_result = 1;
+
+  // Claimed messages
+  ClaimResponse claim_result = 2;
+}
+
+// ============================================================================
+// Heartbeat Messages
+// ============================================================================
+
+message HeartbeatPing {
+  string worker_id = 1;
+  string lease_id = 2;
+  int64 timestamp = 3;
+}
+
+message HeartbeatPong {
+  string lease_id = 1;
+  bool ok = 2;
+  int32 next_ping_ms = 3;
+}
+
+// ============================================================================
+// State API Messages
+// ============================================================================
+
+message StateGetRequest {
+  string namespace = 1;
+  repeated string keys = 2;
+}
+
+message StateGetResponse {
+  map<string, bytes> values = 1;
+}
+
+message StatePutRequest {
+  string namespace = 1;
+  map<string, bytes> puts = 2;
+  repeated string deletes = 3;
+}
+
+message StatePutResponse {
+  int32 puts_count = 1;
+  int32 deletes_count = 2;
+}
+
+// ============================================================================
+// Admin API Messages
+// ============================================================================
+
+message CreateQueueRequest {
+  string queue = 1;
+}
+
+message CreateQueueResponse {
+  bool created = 1;
+}
+
+message DeleteQueueRequest {
+  string queue = 1;
+}
+
+message DeleteQueueResponse {
+  bool deleted = 1;
+  int32 messages_deleted = 2;
+}
+
+message GetStatsRequest {
+  string queue = 1;                      // empty = all queues
+}
+
+message GetStatsResponse {
+  map<string, QueueStats> queues = 1;
+  int32 total_workers = 2;
+  int64 uptime_secs = 3;
+}
+
+message QueueStats {
+  string queue = 1;
+  int64 pending_count = 2;
+  int64 claimed_count = 3;
+  int64 total_pushed = 4;
+  int64 total_acked = 5;
+}
+
+// ============================================================================
+// Queue Completion API Messages
+// ============================================================================
+
+message MarkQueueFinishedRequest {
+  string queue = 1;
+}
+
+message MarkQueueFinishedResponse {
+  bool success = 1;
+}
+
+message IsQueueFinishedRequest {
+  string queue = 1;
+}
+
+message IsQueueFinishedResponse {
+  bool finished = 1;
+  bool drained = 2;
+  bool safe_to_exit = 3;
+  int64 pending_count = 4;
+  int64 claimed_count = 5;
+}
+
+// ============================================================================
+// QueueGroup API Messages
+// ============================================================================
+
+message CreateQueueGroupRequest {
+  string group_name = 1;
+  int32 num_partitions = 2;
+}
+
+message CreateQueueGroupResponse {
+  repeated string queue_names = 1;
+  int32 version = 2;
+  bool created = 3;
+}
+
+message PartitionPayload {
+  int32 partition_id = 1;
+  repeated bytes payloads = 2;
+}
+
+message IsGroupFinishedRequest {
+  string group_name = 1;
+}
+
+message IsGroupFinishedResponse {
+  bool all_finished = 1;
+  bool all_drained = 2;
+  bool safe_to_exit = 3;
+  repeated PartitionStatus partitions = 4;
+}
+
+message PartitionStatus {
+  int32 partition_id = 1;
+  int64 pending_count = 2;
+  int64 claimed_count = 3;
+  bool finished = 4;
+}
+
+message GetGroupStatsRequest {
+  string group_name = 1;
+}
+
+message GetGroupStatsResponse {
+  repeated PartitionStats partitions = 1;
+  int64 total_pending = 2;
+  int64 total_claimed = 3;
+  int64 max_partition_pending = 4;
+  int64 median_partition_pending = 5;
+  float skew_ratio = 6;
+  repeated int32 hot_partitions = 7;
+  int32 version = 8;
+}
+
+message PartitionStats {
+  int32 partition_id = 1;
+  int64 pending_count = 2;
+  int64 claimed_count = 3;
+  int64 total_pushed = 4;
+  int64 total_acked = 5;
+}
+
+message MarkGroupFinishedRequest {
+  string group_name = 1;
+}
+
+message MarkGroupFinishedResponse {
+  bool success = 1;
+  int32 queues_marked = 2;
+}

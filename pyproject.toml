@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nurion-anvil"
+version = "0.1.0"
+description = "Python bindings for Anvil - single-queue multi-consumer work queue"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "grpcio>=1.68.0",
+    "grpcio-tools>=1.68.0",
+    "protobuf>=5.0.0",
+]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "anvil_py.anvil_py"
+
+[tool.ruff]
+extend-exclude = ["**/anvil_pb2.py", "**/anvil_pb2_grpc.py"]
