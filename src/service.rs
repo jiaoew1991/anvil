@@ -125,7 +125,7 @@ impl AnvilService {
                     }),
                     Err(e) => {
                         tracing::error!("Complete(ack) failed: {}", e);
-                        Err(Status::internal("Storage error"))
+                        Err(Status::internal(format!("Storage error: {e}")))
                     }
                 }
             }
@@ -164,7 +164,7 @@ impl AnvilService {
                     }),
                     Err(e) => {
                         tracing::error!("Complete(nack) failed: {}", e);
-                        Err(Status::internal("Storage error"))
+                        Err(Status::internal(format!("Storage error: {e}")))
                     }
                 }
             }
@@ -216,12 +216,16 @@ impl AnvilService {
                         new_msg_ids,
                     }),
                     Err(e) => {
-                        tracing::error!("Complete(forward) failed: {}", e);
-                        Ok(CompleteResponse {
-                            success: false,
-                            processed_count: 0,
-                            new_msg_ids: vec![],
-                        })
+                        if e.to_string().contains("QueueFull") {
+                            Err(Status::resource_exhausted("QueueFull"))
+                        } else {
+                            tracing::error!("Complete(forward) failed: {}", e);
+                            Ok(CompleteResponse {
+                                success: false,
+                                processed_count: 0,
+                                new_msg_ids: vec![],
+                            })
+                        }
                     }
                 }
             }
@@ -271,12 +275,16 @@ impl AnvilService {
                         new_msg_ids,
                     }),
                     Err(e) => {
-                        tracing::error!("Complete(scatter) failed: {}", e);
-                        Ok(CompleteResponse {
-                            success: false,
-                            processed_count: 0,
-                            new_msg_ids: vec![],
-                        })
+                        if e.to_string().contains("QueueFull") {
+                            Err(Status::resource_exhausted("QueueFull"))
+                        } else {
+                            tracing::error!("Complete(scatter) failed: {}", e);
+                            Ok(CompleteResponse {
+                                success: false,
+                                processed_count: 0,
+                                new_msg_ids: vec![],
+                            })
+                        }
                     }
                 }
             }
@@ -304,7 +312,7 @@ impl AnvilService {
                     .await
                     .map_err(|e| {
                         tracing::error!("Claim failed: {}", e);
-                        Status::internal("Storage error")
+                        Status::internal(format!("Storage error: {e}"))
                     })?;
 
                 let messages: Vec<ClaimMessage> = claimed
@@ -351,7 +359,7 @@ impl AnvilService {
                     .await
                     .map_err(|e| {
                         tracing::error!("ClaimFromGroup failed: {}", e);
-                        Status::internal("Storage error")
+                        Status::internal(format!("Storage error: {e}"))
                     })?;
 
                 let messages: Vec<ClaimMessage> = claimed
@@ -422,8 +430,12 @@ impl Anvil for AnvilService {
         match self.storage.push_messages(&req.queue, &messages).await {
             Ok(()) => Ok(Response::new(PushResponse { msg_ids })),
             Err(e) => {
-                tracing::error!("Push failed: {}", e);
-                Err(Status::internal("Storage error"))
+                if e.to_string().contains("QueueFull") {
+                    Err(Status::resource_exhausted("QueueFull"))
+                } else {
+                    tracing::error!("Push failed: {}", e);
+                    Err(Status::internal(format!("Storage error: {e}")))
+                }
             }
         }
     }
@@ -476,7 +488,7 @@ impl Anvil for AnvilService {
             Ok(values) => Ok(Response::new(StateGetResponse { values })),
             Err(e) => {
                 tracing::error!("Failed to get state: {}", e);
-                Err(Status::internal("Storage error"))
+                Err(Status::internal(format!("Storage error: {e}")))
             }
         }
     }
@@ -504,7 +516,7 @@ impl Anvil for AnvilService {
             })),
             Err(e) => {
                 tracing::error!("Failed to put state: {}", e);
-                Err(Status::internal("Storage error"))
+                Err(Status::internal(format!("Storage error: {e}")))
             }
         }
     }
@@ -566,14 +578,14 @@ impl Anvil for AnvilService {
         request: Request<CreateQueueRequest>,
     ) -> Result<Response<CreateQueueResponse>, Status> {
         let req = request.into_inner();
-        match self.storage.create_queue(&req.queue).await {
+        match self.storage.create_queue(&req.queue, req.max_pending).await {
             Ok(()) => {
                 self.state.get_or_create_queue(&req.queue);
                 Ok(Response::new(CreateQueueResponse { created: true }))
             }
             Err(e) => {
                 tracing::error!("Failed to create queue: {}", e);
-                Err(Status::internal("Storage error"))
+                Err(Status::internal(format!("Storage error: {e}")))
             }
         }
     }
@@ -593,7 +605,7 @@ impl Anvil for AnvilService {
             }
             Err(e) => {
                 tracing::error!("Failed to delete queue: {}", e);
-                Err(Status::internal("Storage error"))
+                Err(Status::internal(format!("Storage error: {e}")))
             }
         }
     }
@@ -655,7 +667,7 @@ impl Anvil for AnvilService {
             Ok(()) => Ok(Response::new(MarkQueueFinishedResponse { success: true })),
             Err(e) => {
                 tracing::error!("Failed to mark queue finished: {}", e);
-                Err(Status::internal("Storage error"))
+                Err(Status::internal(format!("Storage error: {e}")))
             }
         }
     }
@@ -680,7 +692,7 @@ impl Anvil for AnvilService {
             }
             Err(e) => {
                 tracing::error!("Failed to check queue finished: {}", e);
-                Err(Status::internal("Storage error"))
+                Err(Status::internal(format!("Storage error: {e}")))
             }
         }
     }
@@ -707,13 +719,17 @@ impl Anvil for AnvilService {
             .await
             .map_err(|e| {
                 tracing::error!("Failed to check group: {}", e);
-                Status::internal("Storage error")
+                Status::internal(format!("Storage error: {e}"))
             })?
             .is_some();
 
         match self
             .storage
-            .create_queue_group(&req.group_name, req.num_partitions as u32)
+            .create_queue_group(
+                &req.group_name,
+                req.num_partitions as u32,
+                req.max_pending_per_partition,
+            )
             .await
         {
             Ok(meta) => {
@@ -728,7 +744,7 @@ impl Anvil for AnvilService {
             }
             Err(e) => {
                 tracing::error!("Failed to create queue group: {}", e);
-                Err(Status::internal("Storage error"))
+                Err(Status::internal(format!("Storage error: {e}")))
             }
         }
     }
@@ -762,7 +778,7 @@ impl Anvil for AnvilService {
             }
             Err(e) => {
                 tracing::error!("Failed is_group_finished: {}", e);
-                Err(Status::internal("Storage error"))
+                Err(Status::internal(format!("Storage error: {e}")))
             }
         }
     }
@@ -844,7 +860,7 @@ impl Anvil for AnvilService {
             }
             Err(e) => {
                 tracing::error!("Failed get_group_stats: {}", e);
-                Err(Status::internal("Storage error"))
+                Err(Status::internal(format!("Storage error: {e}")))
             }
         }
     }
@@ -864,7 +880,7 @@ impl Anvil for AnvilService {
             })),
             Err(e) => {
                 tracing::error!("Failed mark_group_finished: {}", e);
-                Err(Status::internal("Storage error"))
+                Err(Status::internal(format!("Storage error: {e}")))
             }
         }
     }

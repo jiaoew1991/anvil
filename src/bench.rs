@@ -186,6 +186,7 @@ mod tests {
         admin
             .create_queue(proto::CreateQueueRequest {
                 queue: queue.clone(),
+                max_pending: 0,
             })
             .await
             .unwrap();
@@ -267,6 +268,7 @@ mod tests {
         admin
             .create_queue(proto::CreateQueueRequest {
                 queue: queue.clone(),
+                max_pending: 0,
             })
             .await
             .unwrap();
@@ -397,6 +399,7 @@ mod tests {
         admin
             .create_queue(proto::CreateQueueRequest {
                 queue: queue.clone(),
+                max_pending: 0,
             })
             .await
             .unwrap();

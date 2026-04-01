@@ -104,7 +104,7 @@ mod tests {
 
             let queues: Vec<String> = (0..num_queues).map(|i| format!("q{}", i)).collect();
             for q in &queues {
-                storage.create_queue(q).await.unwrap();
+                storage.create_queue(q, 0).await.unwrap();
             }
 
             let workers: Vec<WorkerState> =
@@ -128,7 +128,7 @@ mod tests {
             // Delete all queues and recreate them
             for q in &self.queues {
                 let _ = self.storage.delete_queue(q).await;
-                self.storage.create_queue(q).await.unwrap();
+                self.storage.create_queue(q, 0).await.unwrap();
             }
             self.rng = StdRng::seed_from_u64(seed);
             self.workers = (0..self.num_workers)
@@ -450,8 +450,8 @@ mod tests {
     async fn test_dst_forward_heavy() {
         let _guard = SIM_TIME_LOCK.lock().unwrap();
         let storage = AnvilStorage::new("memory://").await.unwrap();
-        storage.create_queue("upstream").await.unwrap();
-        storage.create_queue("downstream").await.unwrap();
+        storage.create_queue("upstream", 0).await.unwrap();
+        storage.create_queue("downstream", 0).await.unwrap();
 
         set_sim_time_nanos(1_735_689_600_000_000_000);
 
@@ -507,7 +507,7 @@ mod tests {
     async fn test_dst_recovery_cycle() {
         let _guard = SIM_TIME_LOCK.lock().unwrap();
         let storage = AnvilStorage::new("memory://").await.unwrap();
-        storage.create_queue("q").await.unwrap();
+        storage.create_queue("q", 0).await.unwrap();
 
         set_sim_time_nanos(1_735_689_600_000_000_000);
 
@@ -581,7 +581,7 @@ mod tests {
     async fn test_dst_nack_storm() {
         let _guard = SIM_TIME_LOCK.lock().unwrap();
         let storage = AnvilStorage::new("memory://").await.unwrap();
-        storage.create_queue("q").await.unwrap();
+        storage.create_queue("q", 0).await.unwrap();
 
         set_sim_time_nanos(1_735_689_600_000_000_000);
 
@@ -642,7 +642,7 @@ mod tests {
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let storage = Arc::new(storage);
         let queue = "stress_q";
-        storage.create_queue(queue).await.unwrap();
+        storage.create_queue(queue, 0).await.unwrap();
 
         // Push 10000 messages
         let mut msgs = Vec::new();
@@ -707,7 +707,7 @@ mod tests {
 
         let storage = Arc::new(AnvilStorage::new("memory://").await.unwrap());
         let queue = "pca_q";
-        storage.create_queue(queue).await.unwrap();
+        storage.create_queue(queue, 0).await.unwrap();
 
         // Phase 1: push 5000 messages concurrently from 50 pushers
         let total_pushed = Arc::new(AtomicU64::new(0));
@@ -770,7 +770,7 @@ mod tests {
     async fn test_concurrent_claim_from_group() {
         let storage = Arc::new(AnvilStorage::new("memory://").await.unwrap());
         let group = "stress_grp";
-        storage.create_queue_group(group, 4).await.unwrap();
+        storage.create_queue_group(group, 4, 0).await.unwrap();
 
         // Push 2000 messages across partitions
         for pid in 0..4u32 {
@@ -817,5 +817,49 @@ mod tests {
             h.await.unwrap();
         }
         assert_eq!(claimed_ids.lock().unwrap().len(), 2000);
+    }
+
+    /// Bounded queue: push up to max_pending, reject when full, accept after ack frees space.
+    #[tokio::test]
+    async fn test_bounded_queue_rejects_when_full() {
+        let storage = AnvilStorage::new("memory://").await.unwrap();
+        storage.create_queue("bounded", 3).await.unwrap(); // max 3 in-flight
+
+        // Push 3 messages — should succeed
+        for i in 0..3 {
+            let msg = Message::new("bounded".to_string(), format!("data-{i}").into_bytes());
+            storage.push_messages("bounded", &[msg]).await.unwrap();
+        }
+
+        // Push 4th — should fail with QueueFull
+        let msg = Message::new("bounded".to_string(), b"data-3".to_vec());
+        let result = storage.push_messages("bounded", &[msg]).await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("QueueFull"),
+            "Expected QueueFull error"
+        );
+
+        // Claim and ack one — should free space
+        let claimed = storage
+            .claim_messages("bounded", 1, "w1", "lease1")
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let msg_ids: Vec<String> = claimed.iter().map(|c| c.message.msg_id.clone()).collect();
+        let tokens: Vec<String> = claimed.iter().map(|c| c.claim_token.clone()).collect();
+        storage
+            .ack_messages("bounded", &msg_ids, &tokens, "w1", "lease1")
+            .await
+            .unwrap();
+
+        // Now push should succeed again
+        let msg4 = Message::new("bounded".to_string(), b"data-4".to_vec());
+        storage.push_messages("bounded", &[msg4]).await.unwrap();
+
+        // Verify stats: 4 pushed, 1 acked, 3 in-flight
+        let meta = storage.get_queue_stats("bounded").await.unwrap();
+        assert_eq!(meta.total_pushed, 4);
+        assert_eq!(meta.total_acked, 1);
     }
 }

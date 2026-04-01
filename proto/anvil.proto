@@ -229,6 +229,7 @@ message StatePutResponse {
 
 message CreateQueueRequest {
   string queue = 1;
+  uint64 max_pending = 2;  // 0 = unlimited (default)
 }
 
 message CreateQueueResponse {
@@ -293,6 +294,7 @@ message IsQueueFinishedResponse {
 message CreateQueueGroupRequest {
   string group_name = 1;
   int32 num_partitions = 2;
+  uint64 max_pending_per_partition = 3;  // 0 = unlimited (default)
 }
 
 message CreateQueueGroupResponse {
