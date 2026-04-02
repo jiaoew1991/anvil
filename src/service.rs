@@ -325,11 +325,22 @@ impl AnvilService {
                     Err(_) => false,
                 };
 
+                // When empty, check if upstream is finished + fully drained
+                let upstream_drained = if messages.is_empty() {
+                    match self.storage.check_queue_completion(&queue).await {
+                        Ok((finished, drained, _, _)) => finished && drained,
+                        Err(_) => false,
+                    }
+                } else {
+                    false
+                };
+
                 Ok(ClaimResponse {
                     messages,
                     has_more,
                     source_queue: String::new(),
                     source_partition: 0,
+                    upstream_drained,
                 })
             }
 
@@ -367,11 +378,22 @@ impl AnvilService {
                     .map(|c| Self::to_claim_message(&c.message, c.claim_token.clone()))
                     .collect();
 
+                // When empty, check if upstream group is finished + fully drained
+                let upstream_drained = if messages.is_empty() {
+                    match self.storage.check_group_completion(&group.group_name).await {
+                        Ok((all_finished, all_drained, _)) => all_finished && all_drained,
+                        Err(_) => false,
+                    }
+                } else {
+                    false
+                };
+
                 Ok(ClaimResponse {
                     messages,
                     has_more: false,
                     source_queue,
                     source_partition: source_partition as i32,
+                    upstream_drained,
                 })
             }
 

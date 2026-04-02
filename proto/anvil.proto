@@ -99,6 +99,10 @@ message ClaimResponse {
   // Group claim info (empty for plain queue claims)
   string source_queue = 3;
   int32 source_partition = 4;
+  // True when messages is empty AND the source queue/group is
+  // finished + fully drained (pending=0, claimed=0).
+  // Workers use this as the sole exit signal — no master notification needed.
+  bool upstream_drained = 5;
 }
 
 // ============================================================================

@@ -357,7 +357,7 @@ impl AnvilRustClient {
         queue: String,
         batch_size: i32,
         timeout_ms: i32,
-    ) -> PyResult<Vec<RustMessage>> {
+    ) -> PyResult<(Vec<RustMessage>, bool)> {
         let inner = self.inner.clone();
         let q = queue.clone();
         py.allow_threads(move || {
@@ -375,11 +375,12 @@ impl AnvilRustClient {
                     .await
                     .map_err(status_to_pyerr)?
                     .into_inner();
-                Ok(resp
+                let messages: Vec<RustMessage> = resp
                     .messages
                     .iter()
                     .map(|m| RustMessage::from_claim_message(m, &q))
-                    .collect())
+                    .collect();
+                Ok((messages, resp.upstream_drained))
             })
         })
     }
@@ -395,7 +396,7 @@ impl AnvilRustClient {
         assigned_partitions: Option<Vec<i32>>,
         allow_steal: bool,
         steal_pending_threshold: i64,
-    ) -> PyResult<(Vec<RustMessage>, String, i32)> {
+    ) -> PyResult<(Vec<RustMessage>, String, i32, bool)> {
         let inner = self.inner.clone();
         py.allow_threads(move || {
             inner.runtime.block_on(async {
@@ -429,7 +430,12 @@ impl AnvilRustClient {
                     .iter()
                     .map(|m| RustMessage::from_claim_message(m, &source_q))
                     .collect();
-                Ok((messages, resp.source_queue, resp.source_partition))
+                Ok((
+                    messages,
+                    resp.source_queue,
+                    resp.source_partition,
+                    resp.upstream_drained,
+                ))
             })
         })
     }
