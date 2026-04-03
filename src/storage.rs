@@ -1264,8 +1264,11 @@ impl AnvilStorage {
         let pending_count = meta.push_seq.saturating_sub(meta.claim_seq);
         let claimed_count = meta.claimed_count;
 
-        let drained =
-            pending_count == 0 && claimed_count == 0 && (meta.total_pushed > 0 || finished);
+        // A queue is drained only when explicitly marked finished AND fully empty.
+        // The old heuristic (total_pushed > 0) let temporarily-empty queues look
+        // drained before upstream called mark_finished, causing downstream stages
+        // to exit before late-arriving recovery messages.
+        let drained = finished && pending_count == 0 && claimed_count == 0;
 
         Ok((finished, drained, pending_count, claimed_count))
     }

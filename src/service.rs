@@ -328,7 +328,16 @@ impl AnvilService {
                 // When empty, check if upstream is finished + fully drained
                 let upstream_drained = if messages.is_empty() {
                     match self.storage.check_queue_completion(&queue).await {
-                        Ok((finished, drained, _, _)) => finished && drained,
+                        Ok((finished, drained, _pending, _claimed)) => {
+                            if finished && drained {
+                                tracing::info!(
+                                    "upstream_drained=true for queue={}, worker={}",
+                                    queue,
+                                    req.worker_id
+                                );
+                            }
+                            finished && drained
+                        }
                         Err(_) => false,
                     }
                 } else {
@@ -381,7 +390,16 @@ impl AnvilService {
                 // When empty, check if upstream group is finished + fully drained
                 let upstream_drained = if messages.is_empty() {
                     match self.storage.check_group_completion(&group.group_name).await {
-                        Ok((all_finished, all_drained, _)) => all_finished && all_drained,
+                        Ok((all_finished, all_drained, _partitions)) => {
+                            if all_finished && all_drained {
+                                tracing::info!(
+                                    "upstream_drained=true for group={}, worker={}",
+                                    group.group_name,
+                                    req.worker_id
+                                );
+                            }
+                            all_finished && all_drained
+                        }
                         Err(_) => false,
                     }
                 } else {
