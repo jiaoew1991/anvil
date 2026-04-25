@@ -66,7 +66,13 @@ impl RecoveryTask {
         let running = self.running.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         let interval_secs = self.config.recovery_interval_secs;
-        let timeout_secs = self.config.claim_timeout_secs;
+        // Production has one config knob (`claim_timeout_secs`); we feed it
+        // to both the lease-freshness check and the claim-age check so that
+        // existing deployments see the same behavior the single-knob API
+        // gave them. Tests can drive `recover_expired_claims` directly with
+        // independent values when they need to.
+        let lease_timeout_secs = self.config.claim_timeout_secs;
+        let claim_age_timeout_secs = self.config.claim_timeout_secs;
 
         let handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs_f64(interval_secs));
@@ -87,7 +93,11 @@ impl RecoveryTask {
                         let lease_snapshot = state.lease_snapshot();
                         // Recovery is now handled entirely by storage
                         if let Err(e) = storage
-                            .recover_expired_claims(timeout_secs, Some(&lease_snapshot))
+                            .recover_expired_claims(
+                                lease_timeout_secs,
+                                claim_age_timeout_secs,
+                                Some(&lease_snapshot),
+                            )
                             .await
                         {
                             tracing::error!("Recovery error: {}", e);
@@ -99,9 +109,10 @@ impl RecoveryTask {
 
         self.handle = Some(handle);
         tracing::info!(
-            "Recovery task started (interval: {}s, timeout: {}s)",
+            "Recovery task started (interval: {}s, lease_timeout: {}s, claim_age_timeout: {}s)",
             interval_secs,
-            timeout_secs
+            lease_timeout_secs,
+            claim_age_timeout_secs,
         );
     }
 

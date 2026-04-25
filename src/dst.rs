@@ -309,9 +309,13 @@ mod tests {
                 }
 
                 Op::RecoverExpired { timeout_secs } => {
+                    // DST has no `active_leases` to feed in, so every claim
+                    // falls into the dead-lease branch and reclaim is
+                    // unconditional. Pass the same `timeout_secs` for both
+                    // knobs to preserve the existing scenario semantics.
                     let recovered = self
                         .storage
-                        .recover_expired_claims(timeout_secs, None)
+                        .recover_expired_claims(timeout_secs, timeout_secs, None)
                         .await
                         .unwrap();
                     if recovered > 0 {
@@ -528,7 +532,13 @@ mod tests {
 
         advance_sim_time_secs(120.0);
 
-        let recovered = storage.recover_expired_claims(60.0, None).await.unwrap();
+        // No active leases → dead-lease branch reclaims unconditionally;
+        // both timeout knobs are irrelevant. Pass production-like values
+        // for documentation.
+        let recovered = storage
+            .recover_expired_claims(60.0, 60.0, None)
+            .await
+            .unwrap();
         assert_eq!(recovered, 10);
 
         let meta = storage.get_queue_stats("q").await.unwrap();
