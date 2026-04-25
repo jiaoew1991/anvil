@@ -701,7 +701,7 @@ impl AnvilStorage {
 
         let actual_count = claimed_items.len() as u64;
         let new_total_claimed =
-            c.total_claimed.fetch_add(actual_count, Ordering::Relaxed) + actual_count;
+            c.total_claimed.fetch_add(actual_count, Ordering::Release) + actual_count;
 
         let mut batch = WriteBatch::new();
         let mut result = Vec::new();
@@ -807,7 +807,7 @@ impl AnvilStorage {
 
             let c = self.load_or_init_counters(queue).await?;
             let new_total_unclaimed =
-                c.total_unclaimed.fetch_add(ack_count, Ordering::Relaxed) + ack_count;
+                c.total_unclaimed.fetch_add(ack_count, Ordering::Release) + ack_count;
             let new_total_acked = c.total_acked.fetch_add(ack_count, Ordering::Relaxed) + ack_count;
 
             for msg_id in msg_ids {
@@ -1090,7 +1090,7 @@ impl AnvilStorage {
         // Watermark stays put until this guard drops at end-of-scope.
         let _push_guard = Self::reserve_push_range(&c, nack_count);
         let base_seq = _push_guard.base_seq;
-        let new_unclaimed = c.total_unclaimed.fetch_add(nack_count, Ordering::Relaxed) + nack_count;
+        let new_unclaimed = c.total_unclaimed.fetch_add(nack_count, Ordering::Release) + nack_count;
 
         let mut batch = WriteBatch::new();
         for (i, msg_id) in msg_ids.iter().enumerate() {
@@ -1506,17 +1506,31 @@ impl AnvilStorage {
         // a writer that has fetch_add'd push_seq_alloc but hasn't yet
         // committed its WriteBatch creates a transient window where
         // `push_seq - claim_seq == 0` even though there's real work in
-        // flight. A stage master calling this during that window would
-        // see drained=true and prematurely mark its output finished,
-        // losing the about-to-be-committed batch.
+        // flight.
         //
-        // The reported pending_count uses push_seq_alloc as well, so
-        // upstream "has unprocessed messages" checks behave consistently.
-        let alloc_seq = c.push_seq_alloc.load(Ordering::Acquire);
+        // **Read order matters.** `nack_messages_internal` (the recovery
+        // path) bumps `push_seq_alloc` first and `total_unclaimed`
+        // second. If we read in the *same* order as the writer, we can
+        // observe `(alloc_seq=old, total_unclaimed=new)` — claimed_count
+        // computes to 0 (true_claimed - bumped_unclaimed) AND
+        // pending_count computes to 0 (un-bumped alloc_seq - claim_seq),
+        // falsely reporting `drained=true` while a real claim is being
+        // reclaimed. That's exactly the data-loss path that took out
+        // `test_all_workers_crash_and_recovery` after the watermark fix.
+        //
+        // Read in the *opposite* order: total_unclaimed (Acquire) first,
+        // then alloc_seq. The Acquire load synchronizes-with the writer's
+        // Release fetch_add of total_unclaimed (see the Release
+        // annotations in `nack_messages_internal` and `ack_internal`),
+        // so any push_seq_alloc bump done *before* that release in the
+        // writer's program order is visible to subsequent loads here.
+        // Worst-case interleaving now reports `pending > 0` (over-counts
+        // briefly during the in-flight nack), which is the safe direction.
+        let total_unclaimed = c.total_unclaimed.load(Ordering::Acquire);
+        let total_claimed = c.total_claimed.load(Ordering::Acquire);
         let claim_seq = c.claim_seq.load(Ordering::Acquire);
+        let alloc_seq = c.push_seq_alloc.load(Ordering::Acquire);
         let pending_count = alloc_seq.saturating_sub(claim_seq);
-        let total_claimed = c.total_claimed.load(Ordering::Relaxed);
-        let total_unclaimed = c.total_unclaimed.load(Ordering::Relaxed);
         let claimed_count = total_claimed.saturating_sub(total_unclaimed);
 
         // A queue is drained only when explicitly marked finished AND fully empty.
@@ -1677,7 +1691,7 @@ impl AnvilStorage {
 
             let uc = self.load_or_init_counters(upstream_queue).await?;
             let new_total_unclaimed =
-                uc.total_unclaimed.fetch_add(ack_count, Ordering::Relaxed) + ack_count;
+                uc.total_unclaimed.fetch_add(ack_count, Ordering::Release) + ack_count;
             let new_total_acked =
                 uc.total_acked.fetch_add(ack_count, Ordering::Relaxed) + ack_count;
 
