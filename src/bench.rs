@@ -694,6 +694,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn bench_worker_profile() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
         let keys: usize = env_or("ANVIL_BENCH_KEYS", 1_000_000);
         let workers: usize = env_or("ANVIL_BENCH_WORKERS", 1000);
         let producers: usize = env_or("ANVIL_BENCH_PRODUCERS", 8);
