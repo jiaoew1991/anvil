@@ -247,16 +247,7 @@ impl AnvilStorage {
         let db_root = store_url.path().to_string();
         store_url.set_path("");
         let object_store = Db::resolve_object_store(store_url.as_str())?;
-        let mut builder = Db::builder(db_root, object_store);
-        // EXPERIMENT: block cache size override, to be replaced by AnvilConfig.
-        if let Ok(mib) = std::env::var("ANVIL_EXP_BLOCK_CACHE_MB") {
-            let max_capacity = mib.parse::<u64>().expect("ANVIL_EXP_BLOCK_CACHE_MB") << 20;
-            let cache = slatedb::db_cache::foyer::FoyerCache::new_with_opts(
-                slatedb::db_cache::foyer::FoyerCacheOptions { max_capacity, shards: 64 },
-            );
-            builder = builder.with_db_cache(Arc::new(cache), 0);
-        }
-        let db = builder.build().await?;
+        let db = Db::builder(db_root, object_store).build().await?;
         Ok(Self {
             db,
             counters: DashMap::new(),
