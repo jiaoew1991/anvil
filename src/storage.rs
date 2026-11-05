@@ -610,15 +610,27 @@ impl AnvilStorage {
 
     /// Get queue metadata — single locked snapshot of in-memory state.
     pub async fn get_meta(&self, queue: &str) -> Result<QueueMeta, StorageError> {
-        let c = self.load_or_init_counters(queue).await?;
-        let s = c.state.lock().expect("queue state poisoned");
-        Ok(QueueMeta {
+        Ok(Self::meta_of(&*self.load_or_init_counters(queue).await?))
+    }
+
+    /// Metadata of every queue loaded since startup, without touching the
+    /// database, for metrics callbacks that cannot await.
+    pub fn queue_meta_snapshot(&self) -> Vec<(String, QueueMeta)> {
+        self.counters
+            .iter()
+            .map(|entry| (entry.key().clone(), Self::meta_of(entry.value())))
+            .collect()
+    }
+
+    fn meta_of(counters: &QueueCounters) -> QueueMeta {
+        let s = counters.state.lock().expect("queue state poisoned");
+        QueueMeta {
             push_seq: s.push_seq_committed,
             claim_seq: s.claim_seq,
             claimed_count: s.claimed_count(),
             total_pushed: s.total_pushed,
             total_acked: s.total_acked,
-        })
+        }
     }
 
     /// Create a queue — write the 6 counter keys (all zeros).
@@ -713,7 +725,10 @@ impl AnvilStorage {
         for (i, msg) in messages.iter().enumerate() {
             let seq = base_seq + i as u64;
             batch.put(Self::msg_key(queue, &msg.msg_id), encode_message(msg));
-            batch.put(Self::pending_key(queue, seq), encode_pending(&msg.msg_id, 0));
+            batch.put(
+                Self::pending_key(queue, seq),
+                encode_pending(&msg.msg_id, 0),
+            );
         }
         // Persist alloc cursor (monotonic across out-of-order commits) so
         // restart recovers all committed pending_keys.
@@ -819,6 +834,16 @@ impl AnvilStorage {
 
         if claimed_items.is_empty() {
             return Ok(Vec::new());
+        }
+        let redelivered = claimed_items
+            .iter()
+            .filter(|(_, _, _, claim_info)| claim_info.delivery_count > 1)
+            .count() as u64;
+        if redelivered > 0 {
+            crate::metrics::events().redelivered.add(
+                redelivered,
+                &[opentelemetry::KeyValue::new("queue", queue.to_string())],
+            );
         }
 
         let mut batch = WriteBatch::new();
@@ -1218,7 +1243,13 @@ impl AnvilStorage {
         // (acked or requeued concurrently) restarts its count at zero.
         let delivery_counts: Vec<u32> = match claim_tokens {
             Some(tokens) => self
-                .validate_claims(queue, msg_ids, tokens, expected_lease_id, expected_worker_id)
+                .validate_claims(
+                    queue,
+                    msg_ids,
+                    tokens,
+                    expected_lease_id,
+                    expected_worker_id,
+                )
                 .await?
                 .iter()
                 .map(|claim| claim.delivery_count)
@@ -1443,6 +1474,7 @@ impl AnvilStorage {
         }
         if deleted > 0 {
             tracing::info!("GC deleted {} acked entries", deleted);
+            crate::metrics::events().gc_deleted.add(deleted as u64, &[]);
         }
         Ok(deleted)
     }
@@ -1522,6 +1554,10 @@ impl AnvilStorage {
         for (queue, claims) in expired_by_queue {
             let msg_ids: Vec<String> = claims.iter().map(|c| c.msg_id.clone()).collect();
             self.nack_messages_unchecked(&queue, &msg_ids).await?;
+            crate::metrics::events().reclaimed.add(
+                msg_ids.len() as u64,
+                &[opentelemetry::KeyValue::new("queue", queue.clone())],
+            );
 
             let mut puts = HashMap::new();
             let ts_ns = now_nanos();
@@ -2246,7 +2282,10 @@ mod tests {
             storage.create_queue(queue, 0).await.unwrap();
             let msg = Message::new(queue.to_string(), b"payload".to_vec());
             storage.push_message(queue, &msg).await.unwrap();
-            let claimed = storage.claim_messages(queue, 1, "worker", "lease").await.unwrap();
+            let claimed = storage
+                .claim_messages(queue, 1, "worker", "lease")
+                .await
+                .unwrap();
             assert_eq!(claimed.len(), 1);
             (storage, msg.msg_id)
         });
@@ -2256,16 +2295,26 @@ mod tests {
         let recovered = tokio::runtime::Runtime::new().unwrap();
         recovered.block_on(async {
             let storage = AnvilStorage::new(&db_path).await.unwrap();
-            let mut delivered = storage.claim_messages(queue, 1, "worker", "lease-2").await.unwrap();
+            let mut delivered = storage
+                .claim_messages(queue, 1, "worker", "lease-2")
+                .await
+                .unwrap();
             if delivered.is_empty() {
                 // The claim did reach the WAL before the crash: then lease
                 // recovery is what hands the message out again.
                 let recovered_count = storage
-                    .recover_expired_claims(LEASE_TIMEOUT_SECS_TEST_FAST, CLAIM_AGE_TIMEOUT_SECS_TEST_LIVE_SAFE, Some(&HashMap::new()))
+                    .recover_expired_claims(
+                        LEASE_TIMEOUT_SECS_TEST_FAST,
+                        CLAIM_AGE_TIMEOUT_SECS_TEST_LIVE_SAFE,
+                        Some(&HashMap::new()),
+                    )
                     .await
                     .unwrap();
                 assert_eq!(recovered_count, 1);
-                delivered = storage.claim_messages(queue, 1, "worker", "lease-2").await.unwrap();
+                delivered = storage
+                    .claim_messages(queue, 1, "worker", "lease-2")
+                    .await
+                    .unwrap();
             }
             assert_eq!(delivered.len(), 1);
             assert_eq!(delivered[0].message.msg_id, msg_id);
@@ -2294,7 +2343,10 @@ mod tests {
                 .map(|i| Message::new(queue.to_string(), vec![i]))
                 .collect();
             storage.push_messages(queue, &messages).await.unwrap();
-            let claimed = storage.claim_messages(queue, 1, "worker", "lease").await.unwrap();
+            let claimed = storage
+                .claim_messages(queue, 1, "worker", "lease")
+                .await
+                .unwrap();
             let (msg_ids, claim_tokens) = split_claims(&claimed);
             storage
                 .ack_messages(queue, &msg_ids, &claim_tokens, "worker", "lease")
@@ -2313,12 +2365,17 @@ mod tests {
             assert_eq!(acked.len(), 1);
             assert_eq!(acked[0].2, acked_id);
 
-            let claimed = storage.claim_messages(queue, 10, "worker", "lease-2").await.unwrap();
+            let claimed = storage
+                .claim_messages(queue, 10, "worker", "lease-2")
+                .await
+                .unwrap();
             let mut pending_ids: Vec<String> =
                 claimed.iter().map(|c| c.message.msg_id.clone()).collect();
             pending_ids.sort();
-            let mut expected: Vec<String> =
-                pushed_ids.into_iter().filter(|id| *id != acked_id).collect();
+            let mut expected: Vec<String> = pushed_ids
+                .into_iter()
+                .filter(|id| *id != acked_id)
+                .collect();
             expected.sort();
             assert_eq!(pending_ids, expected);
         });
@@ -2339,7 +2396,10 @@ mod tests {
             .await
             .unwrap();
 
-        let first = storage.claim_messages(queue, 1, "w1", "lease-1").await.unwrap();
+        let first = storage
+            .claim_messages(queue, 1, "w1", "lease-1")
+            .await
+            .unwrap();
         assert_eq!(first[0].delivery_count, 1);
         let (msg_ids, claim_tokens) = split_claims(&first);
         storage
@@ -2347,7 +2407,10 @@ mod tests {
             .await
             .unwrap();
 
-        let second = storage.claim_messages(queue, 1, "w2", "lease-2").await.unwrap();
+        let second = storage
+            .claim_messages(queue, 1, "w2", "lease-2")
+            .await
+            .unwrap();
         assert_eq!(second[0].message.msg_id, msg_ids[0]);
         assert_eq!(second[0].delivery_count, 2);
         let no_live_leases = HashMap::new();
@@ -2361,7 +2424,10 @@ mod tests {
             .unwrap();
         assert_eq!(reclaimed, 1);
 
-        let third = storage.claim_messages(queue, 1, "w3", "lease-3").await.unwrap();
+        let third = storage
+            .claim_messages(queue, 1, "w3", "lease-3")
+            .await
+            .unwrap();
         assert_eq!(third[0].delivery_count, 3);
         let (msg_ids, claim_tokens) = split_claims(&third);
         storage
@@ -2376,7 +2442,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let forwarded = storage.claim_messages("count-down", 1, "w4", "lease-4").await.unwrap();
+        let forwarded = storage
+            .claim_messages("count-down", 1, "w4", "lease-4")
+            .await
+            .unwrap();
         assert_eq!(forwarded[0].delivery_count, 1);
     }
 

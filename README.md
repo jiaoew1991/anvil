@@ -21,6 +21,9 @@ runs as the per-job broker embedded in the Ray driver.
   as stuck. Set the second above your slowest task.
 - **Drain signal.** `claim` reports `upstream_drained` once a queue is marked
   finished and empty.
+- **Delivery count.** Every claimed message carries `delivery_count`: 1 on
+  first delivery, plus one for each nack or reclaimed lease, so a worker can
+  park a poison message instead of retrying it forever.
 
 See [docs/semantics.md](docs/semantics.md) for the full consistency and
 recovery model.
@@ -56,6 +59,29 @@ messages, drained = client.claim("work", batch_size=1)
 for message in messages:
     client.ack("work", [message.msg_id], claim_tokens=[message.claim_token])
 ```
+
+## Metrics
+
+The broker exports OpenTelemetry metrics over OTLP/HTTP when
+`OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`) is
+set, every `OTEL_METRIC_EXPORT_INTERVAL` milliseconds (default 60000). Without
+either variable, every instrument is a no-op. `service.name` defaults to
+`anvil`; `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override it.
+
+| Metric | Type | Attributes | Meaning |
+| --- | --- | --- | --- |
+| `anvil.queue.pending` | gauge | `queue` | Messages waiting to be claimed |
+| `anvil.queue.claimed` | gauge | `queue` | Messages claimed, not yet acked or returned |
+| `anvil.queue.pushed` | counter | `queue` | Messages pushed since the queue was created |
+| `anvil.queue.acked` | counter | `queue` | Messages acked since the queue was created |
+| `anvil.leases.active` | gauge | | Worker leases currently registered |
+| `anvil.messages.redelivered` | counter | `queue` | Claims of a message delivered before |
+| `anvil.claims.reclaimed` | counter | `queue` | Claims returned after a dead or aged-out lease |
+| `anvil.gc.deleted` | counter | | Expired acked entries deleted |
+| `rpc.server.call.duration` | histogram (s) | `rpc.method`, `rpc.grpc.status_code` | Server-side RPC latency |
+
+Queue gauges and totals are read from in-memory counters at export time and
+add no work to the request path.
 
 ## License
 
