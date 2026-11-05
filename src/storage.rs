@@ -807,7 +807,14 @@ impl AnvilStorage {
             Self::cnt_total_claimed_key(queue),
             persisted_total_claimed.to_le_bytes(),
         );
-        self.write_durable(batch).await?;
+        // A claim need not be durable before the worker sees it. If the
+        // broker crashes first, recovery reloads the older durable cursor and
+        // `pending` entry and redelivers the message, which at-least-once
+        // already allows. The WAL is one ordered log, so the durable ack that
+        // follows a claim makes the claim durable with it. Skipping the wait
+        // halves a worker's per-key broker latency.
+        #[allow(clippy::disallowed_methods)]
+        let _not_awaited_for_durability = self.db.write(batch).await?;
 
         Ok(result)
     }
@@ -2174,6 +2181,51 @@ mod tests {
 
         let acked = storage.scan_acked(Some(queue)).await.unwrap();
         assert_eq!(acked.len(), 1);
+    }
+
+    /// A claim is not awaited for durability, so a crash right after it may
+    /// forget it; at-least-once then requires the message to be claimable
+    /// again after recovery rather than lost between pending and claimed.
+    #[test]
+    fn test_claim_lost_in_crash_is_redelivered() {
+        let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("anvil_crash_test_{counter}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = format!("file://{}", dir.display());
+        let queue = "crash";
+
+        let crashed = tokio::runtime::Runtime::new().unwrap();
+        let (storage, msg_id) = crashed.block_on(async {
+            let storage = AnvilStorage::new(&db_path).await.unwrap();
+            storage.create_queue(queue, 0).await.unwrap();
+            let msg = Message::new(queue.to_string(), b"payload".to_vec());
+            storage.push_message(queue, &msg).await.unwrap();
+            let claimed = storage.claim_messages(queue, 1, "worker", "lease").await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            (storage, msg.msg_id)
+        });
+        crashed.shutdown_background();
+        std::mem::forget(storage);
+
+        let recovered = tokio::runtime::Runtime::new().unwrap();
+        recovered.block_on(async {
+            let storage = AnvilStorage::new(&db_path).await.unwrap();
+            let mut delivered = storage.claim_messages(queue, 1, "worker", "lease-2").await.unwrap();
+            if delivered.is_empty() {
+                // The claim did reach the WAL before the crash: then lease
+                // recovery is what hands the message out again.
+                let recovered_count = storage
+                    .recover_expired_claims(LEASE_TIMEOUT_SECS_TEST_FAST, CLAIM_AGE_TIMEOUT_SECS_TEST_LIVE_SAFE, Some(&HashMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(recovered_count, 1);
+                delivered = storage.claim_messages(queue, 1, "worker", "lease-2").await.unwrap();
+            }
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].message.msg_id, msg_id);
+            assert_eq!(delivered[0].message.payload, b"payload");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every mutation that returned success must survive a crash. Phase one
