@@ -316,10 +316,8 @@ impl AnvilService {
                         Status::internal(format!("Storage error: {e}"))
                     })?;
 
-                let messages: Vec<ClaimMessage> = claimed
-                    .iter()
-                    .map(Self::to_claim_message)
-                    .collect();
+                let messages: Vec<ClaimMessage> =
+                    claimed.iter().map(Self::to_claim_message).collect();
 
                 let has_more = match self.storage.get_queue_stats(&queue).await {
                     Ok(meta) => meta.claim_seq < meta.push_seq,
@@ -383,10 +381,8 @@ impl AnvilService {
                         Status::internal(format!("Storage error: {e}"))
                     })?;
 
-                let messages: Vec<ClaimMessage> = claimed
-                    .iter()
-                    .map(Self::to_claim_message)
-                    .collect();
+                let messages: Vec<ClaimMessage> =
+                    claimed.iter().map(Self::to_claim_message).collect();
 
                 // When empty, check if upstream group is finished + fully drained
                 let upstream_drained = if messages.is_empty() {

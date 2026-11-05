@@ -683,7 +683,11 @@ mod tests {
             .args(["-o", "rss=", "-p", &std::process::id().to_string()])
             .output()
             .unwrap();
-        String::from_utf8_lossy(&output.stdout).trim().parse::<u64>().unwrap_or(0) / 1024
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0)
+            / 1024
     }
 
     const ITEM_KEY_BYTES: usize = 96;
@@ -737,7 +741,10 @@ mod tests {
         let queue = "items".to_string();
         let (mut admin, _) = connect_client(port, "dispatcher-admin").await;
         admin
-            .create_queue(proto::CreateQueueRequest { queue: queue.clone(), max_pending: 0 })
+            .create_queue(proto::CreateQueueRequest {
+                queue: queue.clone(),
+                max_pending: 0,
+            })
             .await
             .unwrap();
 
@@ -754,16 +761,23 @@ mod tests {
                 while index < keys {
                     let mut payloads = Vec::with_capacity(push_batch);
                     while index < keys && payloads.len() < push_batch {
-                        let mut payload =
-                            format!("{:<width$}", format!("datasets/items/{index:012}.bin"), width = ITEM_KEY_BYTES)
-                                .into_bytes();
+                        let mut payload = format!(
+                            "{:<width$}",
+                            format!("datasets/items/{index:012}.bin"),
+                            width = ITEM_KEY_BYTES
+                        )
+                        .into_bytes();
                         payload.resize(payload_bytes, b'x');
                         payloads.push(payload);
                         index += producers;
                     }
                     let t = Instant::now();
                     client
-                        .push(proto::PushRequest { queue: q.clone(), payloads, metadata: Default::default() })
+                        .push(proto::PushRequest {
+                            queue: q.clone(),
+                            payloads,
+                            metadata: Default::default(),
+                        })
                         .await
                         .unwrap();
                     latencies.push(t.elapsed().as_micros() as u64);
@@ -778,10 +792,13 @@ mod tests {
         push_latencies.sort();
         let dispatch_secs = dispatch_start.elapsed().as_secs_f64();
         admin
-            .mark_queue_finished(proto::MarkQueueFinishedRequest { queue: queue.clone() })
+            .mark_queue_finished(proto::MarkQueueFinishedRequest {
+                queue: queue.clone(),
+            })
             .await
             .unwrap();
-        let percentile = |v: &Vec<u64>, p: f64| v[((p / 100.0 * v.len() as f64) as usize).min(v.len() - 1)];
+        let percentile =
+            |v: &Vec<u64>, p: f64| v[((p / 100.0 * v.len() as f64) as usize).min(v.len() - 1)];
         println!(
             "dispatch: {keys} keys in {dispatch_secs:.1}s = {:.0} keys/s | push RPC p50={}ms p99={}ms | rss={}MiB",
             keys as f64 / dispatch_secs,
@@ -854,7 +871,10 @@ mod tests {
                     let mut puts = std::collections::HashMap::new();
                     for message in &response.messages {
                         let key = String::from_utf8_lossy(&message.payload[..ITEM_KEY_BYTES]);
-                        puts.insert(format!("item_state:{}", key.trim_end()), b"succeeded".to_vec());
+                        puts.insert(
+                            format!("item_state:{}", key.trim_end()),
+                            b"succeeded".to_vec(),
+                        );
                     }
                     let count = response.messages.len() as u64;
                     let t = Instant::now();
@@ -862,11 +882,19 @@ mod tests {
                         .complete(proto::CompleteRequest {
                             upstream_queue: q.clone(),
                             msg_ids: response.messages.iter().map(|m| m.msg_id.clone()).collect(),
-                            claim_tokens: response.messages.iter().map(|m| m.claim_token.clone()).collect(),
+                            claim_tokens: response
+                                .messages
+                                .iter()
+                                .map(|m| m.claim_token.clone())
+                                .collect(),
                             worker_id: worker_id.clone(),
                             lease_id: lease.clone(),
                             action: Some(proto::complete_request::Action::Ack(proto::AckAction {})),
-                            state: Some(proto::StateUpdate { namespace: "ledger".to_string(), puts, deletes: vec![] }),
+                            state: Some(proto::StateUpdate {
+                                namespace: "ledger".to_string(),
+                                puts,
+                                deletes: vec![],
+                            }),
                         })
                         .await
                         .unwrap();
