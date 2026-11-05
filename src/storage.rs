@@ -35,9 +35,52 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use slatedb::{Db, DbRead, Error as SlateError, WriteBatch};
+use slatedb::{Db, DbReadOps, Error as SlateError, WriteBatch};
 
 use crate::types::{now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta};
+
+/// Upper bound on keys one GC write deletes, so a large expired backlog is
+/// retired in many small commits instead of one batch that stalls writers.
+const GC_BATCH_KEYS_MAX: usize = 10_000;
+
+/// Upper bound on keys one GC pass deletes; the next pass resumes the rest.
+const GC_PASS_KEYS_MAX: usize = 1_000_000;
+
+/// On-disk form of a message body. Protobuf rather than JSON because JSON
+/// encodes the payload bytes as a number array, inflating it about 3.5x, and
+/// the body is the bulk of what the queue writes.
+#[derive(Clone, PartialEq, prost::Message)]
+struct StoredMessage {
+    #[prost(string, tag = "1")]
+    msg_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    payload: Vec<u8>,
+    #[prost(double, tag = "3")]
+    created_at: f64,
+    #[prost(map = "string, string", tag = "4")]
+    metadata: HashMap<String, String>,
+}
+
+fn encode_message(msg: &Message) -> Vec<u8> {
+    prost::Message::encode_to_vec(&StoredMessage {
+        msg_id: msg.msg_id.clone(),
+        payload: msg.payload.clone(),
+        created_at: msg.created_at,
+        metadata: msg.metadata.clone(),
+    })
+}
+
+fn decode_message(queue: &str, bytes: &[u8]) -> Result<Message, StorageError> {
+    let stored: StoredMessage = prost::Message::decode(bytes)
+        .map_err(|e| SlateError::invalid(format!("corrupt message body: {e}")))?;
+    Ok(Message {
+        msg_id: stored.msg_id,
+        queue: queue.to_string(),
+        payload: stored.payload,
+        created_at: stored.created_at,
+        metadata: stored.metadata,
+    })
+}
 
 pub type StorageError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -197,14 +240,29 @@ pub struct AnvilStorage {
 
 impl AnvilStorage {
     pub async fn new(db_path: &str) -> Result<Self, StorageError> {
-        let object_store = Db::resolve_object_store(db_path)?;
-        let db = Db::open("/", object_store).await?;
+        // SlateDB resolves only the store root (scheme and authority, e.g.
+        // `s3://bucket`); the path inside it is given to the builder.
+        let mut store_url = url::Url::parse(db_path)
+            .map_err(|e| SlateError::invalid(format!("invalid db_path {db_path}: {e}")))?;
+        let db_root = store_url.path().to_string();
+        store_url.set_path("");
+        let object_store = Db::resolve_object_store(store_url.as_str())?;
+        let db = Db::builder(db_root, object_store).build().await?;
         Ok(Self {
             db,
             counters: DashMap::new(),
             steal_rr: std::sync::Mutex::new(HashMap::new()),
             max_pending_limits: DashMap::new(),
         })
+    }
+
+    /// Commit a batch and wait until it is durable. SlateDB's `write`
+    /// returns once the batch is in the in-memory WAL; every anvil RPC must
+    /// not report success before its effect would survive a crash.
+    #[allow(clippy::disallowed_methods)] // the one sanctioned write path
+    async fn write_durable(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.db.write(batch).await?.await_durable().await?;
+        Ok(())
     }
 
     /// Close the storage gracefully.
@@ -499,7 +557,7 @@ impl AnvilStorage {
                 Self::cnt_total_acked_key(queue),
                 old_meta.total_acked.to_le_bytes(),
             );
-            self.db.write(batch).await?;
+            self.write_durable(batch).await?;
 
             c
         };
@@ -513,7 +571,7 @@ impl AnvilStorage {
     /// Read QueueMeta from legacy meta:{queue} key.
     /// Kept for backward compat and migration path.
     #[allow(dead_code)]
-    async fn get_meta_from_reader<R: DbRead + Sync + ?Sized>(
+    async fn get_meta_from_reader<R: DbReadOps + Sync + ?Sized>(
         reader: &R,
         queue: &str,
     ) -> Result<QueueMeta, StorageError> {
@@ -555,7 +613,7 @@ impl AnvilStorage {
 
         let mut batch = WriteBatch::new();
         Self::write_zero_counters(&mut batch, queue);
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         self.db.flush().await?;
 
         Ok(())
@@ -627,7 +685,7 @@ impl AnvilStorage {
         let mut batch = WriteBatch::new();
         for (i, msg) in messages.iter().enumerate() {
             let seq = base_seq + i as u64;
-            batch.put(Self::msg_key(queue, &msg.msg_id), &serde_json::to_vec(msg)?);
+            batch.put(Self::msg_key(queue, &msg.msg_id), encode_message(msg));
             batch.put(Self::pending_key(queue, seq), msg.msg_id.as_bytes());
         }
         // Persist alloc cursor (monotonic across out-of-order commits) so
@@ -637,7 +695,7 @@ impl AnvilStorage {
         // Guard drops at end-of-scope — both on the Ok return below and on
         // the `?` propagation from `db.write` errors. No early-return path
         // can leak the reservation.
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         Ok(())
     }
 
@@ -696,7 +754,7 @@ impl AnvilStorage {
             if let Some(msg_id_bytes) = self.db.get(&pending_key).await? {
                 let msg_id = String::from_utf8_lossy(&msg_id_bytes).to_string();
                 if let Some(msg_data) = self.db.get(&Self::msg_key(queue, &msg_id)).await? {
-                    let msg: Message = serde_json::from_slice(&msg_data)?;
+                    let msg = decode_message(queue, &msg_data)?;
                     let claim_info =
                         ClaimInfo::new(msg_id.clone(), worker_id.to_string(), lease_id.to_string());
                     claimed_items.push((pending_key, msg_id, msg, claim_info));
@@ -749,7 +807,14 @@ impl AnvilStorage {
             Self::cnt_total_claimed_key(queue),
             persisted_total_claimed.to_le_bytes(),
         );
-        self.db.write(batch).await?;
+        // A claim need not be durable before the worker sees it. If the
+        // broker crashes first, recovery reloads the older durable cursor and
+        // `pending` entry and redelivers the message, which at-least-once
+        // already allows. The WAL is one ordered log, so the durable ack that
+        // follows a claim makes the claim durable with it. Skipping the wait
+        // halves a worker's per-key broker latency.
+        #[allow(clippy::disallowed_methods)]
+        let _not_awaited_for_durability = self.db.write(batch).await?;
 
         Ok(result)
     }
@@ -841,8 +906,12 @@ impl AnvilStorage {
                 (s.total_unclaimed, s.total_acked)
             };
 
+            // The body is dead once acked: no reader of acked entries needs
+            // the payload, and keeping it until GC multiplies the live data
+            // every point read has to search.
             for msg_id in msg_ids {
                 batch.delete(Self::claimed_key(queue, msg_id));
+                batch.delete(Self::msg_key(queue, msg_id));
                 batch.put(Self::acked_key(queue, now_ns, msg_id), []);
             }
             batch.put(
@@ -876,7 +945,7 @@ impl AnvilStorage {
                 for (i, msg) in messages.iter().enumerate() {
                     batch.put(
                         Self::msg_key(downstream_queue, &msg.msg_id),
-                        &serde_json::to_vec(msg)?,
+                        encode_message(msg),
                     );
                     batch.put(
                         Self::pending_key(downstream_queue, base_seq + i as u64),
@@ -908,7 +977,7 @@ impl AnvilStorage {
 
         // Guard drops at end-of-scope (on success or `?`-propagated error
         // from db.write), advancing the downstream watermark.
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         Ok(())
     }
 
@@ -1173,7 +1242,7 @@ impl AnvilStorage {
         // the reservation is still closed out (just with no pending_key
         // committed for the missing batch — which is the correct
         // localization of a failed nack).
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         Ok(())
     }
 
@@ -1190,7 +1259,7 @@ impl AnvilStorage {
         };
 
         let mut results = Vec::new();
-        let mut iter = self.db.scan_prefix(&prefix).await?;
+        let mut iter = self.db.scan_prefix(&prefix, ..).await?;
 
         while let Ok(Some(kv)) = iter.next().await {
             let key_str = String::from_utf8_lossy(&kv.key);
@@ -1217,7 +1286,7 @@ impl AnvilStorage {
         };
 
         let mut results = Vec::new();
-        let mut iter = self.db.scan_prefix(&prefix).await?;
+        let mut iter = self.db.scan_prefix(&prefix, ..).await?;
 
         while let Ok(Some(kv)) = iter.next().await {
             let key_str = String::from_utf8_lossy(&kv.key);
@@ -1286,7 +1355,7 @@ impl AnvilStorage {
         }
 
         if deleted > 0 || !claimed.is_empty() || !acked.is_empty() {
-            self.db.write(batch).await?;
+            self.write_durable(batch).await?;
         }
 
         // Remove from in-memory caches
@@ -1300,24 +1369,35 @@ impl AnvilStorage {
 
     pub async fn gc_acked_messages(&self, retention_ns: u64) -> Result<usize, StorageError> {
         let cutoff_ns = now_nanos().saturating_sub(retention_ns);
-        let all_acked = self.scan_acked(None).await?;
-
-        let mut batch = WriteBatch::new();
         let mut deleted = 0;
-
-        for (queue, timestamp_ns, msg_id) in all_acked {
-            if timestamp_ns < cutoff_ns {
-                batch.delete(Self::acked_key(&queue, timestamp_ns, &msg_id));
-                batch.delete(Self::msg_key(&queue, &msg_id));
+        // Acked keys sort by timestamp within a queue, so each queue's
+        // expired entries are one contiguous range ending at the cutoff:
+        // the pass never touches live entries, unlike a full prefix scan.
+        for queue in self.list_queues().await? {
+            let start = format!("acked:{}:", queue).into_bytes();
+            let end = Self::acked_key(&queue, cutoff_ns, "");
+            let mut iter = self.db.scan(start..end).await?;
+            let mut batch = WriteBatch::new();
+            let mut batch_keys = 0;
+            while deleted < GC_PASS_KEYS_MAX {
+                let Some(kv) = iter.next().await? else {
+                    break;
+                };
+                batch.delete(&kv.key);
+                batch_keys += 1;
                 deleted += 1;
+                if batch_keys == GC_BATCH_KEYS_MAX {
+                    self.write_durable(std::mem::take(&mut batch)).await?;
+                    batch_keys = 0;
+                }
+            }
+            if batch_keys > 0 {
+                self.write_durable(batch).await?;
             }
         }
-
         if deleted > 0 {
-            self.db.write(batch).await?;
-            tracing::info!("GC deleted {} acked messages", deleted);
+            tracing::info!("GC deleted {} acked entries", deleted);
         }
-
         Ok(deleted)
     }
 
@@ -1465,7 +1545,7 @@ impl AnvilStorage {
             batch.delete(Self::state_key(namespace, key));
         }
 
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         Ok((puts.len(), deletes.len()))
     }
 
@@ -1476,7 +1556,7 @@ impl AnvilStorage {
         limit: usize,
     ) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
         let key_prefix = format!("state:{}:{}", namespace, prefix).into_bytes();
-        let mut iter = self.db.scan_prefix(&key_prefix).await?;
+        let mut iter = self.db.scan_prefix(&key_prefix, ..).await?;
         let mut results = Vec::new();
         let namespace_prefix = format!("state:{}:", namespace);
 
@@ -1496,7 +1576,7 @@ impl AnvilStorage {
     pub async fn list_queues(&self) -> Result<Vec<String>, StorageError> {
         // Scan new counter key prefix first
         let mut queues = Vec::new();
-        let mut iter = self.db.scan_prefix(b"seq_push:").await?;
+        let mut iter = self.db.scan_prefix(b"seq_push:", ..).await?;
         while let Ok(Some(kv)) = iter.next().await {
             let key_str = String::from_utf8_lossy(&kv.key);
             if let Some(queue) = key_str.strip_prefix("seq_push:") {
@@ -1505,7 +1585,7 @@ impl AnvilStorage {
         }
 
         // Fallback: also scan old meta: prefix for migration
-        let mut iter = self.db.scan_prefix(b"meta:").await?;
+        let mut iter = self.db.scan_prefix(b"meta:", ..).await?;
         let existing: std::collections::HashSet<String> = queues.iter().cloned().collect();
         while let Ok(Some(kv)) = iter.next().await {
             let key_str = String::from_utf8_lossy(&kv.key);
@@ -1523,7 +1603,9 @@ impl AnvilStorage {
 
     /// Mark a queue as finished (no more messages will be pushed)
     pub async fn mark_queue_finished(&self, queue: &str) -> Result<(), StorageError> {
-        self.db.put(&Self::finished_key(queue), b"1").await?;
+        let mut batch = WriteBatch::new();
+        batch.put(Self::finished_key(queue), b"1");
+        self.write_durable(batch).await?;
         self.db.flush().await?;
         tracing::info!("Queue {} marked as finished", queue);
         Ok(())
@@ -1560,7 +1642,9 @@ impl AnvilStorage {
     /// Clear the finished flag (for queue reuse/testing)
     #[allow(dead_code)]
     pub async fn clear_queue_finished(&self, queue: &str) -> Result<(), StorageError> {
-        self.db.delete(&Self::finished_key(queue)).await?;
+        let mut batch = WriteBatch::new();
+        batch.delete(Self::finished_key(queue));
+        self.write_durable(batch).await?;
         Ok(())
     }
 
@@ -1611,7 +1695,7 @@ impl AnvilStorage {
         for queue_name in &meta.partition_queues {
             Self::write_zero_counters(&mut batch, queue_name);
         }
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
 
         // Store max_pending limits for each partition queue
         if max_pending_per_partition > 0 {
@@ -1714,6 +1798,7 @@ impl AnvilStorage {
 
             for msg_id in upstream_msg_ids {
                 batch.delete(Self::claimed_key(upstream_queue, msg_id));
+                batch.delete(Self::msg_key(upstream_queue, msg_id));
                 batch.put(Self::acked_key(upstream_queue, now_ns, msg_id), []);
             }
             batch.put(
@@ -1751,7 +1836,7 @@ impl AnvilStorage {
                 let seq = base_seq + i as u64;
                 batch.put(
                     Self::msg_key(partition_queue, &msg.msg_id),
-                    &serde_json::to_vec(msg)?,
+                    encode_message(msg),
                 );
                 batch.put(
                     Self::pending_key(partition_queue, seq),
@@ -1777,7 +1862,7 @@ impl AnvilStorage {
             }
         }
 
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         Ok(all_new_msg_ids)
     }
 
@@ -1922,7 +2007,7 @@ impl AnvilStorage {
         for queue_name in &group.partition_queues {
             batch.put(Self::finished_key(queue_name), b"1");
         }
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
 
         // Clean up in-memory round-robin counters for this group
         let prefix = format!("{}_", group_name);
@@ -2096,6 +2181,102 @@ mod tests {
 
         let acked = storage.scan_acked(Some(queue)).await.unwrap();
         assert_eq!(acked.len(), 1);
+    }
+
+    /// A claim is not awaited for durability, so a crash right after it may
+    /// forget it; at-least-once then requires the message to be claimable
+    /// again after recovery rather than lost between pending and claimed.
+    #[test]
+    fn test_claim_lost_in_crash_is_redelivered() {
+        let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("anvil_crash_test_{counter}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = format!("file://{}", dir.display());
+        let queue = "crash";
+
+        let crashed = tokio::runtime::Runtime::new().unwrap();
+        let (storage, msg_id) = crashed.block_on(async {
+            let storage = AnvilStorage::new(&db_path).await.unwrap();
+            storage.create_queue(queue, 0).await.unwrap();
+            let msg = Message::new(queue.to_string(), b"payload".to_vec());
+            storage.push_message(queue, &msg).await.unwrap();
+            let claimed = storage.claim_messages(queue, 1, "worker", "lease").await.unwrap();
+            assert_eq!(claimed.len(), 1);
+            (storage, msg.msg_id)
+        });
+        crashed.shutdown_background();
+        std::mem::forget(storage);
+
+        let recovered = tokio::runtime::Runtime::new().unwrap();
+        recovered.block_on(async {
+            let storage = AnvilStorage::new(&db_path).await.unwrap();
+            let mut delivered = storage.claim_messages(queue, 1, "worker", "lease-2").await.unwrap();
+            if delivered.is_empty() {
+                // The claim did reach the WAL before the crash: then lease
+                // recovery is what hands the message out again.
+                let recovered_count = storage
+                    .recover_expired_claims(LEASE_TIMEOUT_SECS_TEST_FAST, CLAIM_AGE_TIMEOUT_SECS_TEST_LIVE_SAFE, Some(&HashMap::new()))
+                    .await
+                    .unwrap();
+                assert_eq!(recovered_count, 1);
+                delivered = storage.claim_messages(queue, 1, "worker", "lease-2").await.unwrap();
+            }
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].message.msg_id, msg_id);
+            assert_eq!(delivered[0].message.payload, b"payload");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every mutation that returned success must survive a crash. Phase one
+    /// runs on its own runtime, which is torn down without closing the
+    /// database, so no flush can sneak in after the calls return; phase two
+    /// reopens the same directory and checks the acked and pending states.
+    #[test]
+    fn test_acknowledged_writes_survive_crash() {
+        let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("anvil_crash_test_{counter}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = format!("file://{}", dir.display());
+        let queue = "crash";
+
+        let crashed = tokio::runtime::Runtime::new().unwrap();
+        let (storage, pushed_ids, acked_id) = crashed.block_on(async {
+            let storage = AnvilStorage::new(&db_path).await.unwrap();
+            storage.create_queue(queue, 0).await.unwrap();
+            let messages: Vec<Message> = (0u8..3)
+                .map(|i| Message::new(queue.to_string(), vec![i]))
+                .collect();
+            storage.push_messages(queue, &messages).await.unwrap();
+            let claimed = storage.claim_messages(queue, 1, "worker", "lease").await.unwrap();
+            let (msg_ids, claim_tokens) = split_claims(&claimed);
+            storage
+                .ack_messages(queue, &msg_ids, &claim_tokens, "worker", "lease")
+                .await
+                .unwrap();
+            let pushed_ids: Vec<String> = messages.into_iter().map(|m| m.msg_id).collect();
+            (storage, pushed_ids, msg_ids[0].clone())
+        });
+        crashed.shutdown_background();
+        std::mem::forget(storage);
+
+        let recovered = tokio::runtime::Runtime::new().unwrap();
+        recovered.block_on(async {
+            let storage = AnvilStorage::new(&db_path).await.unwrap();
+            let acked = storage.scan_acked(Some(queue)).await.unwrap();
+            assert_eq!(acked.len(), 1);
+            assert_eq!(acked[0].2, acked_id);
+
+            let claimed = storage.claim_messages(queue, 10, "worker", "lease-2").await.unwrap();
+            let mut pending_ids: Vec<String> =
+                claimed.iter().map(|c| c.message.msg_id.clone()).collect();
+            pending_ids.sort();
+            let mut expected: Vec<String> =
+                pushed_ids.into_iter().filter(|id| *id != acked_id).collect();
+            expected.sort();
+            assert_eq!(pending_ids, expected);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

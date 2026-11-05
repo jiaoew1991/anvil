@@ -1,0 +1,13 @@
+# SlateDB's write/put/delete return once a change is in the in-memory WAL,
+# before it is durable. Anvil reports an RPC as successful only after its
+# effect would survive a crash, so every mutation goes through
+# AnvilStorage::write_durable; an intentional exception needs an #[allow]
+# with its reason.
+disallowed-methods = [
+    { path = "slatedb::Db::write", reason = "returns before durability; use AnvilStorage::write_durable" },
+    { path = "slatedb::Db::write_with_options", reason = "returns before durability; use AnvilStorage::write_durable" },
+    { path = "slatedb::Db::put", reason = "returns before durability; use AnvilStorage::write_durable" },
+    { path = "slatedb::Db::put_with_options", reason = "returns before durability; use AnvilStorage::write_durable" },
+    { path = "slatedb::Db::delete", reason = "returns before durability; use AnvilStorage::write_durable" },
+    { path = "slatedb::Db::delete_with_options", reason = "returns before durability; use AnvilStorage::write_durable" },
+]

@@ -20,6 +20,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use futures::StreamExt;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -30,6 +31,10 @@ use crate::service::AnvilService;
 use crate::state::AnvilState;
 use crate::storage::AnvilStorage;
 use crate::types::AnvilConfig;
+
+/// Pause after a failed accept before the next one, so a burst of failures
+/// under fd exhaustion does not spin a core.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Anvil broker inner implementation
 pub struct AnvilBrokerInner {
@@ -111,8 +116,21 @@ impl AnvilBrokerInner {
 
         tracing::info!("Anvil server starting on {}", actual_addr);
 
-        // Convert to stream for tonic
-        let incoming = TcpListenerStream::new(listener);
+        // A failed accept (EMFILE under fd exhaustion, ECONNABORTED) must not
+        // end the server: tonic stops serving on the first error the incoming
+        // stream yields, which would refuse every later worker for good.
+        // Drop the failed accept, back off briefly so fd pressure can ease,
+        // and keep listening.
+        let incoming = TcpListenerStream::new(listener).filter_map(|accepted| async move {
+            match accepted {
+                Ok(stream) => Some(Ok::<_, std::io::Error>(stream)),
+                Err(e) => {
+                    tracing::warn!("accept failed, retrying: {}", e);
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    None
+                }
+            }
+        });
 
         // Spawn server task with HTTP2 keepalive settings
         tokio::spawn(async move {
