@@ -268,6 +268,7 @@ impl AnvilStorage {
     /// Commit a batch and wait until it is durable. SlateDB's `write`
     /// returns once the batch is in the in-memory WAL; every anvil RPC must
     /// not report success before its effect would survive a crash.
+    #[allow(clippy::disallowed_methods)] // the one sanctioned write path
     async fn write_durable(&self, batch: WriteBatch) -> Result<(), StorageError> {
         self.db.write(batch).await?.await_durable().await?;
         Ok(())
@@ -2182,6 +2183,57 @@ mod tests {
 
         let acked = storage.scan_acked(Some(queue)).await.unwrap();
         assert_eq!(acked.len(), 1);
+    }
+
+    /// Every mutation that returned success must survive a crash. Phase one
+    /// runs on its own runtime, which is torn down without closing the
+    /// database, so no flush can sneak in after the calls return; phase two
+    /// reopens the same directory and checks the acked and pending states.
+    #[test]
+    fn test_acknowledged_writes_survive_crash() {
+        let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("anvil_crash_test_{counter}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = format!("file://{}", dir.display());
+        let queue = "crash";
+
+        let crashed = tokio::runtime::Runtime::new().unwrap();
+        let (storage, pushed_ids, acked_id) = crashed.block_on(async {
+            let storage = AnvilStorage::new(&db_path).await.unwrap();
+            storage.create_queue(queue, 0).await.unwrap();
+            let messages: Vec<Message> = (0u8..3)
+                .map(|i| Message::new(queue.to_string(), vec![i]))
+                .collect();
+            storage.push_messages(queue, &messages).await.unwrap();
+            let claimed = storage.claim_messages(queue, 1, "worker", "lease").await.unwrap();
+            let (msg_ids, claim_tokens) = split_claims(&claimed);
+            storage
+                .ack_messages(queue, &msg_ids, &claim_tokens, "worker", "lease")
+                .await
+                .unwrap();
+            let pushed_ids: Vec<String> = messages.into_iter().map(|m| m.msg_id).collect();
+            (storage, pushed_ids, msg_ids[0].clone())
+        });
+        crashed.shutdown_background();
+        std::mem::forget(storage);
+
+        let recovered = tokio::runtime::Runtime::new().unwrap();
+        recovered.block_on(async {
+            let storage = AnvilStorage::new(&db_path).await.unwrap();
+            let acked = storage.scan_acked(Some(queue)).await.unwrap();
+            assert_eq!(acked.len(), 1);
+            assert_eq!(acked[0].2, acked_id);
+
+            let claimed = storage.claim_messages(queue, 10, "worker", "lease-2").await.unwrap();
+            let mut pending_ids: Vec<String> =
+                claimed.iter().map(|c| c.message.msg_id.clone()).collect();
+            pending_ids.sort();
+            let mut expected: Vec<String> =
+                pushed_ids.into_iter().filter(|id| *id != acked_id).collect();
+            expected.sort();
+            assert_eq!(pending_ids, expected);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
