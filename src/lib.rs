@@ -78,7 +78,9 @@ pub struct BrokerConfig {
     #[pyo3(get, set)]
     pub port: u16,
     #[pyo3(get, set)]
-    pub claim_timeout_secs: f64,
+    pub lease_timeout_secs: f64,
+    #[pyo3(get, set)]
+    pub claim_age_timeout_secs: f64,
     #[pyo3(get, set)]
     pub recovery_interval_secs: f64,
     #[pyo3(get, set)]
@@ -93,33 +95,52 @@ pub struct BrokerConfig {
 impl BrokerConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (db_path, host="0.0.0.0".to_string(), port=0, claim_timeout_secs=60.0, recovery_interval_secs=10.0, max_queue_depth=0, acked_retention_secs=3600.0, gc_interval_secs=60.0))]
+    #[pyo3(signature = (db_path, host="0.0.0.0".to_string(), port=0, lease_timeout_secs=60.0, claim_age_timeout_secs=60.0, recovery_interval_secs=10.0, max_queue_depth=0, acked_retention_secs=3600.0, gc_interval_secs=60.0))]
     fn new(
         db_path: String,
         host: String,
         port: u16,
-        claim_timeout_secs: f64,
+        lease_timeout_secs: f64,
+        claim_age_timeout_secs: f64,
         recovery_interval_secs: f64,
         max_queue_depth: usize,
         acked_retention_secs: f64,
         gc_interval_secs: f64,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        // A non-positive timeout reclaims every claim on the first recovery
+        // tick, so the queue would redeliver work as fast as it hands it out.
+        if lease_timeout_secs <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "lease_timeout_secs must be positive",
+            ));
+        }
+        if claim_age_timeout_secs <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "claim_age_timeout_secs must be positive",
+            ));
+        }
+        Ok(Self {
             db_path,
             host,
             port,
-            claim_timeout_secs,
+            lease_timeout_secs,
+            claim_age_timeout_secs,
             recovery_interval_secs,
             max_queue_depth,
             acked_retention_secs,
             gc_interval_secs,
-        }
+        })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "BrokerConfig(db_path='{}', host='{}', port={}, claim_timeout_secs={}, gc_interval_secs={})",
-            self.db_path, self.host, self.port, self.claim_timeout_secs, self.gc_interval_secs
+            "BrokerConfig(db_path='{}', host='{}', port={}, lease_timeout_secs={}, claim_age_timeout_secs={}, gc_interval_secs={})",
+            self.db_path,
+            self.host,
+            self.port,
+            self.lease_timeout_secs,
+            self.claim_age_timeout_secs,
+            self.gc_interval_secs
         )
     }
 }
@@ -130,7 +151,8 @@ impl From<BrokerConfig> for AnvilConfig {
             db_path: config.db_path,
             host: config.host,
             port: config.port,
-            claim_timeout_secs: config.claim_timeout_secs,
+            lease_timeout_secs: config.lease_timeout_secs,
+            claim_age_timeout_secs: config.claim_age_timeout_secs,
             recovery_interval_secs: config.recovery_interval_secs,
             max_queue_depth: config.max_queue_depth,
             acked_retention_secs: config.acked_retention_secs,

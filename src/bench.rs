@@ -94,7 +94,8 @@ mod tests {
             db_path: "memory://".to_string(),
             host: "127.0.0.1".to_string(),
             port: 0,
-            claim_timeout_secs: 300.0, // long timeout for benchmarks
+            lease_timeout_secs: 300.0, // long timeouts for benchmarks
+            claim_age_timeout_secs: 300.0,
             recovery_interval_secs: 600.0,
             max_queue_depth: 0,
             acked_retention_secs: 60.0,

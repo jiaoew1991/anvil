@@ -195,8 +195,14 @@ pub struct AnvilConfig {
     pub port: u16,
     /// SlateDB storage path (memory://, file://, or s3://)
     pub db_path: String,
-    /// Claim timeout in seconds (messages reclaimed if worker doesn't heartbeat)
-    pub claim_timeout_secs: f64,
+    /// Seconds a lease may go without a heartbeat before its worker is
+    /// considered dead and every claim it holds is reclaimed. Detects crashed
+    /// workers, so keep it short (a few heartbeat intervals).
+    pub lease_timeout_secs: f64,
+    /// Seconds a single claim may be held, even under a live lease, before it
+    /// is treated as stuck and reclaimed. Bounds task duration, so it must
+    /// exceed the slowest legitimate task or that task is redelivered forever.
+    pub claim_age_timeout_secs: f64,
     /// Recovery task interval in seconds
     pub recovery_interval_secs: f64,
     /// Maximum queue depth (0 = unlimited) - reserved for future use
@@ -214,7 +220,8 @@ impl Default for AnvilConfig {
             host: "0.0.0.0".to_string(),
             port: 0,
             db_path: "memory://anvil".to_string(),
-            claim_timeout_secs: 60.0,
+            lease_timeout_secs: 60.0,
+            claim_age_timeout_secs: 60.0,
             recovery_interval_secs: 10.0,
             max_queue_depth: 0,
             acked_retention_secs: 3600.0,
@@ -270,7 +277,8 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.port, 0);
         assert_eq!(config.db_path, "memory://anvil");
-        assert_eq!(config.claim_timeout_secs, 60.0);
+        assert_eq!(config.lease_timeout_secs, 60.0);
+        assert_eq!(config.claim_age_timeout_secs, 60.0);
         assert_eq!(config.recovery_interval_secs, 10.0);
         assert_eq!(config.max_queue_depth, 0);
     }

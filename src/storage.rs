@@ -1967,10 +1967,8 @@ mod tests {
     //      slack" number.
     // ─────────────────────────────────────────────────────────────────────
 
-    /// Production default for `BrokerConfig::claim_timeout_secs` (60 s).
-    /// The single-knob compatibility layer in `recovery.rs` uses this same
-    /// value for both lease freshness and claim age — see the comment in
-    /// `RecoveryTask::start`.
+    /// Production defaults for `BrokerConfig::lease_timeout_secs` and
+    /// `BrokerConfig::claim_age_timeout_secs` (60 s each).
     const LEASE_TIMEOUT_SECS_PRODUCTION: f64 = 60.0;
     const CLAIM_AGE_TIMEOUT_SECS_PRODUCTION: f64 = 60.0;
 

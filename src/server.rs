@@ -49,7 +49,11 @@ impl AnvilBrokerInner {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         tracing::info!("Initializing Anvil broker...");
         tracing::info!("  Storage: {}", config.db_path);
-        tracing::info!("  Claim timeout: {}s", config.claim_timeout_secs);
+        tracing::info!(
+            "  Lease timeout: {}s, claim age timeout: {}s",
+            config.lease_timeout_secs,
+            config.claim_age_timeout_secs
+        );
         tracing::info!(
             "  GC interval: {}s, retention: {}s",
             config.gc_interval_secs,
