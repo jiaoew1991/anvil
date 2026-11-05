@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use slatedb::{Db, DbRead, Error as SlateError, WriteBatch};
+use slatedb::{Db, DbReadOps, Error as SlateError, WriteBatch};
 
 use crate::types::{now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta};
 
@@ -240,15 +240,21 @@ pub struct AnvilStorage {
 
 impl AnvilStorage {
     pub async fn new(db_path: &str) -> Result<Self, StorageError> {
-        let object_store = Db::resolve_object_store(db_path)?;
-        let mut builder = Db::builder("/", object_store);
+        // SlateDB resolves only the store root (scheme and authority, e.g.
+        // `s3://bucket`); the path inside it is given to the builder.
+        let mut store_url = url::Url::parse(db_path)
+            .map_err(|e| SlateError::invalid(format!("invalid db_path {db_path}: {e}")))?;
+        let db_root = store_url.path().to_string();
+        store_url.set_path("");
+        let object_store = Db::resolve_object_store(store_url.as_str())?;
+        let mut builder = Db::builder(db_root, object_store);
         // EXPERIMENT: block cache size override, to be replaced by AnvilConfig.
         if let Ok(mib) = std::env::var("ANVIL_EXP_BLOCK_CACHE_MB") {
             let max_capacity = mib.parse::<u64>().expect("ANVIL_EXP_BLOCK_CACHE_MB") << 20;
             let cache = slatedb::db_cache::foyer::FoyerCache::new_with_opts(
                 slatedb::db_cache::foyer::FoyerCacheOptions { max_capacity, shards: 64 },
             );
-            builder = builder.with_memory_cache(Arc::new(cache));
+            builder = builder.with_db_cache(Arc::new(cache), 0);
         }
         let db = builder.build().await?;
         Ok(Self {
@@ -257,6 +263,14 @@ impl AnvilStorage {
             steal_rr: std::sync::Mutex::new(HashMap::new()),
             max_pending_limits: DashMap::new(),
         })
+    }
+
+    /// Commit a batch and wait until it is durable. SlateDB's `write`
+    /// returns once the batch is in the in-memory WAL; every anvil RPC must
+    /// not report success before its effect would survive a crash.
+    async fn write_durable(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.db.write(batch).await?.await_durable().await?;
+        Ok(())
     }
 
     /// Close the storage gracefully.
@@ -551,7 +565,7 @@ impl AnvilStorage {
                 Self::cnt_total_acked_key(queue),
                 old_meta.total_acked.to_le_bytes(),
             );
-            self.db.write(batch).await?;
+            self.write_durable(batch).await?;
 
             c
         };
@@ -565,7 +579,7 @@ impl AnvilStorage {
     /// Read QueueMeta from legacy meta:{queue} key.
     /// Kept for backward compat and migration path.
     #[allow(dead_code)]
-    async fn get_meta_from_reader<R: DbRead + Sync + ?Sized>(
+    async fn get_meta_from_reader<R: DbReadOps + Sync + ?Sized>(
         reader: &R,
         queue: &str,
     ) -> Result<QueueMeta, StorageError> {
@@ -607,7 +621,7 @@ impl AnvilStorage {
 
         let mut batch = WriteBatch::new();
         Self::write_zero_counters(&mut batch, queue);
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         self.db.flush().await?;
 
         Ok(())
@@ -689,7 +703,7 @@ impl AnvilStorage {
         // Guard drops at end-of-scope — both on the Ok return below and on
         // the `?` propagation from `db.write` errors. No early-return path
         // can leak the reservation.
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         Ok(())
     }
 
@@ -801,7 +815,7 @@ impl AnvilStorage {
             Self::cnt_total_claimed_key(queue),
             persisted_total_claimed.to_le_bytes(),
         );
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
 
         Ok(result)
     }
@@ -964,7 +978,7 @@ impl AnvilStorage {
 
         // Guard drops at end-of-scope (on success or `?`-propagated error
         // from db.write), advancing the downstream watermark.
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         Ok(())
     }
 
@@ -1229,7 +1243,7 @@ impl AnvilStorage {
         // the reservation is still closed out (just with no pending_key
         // committed for the missing batch — which is the correct
         // localization of a failed nack).
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         Ok(())
     }
 
@@ -1246,7 +1260,7 @@ impl AnvilStorage {
         };
 
         let mut results = Vec::new();
-        let mut iter = self.db.scan_prefix(&prefix).await?;
+        let mut iter = self.db.scan_prefix(&prefix, ..).await?;
 
         while let Ok(Some(kv)) = iter.next().await {
             let key_str = String::from_utf8_lossy(&kv.key);
@@ -1273,7 +1287,7 @@ impl AnvilStorage {
         };
 
         let mut results = Vec::new();
-        let mut iter = self.db.scan_prefix(&prefix).await?;
+        let mut iter = self.db.scan_prefix(&prefix, ..).await?;
 
         while let Ok(Some(kv)) = iter.next().await {
             let key_str = String::from_utf8_lossy(&kv.key);
@@ -1342,7 +1356,7 @@ impl AnvilStorage {
         }
 
         if deleted > 0 || !claimed.is_empty() || !acked.is_empty() {
-            self.db.write(batch).await?;
+            self.write_durable(batch).await?;
         }
 
         // Remove from in-memory caches
@@ -1374,12 +1388,12 @@ impl AnvilStorage {
                 batch_keys += 1;
                 deleted += 1;
                 if batch_keys == GC_BATCH_KEYS_MAX {
-                    self.db.write(std::mem::take(&mut batch)).await?;
+                    self.write_durable(std::mem::take(&mut batch)).await?;
                     batch_keys = 0;
                 }
             }
             if batch_keys > 0 {
-                self.db.write(batch).await?;
+                self.write_durable(batch).await?;
             }
         }
         if deleted > 0 {
@@ -1532,7 +1546,7 @@ impl AnvilStorage {
             batch.delete(Self::state_key(namespace, key));
         }
 
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         Ok((puts.len(), deletes.len()))
     }
 
@@ -1543,7 +1557,7 @@ impl AnvilStorage {
         limit: usize,
     ) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
         let key_prefix = format!("state:{}:{}", namespace, prefix).into_bytes();
-        let mut iter = self.db.scan_prefix(&key_prefix).await?;
+        let mut iter = self.db.scan_prefix(&key_prefix, ..).await?;
         let mut results = Vec::new();
         let namespace_prefix = format!("state:{}:", namespace);
 
@@ -1563,7 +1577,7 @@ impl AnvilStorage {
     pub async fn list_queues(&self) -> Result<Vec<String>, StorageError> {
         // Scan new counter key prefix first
         let mut queues = Vec::new();
-        let mut iter = self.db.scan_prefix(b"seq_push:").await?;
+        let mut iter = self.db.scan_prefix(b"seq_push:", ..).await?;
         while let Ok(Some(kv)) = iter.next().await {
             let key_str = String::from_utf8_lossy(&kv.key);
             if let Some(queue) = key_str.strip_prefix("seq_push:") {
@@ -1572,7 +1586,7 @@ impl AnvilStorage {
         }
 
         // Fallback: also scan old meta: prefix for migration
-        let mut iter = self.db.scan_prefix(b"meta:").await?;
+        let mut iter = self.db.scan_prefix(b"meta:", ..).await?;
         let existing: std::collections::HashSet<String> = queues.iter().cloned().collect();
         while let Ok(Some(kv)) = iter.next().await {
             let key_str = String::from_utf8_lossy(&kv.key);
@@ -1590,7 +1604,9 @@ impl AnvilStorage {
 
     /// Mark a queue as finished (no more messages will be pushed)
     pub async fn mark_queue_finished(&self, queue: &str) -> Result<(), StorageError> {
-        self.db.put(&Self::finished_key(queue), b"1").await?;
+        let mut batch = WriteBatch::new();
+        batch.put(Self::finished_key(queue), b"1");
+        self.write_durable(batch).await?;
         self.db.flush().await?;
         tracing::info!("Queue {} marked as finished", queue);
         Ok(())
@@ -1627,7 +1643,9 @@ impl AnvilStorage {
     /// Clear the finished flag (for queue reuse/testing)
     #[allow(dead_code)]
     pub async fn clear_queue_finished(&self, queue: &str) -> Result<(), StorageError> {
-        self.db.delete(&Self::finished_key(queue)).await?;
+        let mut batch = WriteBatch::new();
+        batch.delete(Self::finished_key(queue));
+        self.write_durable(batch).await?;
         Ok(())
     }
 
@@ -1678,7 +1696,7 @@ impl AnvilStorage {
         for queue_name in &meta.partition_queues {
             Self::write_zero_counters(&mut batch, queue_name);
         }
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
 
         // Store max_pending limits for each partition queue
         if max_pending_per_partition > 0 {
@@ -1845,7 +1863,7 @@ impl AnvilStorage {
             }
         }
 
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
         Ok(all_new_msg_ids)
     }
 
@@ -1990,7 +2008,7 @@ impl AnvilStorage {
         for queue_name in &group.partition_queues {
             batch.put(Self::finished_key(queue_name), b"1");
         }
-        self.db.write(batch).await?;
+        self.write_durable(batch).await?;
 
         // Clean up in-memory round-robin counters for this group
         let prefix = format!("{}_", group_name);
