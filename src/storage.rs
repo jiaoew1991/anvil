@@ -44,7 +44,7 @@ use crate::types::{now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta
 const GC_BATCH_KEYS_MAX: usize = 10_000;
 
 /// Upper bound on keys one GC pass deletes; the next pass resumes the rest.
-const GC_PASS_KEYS_MAX: usize = 1_000_000;
+pub(crate) const GC_PASS_KEYS_MAX: usize = 1_000_000;
 
 /// On-disk form of a message body. Protobuf rather than JSON because JSON
 /// encodes the payload bytes as a number array, inflating it about 3.5x, and

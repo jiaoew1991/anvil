@@ -28,8 +28,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 
 use crate::state::AnvilState;
-use crate::storage::AnvilStorage;
+use crate::storage::{AnvilStorage, GC_PASS_KEYS_MAX};
 use crate::types::AnvilConfig;
+
+/// Upper bound on back-to-back GC passes in one interval (100M entries at
+/// the per-pass cap), so a pathological backlog still yields to shutdown.
+const GC_PASSES_PER_TICK_MAX: usize = 100;
 
 /// Recovery task manager - recovers expired claims
 pub struct RecoveryTask {
@@ -206,8 +210,22 @@ impl GcTask {
                             break;
                         }
 
-                        if let Err(e) = storage.gc_acked_messages(retention_ns).await {
-                            tracing::error!("GC error: {}", e);
+                        // A pass that hit its cap left expired entries behind.
+                        // Acks can outpace one capped pass per interval, so keep
+                        // passing until the backlog is cleared rather than let
+                        // it grow without bound.
+                        for _ in 0..GC_PASSES_PER_TICK_MAX {
+                            if !running.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            match storage.gc_acked_messages(retention_ns).await {
+                                Ok(deleted) if deleted == GC_PASS_KEYS_MAX => continue,
+                                Ok(_) => break,
+                                Err(e) => {
+                                    tracing::error!("GC error: {}", e);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
