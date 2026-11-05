@@ -707,6 +707,8 @@ mod tests {
         // Caps the processing phase so a large backlog can be probed without
         // draining it; 0 drains the whole queue.
         let process_secs_max: u64 = env_or("ANVIL_BENCH_PROCESS_SECS", 0);
+        // Shortened to make acked GC run within a bench of a few minutes.
+        let acked_retention_secs: f64 = env_or("ANVIL_BENCH_ACKED_RETENTION_SECS", 3600.0);
         assert!(payload_bytes >= ITEM_KEY_BYTES);
 
         let config = AnvilConfig {
@@ -717,7 +719,7 @@ mod tests {
             claim_age_timeout_secs: 3600.0,
             recovery_interval_secs: 10.0,
             max_queue_depth: 0,
-            acked_retention_secs: 3600.0,
+            acked_retention_secs,
             gc_interval_secs: 60.0,
         };
         let storage = Arc::new(AnvilStorage::new(&config.db_path).await.unwrap());
