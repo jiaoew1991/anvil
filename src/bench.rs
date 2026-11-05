@@ -665,4 +665,235 @@ mod tests {
         assert!(r.throughput > 0.0, "Throughput must be positive");
         assert!(r.total_messages > 0, "Must process some messages");
     }
+
+    // ========================================================================
+    // Work-queue load: one dispatch phase, then many single-key workers
+    // that ack each key together with its ledger entry.
+    // ========================================================================
+
+    fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+        match std::env::var(name) {
+            Ok(value) => value.parse().ok().expect(name),
+            Err(_) => default,
+        }
+    }
+
+    fn process_rss_mib() -> u64 {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().parse::<u64>().unwrap_or(0) / 1024
+    }
+
+    const ITEM_KEY_BYTES: usize = 96;
+
+    /// Run with, for example:
+    /// `ANVIL_BENCH_KEYS=1000000 ANVIL_BENCH_WORKERS=1000 ANVIL_BENCH_DB=file:///tmp/anvil-bench
+    ///  cargo test --release bench_worker_profile -- --nocapture --ignored`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn bench_worker_profile() {
+        let keys: usize = env_or("ANVIL_BENCH_KEYS", 1_000_000);
+        let workers: usize = env_or("ANVIL_BENCH_WORKERS", 1000);
+        let producers: usize = env_or("ANVIL_BENCH_PRODUCERS", 8);
+        let push_batch: usize = env_or("ANVIL_BENCH_PUSH_BATCH", 1000);
+        let claim_batch: usize = env_or("ANVIL_BENCH_CLAIM_BATCH", 1);
+        let payload_bytes: usize = env_or("ANVIL_BENCH_PAYLOAD_BYTES", 256);
+        let db_path: String = env_or("ANVIL_BENCH_DB", "memory://".to_string());
+        // Caps the processing phase so a large backlog can be probed without
+        // draining it; 0 drains the whole queue.
+        let process_secs_max: u64 = env_or("ANVIL_BENCH_PROCESS_SECS", 0);
+        assert!(payload_bytes >= ITEM_KEY_BYTES);
+
+        let config = AnvilConfig {
+            db_path: db_path.clone(),
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            lease_timeout_secs: 300.0,
+            claim_age_timeout_secs: 3600.0,
+            recovery_interval_secs: 10.0,
+            max_queue_depth: 0,
+            acked_retention_secs: 3600.0,
+            gc_interval_secs: 60.0,
+        };
+        let storage = Arc::new(AnvilStorage::new(&config.db_path).await.unwrap());
+        let mut broker = AnvilBrokerInner::new_with_storage(config, storage.clone())
+            .await
+            .unwrap();
+        let port = broker.start().await.unwrap();
+        std::mem::forget(broker);
+
+        println!(
+            "\n=== worker profile: keys={keys} workers={workers} producers={producers} \
+             push_batch={push_batch} claim_batch={claim_batch} payload={payload_bytes}B db={db_path} ==="
+        );
+
+        let queue = "items".to_string();
+        let (mut admin, _) = connect_client(port, "dispatcher-admin").await;
+        admin
+            .create_queue(proto::CreateQueueRequest { queue: queue.clone(), max_pending: 0 })
+            .await
+            .unwrap();
+
+        // Dispatch: every payload starts with a fixed-width row key that the
+        // worker writes back into the ledger, like a per-item status ledger.
+        let dispatch_start = Instant::now();
+        let mut handles = Vec::new();
+        for producer in 0..producers {
+            let q = queue.clone();
+            handles.push(tokio::spawn(async move {
+                let (mut client, _) = connect_client(port, &format!("dispatcher-{producer}")).await;
+                let mut latencies = Vec::new();
+                let mut index = producer;
+                while index < keys {
+                    let mut payloads = Vec::with_capacity(push_batch);
+                    while index < keys && payloads.len() < push_batch {
+                        let mut payload =
+                            format!("{:<width$}", format!("datasets/items/{index:012}.bin"), width = ITEM_KEY_BYTES)
+                                .into_bytes();
+                        payload.resize(payload_bytes, b'x');
+                        payloads.push(payload);
+                        index += producers;
+                    }
+                    let t = Instant::now();
+                    client
+                        .push(proto::PushRequest { queue: q.clone(), payloads, metadata: Default::default() })
+                        .await
+                        .unwrap();
+                    latencies.push(t.elapsed().as_micros() as u64);
+                }
+                latencies
+            }));
+        }
+        let mut push_latencies = Vec::new();
+        for h in handles {
+            push_latencies.extend(h.await.unwrap());
+        }
+        push_latencies.sort();
+        let dispatch_secs = dispatch_start.elapsed().as_secs_f64();
+        admin
+            .mark_queue_finished(proto::MarkQueueFinishedRequest { queue: queue.clone() })
+            .await
+            .unwrap();
+        let percentile = |v: &Vec<u64>, p: f64| v[((p / 100.0 * v.len() as f64) as usize).min(v.len() - 1)];
+        println!(
+            "dispatch: {keys} keys in {dispatch_secs:.1}s = {:.0} keys/s | push RPC p50={}ms p99={}ms | rss={}MiB",
+            keys as f64 / dispatch_secs,
+            percentile(&push_latencies, 50.0) / 1000,
+            percentile(&push_latencies, 99.0) / 1000,
+            process_rss_mib()
+        );
+
+        // Connect workers one at a time: a burst of simultaneous connects
+        // overflows the listen backlog (128 on macOS), which is a property of
+        // the host, not of the broker.
+        let mut clients = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            clients.push(connect_client(port, &format!("worker-{worker}")).await);
+        }
+
+        let acked = Arc::new(AtomicU64::new(0));
+        let process_start = Instant::now();
+        let reporter_acked = acked.clone();
+        let reporter = tokio::spawn(async move {
+            let mut previous = 0;
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let now = reporter_acked.load(Ordering::Relaxed);
+                println!(
+                    "  t={:>5.0}s acked={now:>10} window={:>7.0} keys/s rss={}MiB",
+                    process_start.elapsed().as_secs_f64(),
+                    (now - previous) as f64 / 10.0,
+                    process_rss_mib()
+                );
+                previous = now;
+            }
+        });
+
+        let mut handles = Vec::new();
+        for (worker, (mut client, lease)) in clients.into_iter().enumerate() {
+            let q = queue.clone();
+            let acked = acked.clone();
+            handles.push(tokio::spawn(async move {
+                let deadline = (process_secs_max > 0)
+                    .then(|| process_start + Duration::from_secs(process_secs_max));
+                let worker_id = format!("worker-{worker}");
+                let mut claim_latencies = Vec::new();
+                let mut ack_latencies = Vec::new();
+                loop {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        break;
+                    }
+                    let t = Instant::now();
+                    let response = client
+                        .claim(proto::ClaimRequest {
+                            source: Some(proto::claim_request::Source::Queue(q.clone())),
+                            worker_id: worker_id.clone(),
+                            lease_id: lease.clone(),
+                            batch_size: claim_batch as i32,
+                            timeout_ms: 1000,
+                        })
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    if response.messages.is_empty() {
+                        if response.upstream_drained {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    claim_latencies.push(t.elapsed().as_micros() as u64);
+
+                    let mut puts = std::collections::HashMap::new();
+                    for message in &response.messages {
+                        let key = String::from_utf8_lossy(&message.payload[..ITEM_KEY_BYTES]);
+                        puts.insert(format!("item_state:{}", key.trim_end()), b"succeeded".to_vec());
+                    }
+                    let count = response.messages.len() as u64;
+                    let t = Instant::now();
+                    client
+                        .complete(proto::CompleteRequest {
+                            upstream_queue: q.clone(),
+                            msg_ids: response.messages.iter().map(|m| m.msg_id.clone()).collect(),
+                            claim_tokens: response.messages.iter().map(|m| m.claim_token.clone()).collect(),
+                            worker_id: worker_id.clone(),
+                            lease_id: lease.clone(),
+                            action: Some(proto::complete_request::Action::Ack(proto::AckAction {})),
+                            state: Some(proto::StateUpdate { namespace: "ledger".to_string(), puts, deletes: vec![] }),
+                        })
+                        .await
+                        .unwrap();
+                    ack_latencies.push(t.elapsed().as_micros() as u64);
+                    acked.fetch_add(count, Ordering::Relaxed);
+                }
+                (claim_latencies, ack_latencies)
+            }));
+        }
+        let mut claim_latencies = Vec::new();
+        let mut ack_latencies = Vec::new();
+        for h in handles {
+            let (c, a) = h.await.unwrap();
+            claim_latencies.extend(c);
+            ack_latencies.extend(a);
+        }
+        reporter.abort();
+        claim_latencies.sort();
+        ack_latencies.sort();
+        let process_secs = process_start.elapsed().as_secs_f64();
+        let total = acked.load(Ordering::Relaxed);
+        println!(
+            "process: {total} keys in {process_secs:.1}s = {:.0} keys/s | claim p50={}ms p99={}ms | ack+ledger p50={}ms p99={}ms | rss={}MiB",
+            total as f64 / process_secs,
+            percentile(&claim_latencies, 50.0) / 1000,
+            percentile(&claim_latencies, 99.0) / 1000,
+            percentile(&ack_latencies, 50.0) / 1000,
+            percentile(&ack_latencies, 99.0) / 1000,
+            process_rss_mib()
+        );
+        if process_secs_max == 0 {
+            assert_eq!(total, keys as u64);
+        }
+    }
 }

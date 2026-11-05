@@ -39,6 +39,49 @@ use slatedb::{Db, DbRead, Error as SlateError, WriteBatch};
 
 use crate::types::{now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta};
 
+/// Upper bound on keys one GC write deletes, so a large expired backlog is
+/// retired in many small commits instead of one batch that stalls writers.
+const GC_BATCH_KEYS_MAX: usize = 10_000;
+
+/// Upper bound on keys one GC pass deletes; the next pass resumes the rest.
+const GC_PASS_KEYS_MAX: usize = 1_000_000;
+
+/// On-disk form of a message body. Protobuf rather than JSON because JSON
+/// encodes the payload bytes as a number array, inflating it about 3.5x, and
+/// the body is the bulk of what the queue writes.
+#[derive(Clone, PartialEq, prost::Message)]
+struct StoredMessage {
+    #[prost(string, tag = "1")]
+    msg_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    payload: Vec<u8>,
+    #[prost(double, tag = "3")]
+    created_at: f64,
+    #[prost(map = "string, string", tag = "4")]
+    metadata: HashMap<String, String>,
+}
+
+fn encode_message(msg: &Message) -> Vec<u8> {
+    prost::Message::encode_to_vec(&StoredMessage {
+        msg_id: msg.msg_id.clone(),
+        payload: msg.payload.clone(),
+        created_at: msg.created_at,
+        metadata: msg.metadata.clone(),
+    })
+}
+
+fn decode_message(queue: &str, bytes: &[u8]) -> Result<Message, StorageError> {
+    let stored: StoredMessage = prost::Message::decode(bytes)
+        .map_err(|e| SlateError::invalid(format!("corrupt message body: {e}")))?;
+    Ok(Message {
+        msg_id: stored.msg_id,
+        queue: queue.to_string(),
+        payload: stored.payload,
+        created_at: stored.created_at,
+        metadata: stored.metadata,
+    })
+}
+
 pub type StorageError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Per-queue in-memory state. **Single source of truth** for everything
@@ -198,7 +241,16 @@ pub struct AnvilStorage {
 impl AnvilStorage {
     pub async fn new(db_path: &str) -> Result<Self, StorageError> {
         let object_store = Db::resolve_object_store(db_path)?;
-        let db = Db::open("/", object_store).await?;
+        let mut builder = Db::builder("/", object_store);
+        // EXPERIMENT: block cache size override, to be replaced by AnvilConfig.
+        if let Ok(mib) = std::env::var("ANVIL_EXP_BLOCK_CACHE_MB") {
+            let max_capacity = mib.parse::<u64>().expect("ANVIL_EXP_BLOCK_CACHE_MB") << 20;
+            let cache = slatedb::db_cache::foyer::FoyerCache::new_with_opts(
+                slatedb::db_cache::foyer::FoyerCacheOptions { max_capacity, shards: 64 },
+            );
+            builder = builder.with_memory_cache(Arc::new(cache));
+        }
+        let db = builder.build().await?;
         Ok(Self {
             db,
             counters: DashMap::new(),
@@ -627,7 +679,7 @@ impl AnvilStorage {
         let mut batch = WriteBatch::new();
         for (i, msg) in messages.iter().enumerate() {
             let seq = base_seq + i as u64;
-            batch.put(Self::msg_key(queue, &msg.msg_id), &serde_json::to_vec(msg)?);
+            batch.put(Self::msg_key(queue, &msg.msg_id), encode_message(msg));
             batch.put(Self::pending_key(queue, seq), msg.msg_id.as_bytes());
         }
         // Persist alloc cursor (monotonic across out-of-order commits) so
@@ -696,7 +748,7 @@ impl AnvilStorage {
             if let Some(msg_id_bytes) = self.db.get(&pending_key).await? {
                 let msg_id = String::from_utf8_lossy(&msg_id_bytes).to_string();
                 if let Some(msg_data) = self.db.get(&Self::msg_key(queue, &msg_id)).await? {
-                    let msg: Message = serde_json::from_slice(&msg_data)?;
+                    let msg = decode_message(queue, &msg_data)?;
                     let claim_info =
                         ClaimInfo::new(msg_id.clone(), worker_id.to_string(), lease_id.to_string());
                     claimed_items.push((pending_key, msg_id, msg, claim_info));
@@ -841,8 +893,12 @@ impl AnvilStorage {
                 (s.total_unclaimed, s.total_acked)
             };
 
+            // The body is dead once acked: no reader of acked entries needs
+            // the payload, and keeping it until GC multiplies the live data
+            // every point read has to search.
             for msg_id in msg_ids {
                 batch.delete(Self::claimed_key(queue, msg_id));
+                batch.delete(Self::msg_key(queue, msg_id));
                 batch.put(Self::acked_key(queue, now_ns, msg_id), []);
             }
             batch.put(
@@ -876,7 +932,7 @@ impl AnvilStorage {
                 for (i, msg) in messages.iter().enumerate() {
                     batch.put(
                         Self::msg_key(downstream_queue, &msg.msg_id),
-                        &serde_json::to_vec(msg)?,
+                        encode_message(msg),
                     );
                     batch.put(
                         Self::pending_key(downstream_queue, base_seq + i as u64),
@@ -1300,24 +1356,35 @@ impl AnvilStorage {
 
     pub async fn gc_acked_messages(&self, retention_ns: u64) -> Result<usize, StorageError> {
         let cutoff_ns = now_nanos().saturating_sub(retention_ns);
-        let all_acked = self.scan_acked(None).await?;
-
-        let mut batch = WriteBatch::new();
         let mut deleted = 0;
-
-        for (queue, timestamp_ns, msg_id) in all_acked {
-            if timestamp_ns < cutoff_ns {
-                batch.delete(Self::acked_key(&queue, timestamp_ns, &msg_id));
-                batch.delete(Self::msg_key(&queue, &msg_id));
+        // Acked keys sort by timestamp within a queue, so each queue's
+        // expired entries are one contiguous range ending at the cutoff:
+        // the pass never touches live entries, unlike a full prefix scan.
+        for queue in self.list_queues().await? {
+            let start = format!("acked:{}:", queue).into_bytes();
+            let end = Self::acked_key(&queue, cutoff_ns, "");
+            let mut iter = self.db.scan(start..end).await?;
+            let mut batch = WriteBatch::new();
+            let mut batch_keys = 0;
+            while deleted < GC_PASS_KEYS_MAX {
+                let Some(kv) = iter.next().await? else {
+                    break;
+                };
+                batch.delete(&kv.key);
+                batch_keys += 1;
                 deleted += 1;
+                if batch_keys == GC_BATCH_KEYS_MAX {
+                    self.db.write(std::mem::take(&mut batch)).await?;
+                    batch_keys = 0;
+                }
+            }
+            if batch_keys > 0 {
+                self.db.write(batch).await?;
             }
         }
-
         if deleted > 0 {
-            self.db.write(batch).await?;
-            tracing::info!("GC deleted {} acked messages", deleted);
+            tracing::info!("GC deleted {} acked entries", deleted);
         }
-
         Ok(deleted)
     }
 
@@ -1714,6 +1781,7 @@ impl AnvilStorage {
 
             for msg_id in upstream_msg_ids {
                 batch.delete(Self::claimed_key(upstream_queue, msg_id));
+                batch.delete(Self::msg_key(upstream_queue, msg_id));
                 batch.put(Self::acked_key(upstream_queue, now_ns, msg_id), []);
             }
             batch.put(
@@ -1751,7 +1819,7 @@ impl AnvilStorage {
                 let seq = base_seq + i as u64;
                 batch.put(
                     Self::msg_key(partition_queue, &msg.msg_id),
-                    &serde_json::to_vec(msg)?,
+                    encode_message(msg),
                 );
                 batch.put(
                     Self::pending_key(partition_queue, seq),
