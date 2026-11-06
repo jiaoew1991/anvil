@@ -115,6 +115,7 @@ mod tests {
         let (storage, scattered_id, held_id) = crashed.block_on(async {
             let storage = AnvilStorage::new(&db_path).await.unwrap();
             storage.create_queue(UPSTREAM, 0).await.unwrap();
+            storage.create_queue(FORWARD_QUEUE, 0).await.unwrap();
             storage
                 .create_queue_group(GROUP, PARTITIONS, 0)
                 .await
