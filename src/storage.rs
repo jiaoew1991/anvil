@@ -34,8 +34,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use dashmap::DashMap;
-use slatedb::{Db, DbReadOps, Error as SlateError, WriteBatch};
+use bytes::Bytes;
+use dashmap::{DashMap, DashSet};
+use slatedb::{Db, DbReadOps, Error as SlateError, MergeOperator, MergeOperatorError, WriteBatch};
 
 use crate::types::{now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta};
 
@@ -44,7 +45,11 @@ use crate::types::{now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta
 const GC_BATCH_KEYS_MAX: usize = 10_000;
 
 /// Upper bound on keys one GC pass deletes; the next pass resumes the rest.
-const GC_PASS_KEYS_MAX: usize = 1_000_000;
+pub(crate) const GC_PASS_KEYS_MAX: usize = 1_000_000;
+
+/// Width of the zero-padded seq in a pending key, enough for any u64, so
+/// keys sort in seq order.
+const PENDING_SEQ_DIGITS: usize = 20;
 
 /// On-disk form of a message body. Protobuf rather than JSON because JSON
 /// encodes the payload bytes as a number array, inflating it about 3.5x, and
@@ -59,6 +64,30 @@ struct StoredMessage {
     created_at: f64,
     #[prost(map = "string, string", tag = "4")]
     metadata: HashMap<String, String>,
+}
+
+/// Value of a `pending` key: which message waits at this seq, and how often
+/// it has been delivered before, so redeliveries keep counting.
+#[derive(Clone, PartialEq, prost::Message)]
+struct PendingEntry {
+    #[prost(string, tag = "1")]
+    msg_id: String,
+    #[prost(uint32, tag = "2")]
+    delivery_count: u32,
+}
+
+fn encode_pending(msg_id: &str, delivery_count: u32) -> Vec<u8> {
+    prost::Message::encode_to_vec(&PendingEntry {
+        msg_id: msg_id.to_string(),
+        delivery_count,
+    })
+}
+
+fn decode_pending(bytes: &[u8]) -> Result<PendingEntry, StorageError> {
+    let entry: PendingEntry = prost::Message::decode(bytes)
+        .map_err(|e| SlateError::invalid(format!("corrupt pending entry: {e}")))?;
+    assert!(!entry.msg_id.is_empty());
+    Ok(entry)
 }
 
 fn encode_message(msg: &Message) -> Vec<u8> {
@@ -227,6 +256,65 @@ pub struct AckOptions<'a> {
     pub worker_id: Option<&'a str>,
 }
 
+/// Sums the u64 increments merged into a queue's lifetime totals
+/// (`cnt_total_pushed`, `cnt_total_acked`). Each operation merges its own
+/// increment in its own batch, so the durable total is exactly the sum of
+/// the durable operations, whatever order concurrent writers reach the WAL
+/// in; a written absolute value would let an older one land last.
+struct TotalSumMergeOperator;
+
+impl TotalSumMergeOperator {
+    fn decode(key: &Bytes, value: &Bytes) -> Result<u64, MergeOperatorError> {
+        let bytes: [u8; 8] =
+            value
+                .as_ref()
+                .try_into()
+                .map_err(|_| MergeOperatorError::Callback {
+                    message: format!(
+                        "total {} holds {} bytes, not a u64",
+                        String::from_utf8_lossy(key),
+                        value.len()
+                    ),
+                })?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+}
+
+impl MergeOperator for TotalSumMergeOperator {
+    fn merge(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        value: Bytes,
+    ) -> Result<Bytes, MergeOperatorError> {
+        self.merge_batch(key, existing_value, std::slice::from_ref(&value))
+    }
+
+    fn merge_batch(
+        &self,
+        key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        if !key.starts_with(b"cnt_total_") {
+            return Err(MergeOperatorError::Callback {
+                message: format!(
+                    "merge on {}, which is not a total",
+                    String::from_utf8_lossy(key)
+                ),
+            });
+        }
+        let mut total = match &existing_value {
+            Some(value) => Self::decode(key, value)?,
+            None => 0,
+        };
+        for operand in operands {
+            total += Self::decode(key, operand)?;
+        }
+        Ok(Bytes::copy_from_slice(&total.to_le_bytes()))
+    }
+}
+
 /// Anvil storage backed by SlateDB with in-memory atomic counters
 pub struct AnvilStorage {
     db: Db,
@@ -236,6 +324,48 @@ pub struct AnvilStorage {
     steal_rr: std::sync::Mutex<HashMap<String, u64>>,
     /// Per-queue max pending limits (0 = unlimited). Used for bounded queue support.
     max_pending_limits: DashMap<String, u64>,
+    /// Claim keys whose settlement (ack, nack or reclaim) is between its
+    /// check and its durable write. Without the hold, two settlements of
+    /// one message both pass the check: a retried ack counts twice, and a
+    /// reclaim that read the claim before an ack requeues an acked message,
+    /// which undercounts `claimed_count` until a queue reports drained with
+    /// work still in flight. The broker is the database's only writer, so
+    /// an in-memory set is enough.
+    settling: DashSet<Vec<u8>>,
+}
+
+/// Claims held for settlement, released when dropped: after the durable
+/// write, on an error, or when the request future is cancelled.
+struct SettlementHold<'a> {
+    settling: &'a DashSet<Vec<u8>>,
+    claim_keys: Vec<Vec<u8>>,
+}
+
+impl<'a> SettlementHold<'a> {
+    fn new(settling: &'a DashSet<Vec<u8>>) -> Self {
+        Self {
+            settling,
+            claim_keys: Vec::new(),
+        }
+    }
+
+    /// Takes the claim unless another settlement holds it.
+    fn take(&mut self, claim_key: Vec<u8>) -> bool {
+        if !self.settling.insert(claim_key.clone()) {
+            return false;
+        }
+        self.claim_keys.push(claim_key);
+        true
+    }
+}
+
+impl Drop for SettlementHold<'_> {
+    fn drop(&mut self) {
+        for claim_key in &self.claim_keys {
+            let released = self.settling.remove(claim_key);
+            assert!(released.is_some(), "settlement hold released twice");
+        }
+    }
 }
 
 impl AnvilStorage {
@@ -247,12 +377,16 @@ impl AnvilStorage {
         let db_root = store_url.path().to_string();
         store_url.set_path("");
         let object_store = Db::resolve_object_store(store_url.as_str())?;
-        let db = Db::builder(db_root, object_store).build().await?;
+        let db = Db::builder(db_root, object_store)
+            .with_merge_operator(Arc::new(TotalSumMergeOperator))
+            .build()
+            .await?;
         Ok(Self {
             db,
             counters: DashMap::new(),
             steal_rr: std::sync::Mutex::new(HashMap::new()),
             max_pending_limits: DashMap::new(),
+            settling: DashSet::new(),
         })
     }
 
@@ -283,6 +417,7 @@ impl AnvilStorage {
         format!("seq_push:{}", queue).into_bytes()
     }
 
+    /// Legacy: the claim cursor is derived from the pending keys on load.
     fn seq_claim_key(queue: &str) -> Vec<u8> {
         format!("seq_claim:{}", queue).into_bytes()
     }
@@ -291,10 +426,12 @@ impl AnvilStorage {
         format!("cnt_total_pushed:{}", queue).into_bytes()
     }
 
+    /// Legacy: the in-flight count is derived from the claimed keys on load.
     fn cnt_total_claimed_key(queue: &str) -> Vec<u8> {
         format!("cnt_total_claimed:{}", queue).into_bytes()
     }
 
+    /// Legacy, like `cnt_total_claimed_key`.
     fn cnt_total_unclaimed_key(queue: &str) -> Vec<u8> {
         format!("cnt_total_unclaimed:{}", queue).into_bytes()
     }
@@ -304,7 +441,7 @@ impl AnvilStorage {
     }
 
     fn pending_key(queue: &str, seq: u64) -> Vec<u8> {
-        format!("pending:{}:{:020}", queue, seq).into_bytes()
+        format!("pending:{queue}:{seq:0width$}", width = PENDING_SEQ_DIGITS).into_bytes()
     }
 
     fn msg_key(queue: &str, msg_id: &str) -> Vec<u8> {
@@ -341,19 +478,18 @@ impl AnvilStorage {
         }
     }
 
-    /// Write 6 zero counter keys for a new queue into a WriteBatch.
+    /// Write the zero counter keys of a new queue into a WriteBatch.
     fn write_zero_counters(batch: &mut WriteBatch, queue: &str) {
         let zero = 0u64.to_le_bytes();
         batch.put(Self::seq_push_key(queue), zero);
-        batch.put(Self::seq_claim_key(queue), zero);
         batch.put(Self::cnt_total_pushed_key(queue), zero);
-        batch.put(Self::cnt_total_claimed_key(queue), zero);
-        batch.put(Self::cnt_total_unclaimed_key(queue), zero);
         batch.put(Self::cnt_total_acked_key(queue), zero);
     }
 
-    /// Validate claim tokens for a batch of message IDs.
-    /// Reads claim info from DB and verifies token, lease, and worker identity.
+    /// Holds the claims of `msg_ids` and verifies each one's token, lease and
+    /// worker. The caller settles them while it keeps the returned hold, which
+    /// must outlive its durable write: a claim that is already being settled
+    /// fails the check like a stale token.
     async fn validate_claims(
         &self,
         queue: &str,
@@ -361,9 +497,16 @@ impl AnvilStorage {
         claim_tokens: &[String],
         expected_lease_id: Option<&str>,
         expected_worker_id: Option<&str>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(SettlementHold<'_>, Vec<ClaimInfo>), StorageError> {
+        let mut hold = SettlementHold::new(&self.settling);
+        let mut claims = Vec::with_capacity(msg_ids.len());
         for (msg_id, token) in msg_ids.iter().zip(claim_tokens.iter()) {
             let claim_key = Self::claimed_key(queue, msg_id);
+            if !hold.take(claim_key.clone()) {
+                return Err(Box::new(SlateError::invalid(format!(
+                    "claim_settling: queue={queue}, msg_id={msg_id} is being settled concurrently"
+                ))));
+            }
             let claim_data = self.db.get(&claim_key).await?.ok_or_else(|| {
                 SlateError::invalid(format!(
                     "message_not_claimed: queue={queue}, msg_id={msg_id}"
@@ -396,22 +539,11 @@ impl AnvilStorage {
                     ))));
                 }
             }
+            claims.push(claim_info);
         }
-        Ok(())
-    }
-
-    /// Persist push counters into a WriteBatch (push_seq + total_pushed for a queue).
-    fn persist_push_counters(
-        batch: &mut WriteBatch,
-        queue: &str,
-        new_push_seq: u64,
-        new_total_pushed: u64,
-    ) {
-        batch.put(Self::seq_push_key(queue), new_push_seq.to_le_bytes());
-        batch.put(
-            Self::cnt_total_pushed_key(queue),
-            new_total_pushed.to_le_bytes(),
-        );
+        assert_eq!(claims.len(), msg_ids.len());
+        assert_eq!(hold.claim_keys.len(), msg_ids.len());
+        Ok((hold, claims))
     }
 
     /// Reserve a contiguous push range and register a pending entry in
@@ -450,6 +582,65 @@ impl AnvilStorage {
         }
     }
 
+    /// Seq of a pending key of `queue`, or `None` for a key of another queue
+    /// that shares the prefix (a queue named `{queue}:...`).
+    fn pending_seq(queue: &str, key: &[u8]) -> Option<u64> {
+        let seq = key.strip_prefix(format!("pending:{queue}:").as_bytes())?;
+        if seq.len() != PENDING_SEQ_DIGITS || !seq.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(seq).ok()?.parse().ok()
+    }
+
+    /// The claim and push cursors the pending keys of `queue` imply: claiming
+    /// resumes at the oldest pending entry, and pushing continues past both
+    /// the newest one and the persisted push cursor. Reads only the oldest
+    /// entry and the entries at or past the persisted cursor.
+    async fn derive_seq_range(
+        &self,
+        queue: &str,
+        push_seq_persisted: u64,
+    ) -> Result<(u64, u64), StorageError> {
+        let end = format!("pending:{queue};").into_bytes();
+
+        let mut push_seq = push_seq_persisted;
+        let mut iter = self
+            .db
+            .scan(Self::pending_key(queue, push_seq_persisted)..end.clone())
+            .await?;
+        while let Some(kv) = iter.next().await? {
+            if let Some(seq) = Self::pending_seq(queue, &kv.key) {
+                push_seq = push_seq.max(seq + 1);
+            }
+        }
+
+        let mut claim_seq = push_seq;
+        let mut iter = self.db.scan(Self::pending_key(queue, 0)..end).await?;
+        while let Some(kv) = iter.next().await? {
+            if let Some(seq) = Self::pending_seq(queue, &kv.key) {
+                claim_seq = seq;
+                break;
+            }
+        }
+        assert!(claim_seq <= push_seq);
+        Ok((claim_seq, push_seq))
+    }
+
+    /// Number of messages of `queue` claimed and not yet settled.
+    async fn count_claimed(&self, queue: &str) -> Result<u64, StorageError> {
+        let prefix = format!("claimed:{queue}:");
+        let mut iter = self.db.scan_prefix(prefix.as_bytes(), ..).await?;
+        let mut count = 0;
+        while let Some(kv) = iter.next().await? {
+            // A msg_id has no ':'; a key with one belongs to a queue named
+            // `{queue}:...`.
+            if !kv.key[prefix.len()..].contains(&b':') {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Load or initialize counters for a queue.
     /// 1. Check DashMap (fast path)
     /// 2. If missing, try to load from new counter keys
@@ -461,33 +652,18 @@ impl AnvilStorage {
             return Ok(c.clone());
         }
 
-        // Try loading from new counter keys first
-        let push_seq_data = self.db.get(&Self::seq_push_key(queue)).await?;
-
-        let counters = if let Some(ps_data) = push_seq_data {
-            // New format exists — load all counter keys
-            let push_seq = Self::read_u64_le(&ps_data);
-            let claim_seq = self
-                .db
-                .get(&Self::seq_claim_key(queue))
-                .await?
-                .map(|d| Self::read_u64_le(&d))
-                .unwrap_or(0);
+        let counters = if let Some(push_seq_data) = self.db.get(&Self::seq_push_key(queue)).await? {
+            // Only the totals are taken as persisted. Cursors and the
+            // in-flight count come from the keys, which every durable batch
+            // keeps exact, so no cursor can lag behind its keys and hide a
+            // pending message.
+            let (claim_seq, push_seq) = self
+                .derive_seq_range(queue, Self::read_u64_le(&push_seq_data))
+                .await?;
+            let claimed_count = self.count_claimed(queue).await?;
             let total_pushed = self
                 .db
                 .get(&Self::cnt_total_pushed_key(queue))
-                .await?
-                .map(|d| Self::read_u64_le(&d))
-                .unwrap_or(0);
-            let total_claimed = self
-                .db
-                .get(&Self::cnt_total_claimed_key(queue))
-                .await?
-                .map(|d| Self::read_u64_le(&d))
-                .unwrap_or(0);
-            let total_unclaimed = self
-                .db
-                .get(&Self::cnt_total_unclaimed_key(queue))
                 .await?
                 .map(|d| Self::read_u64_le(&d))
                 .unwrap_or(0);
@@ -504,8 +680,8 @@ impl AnvilStorage {
                     push_seq_alloc: push_seq,
                     claim_seq,
                     total_pushed,
-                    total_claimed,
-                    total_unclaimed,
+                    total_claimed: claimed_count,
+                    total_unclaimed: 0,
                     total_acked,
                     commit_log: BTreeMap::new(),
                 }),
@@ -540,18 +716,9 @@ impl AnvilStorage {
             // Persist new counter keys
             let mut batch = WriteBatch::new();
             batch.put(Self::seq_push_key(queue), old_meta.push_seq.to_le_bytes());
-            batch.put(Self::seq_claim_key(queue), old_meta.claim_seq.to_le_bytes());
             batch.put(
                 Self::cnt_total_pushed_key(queue),
                 old_meta.total_pushed.to_le_bytes(),
-            );
-            batch.put(
-                Self::cnt_total_claimed_key(queue),
-                migrated_total_claimed.to_le_bytes(),
-            );
-            batch.put(
-                Self::cnt_total_unclaimed_key(queue),
-                migrated_total_unclaimed.to_le_bytes(),
             );
             batch.put(
                 Self::cnt_total_acked_key(queue),
@@ -583,15 +750,27 @@ impl AnvilStorage {
 
     /// Get queue metadata — single locked snapshot of in-memory state.
     pub async fn get_meta(&self, queue: &str) -> Result<QueueMeta, StorageError> {
-        let c = self.load_or_init_counters(queue).await?;
-        let s = c.state.lock().expect("queue state poisoned");
-        Ok(QueueMeta {
+        Ok(Self::meta_of(&*self.load_or_init_counters(queue).await?))
+    }
+
+    /// Metadata of every queue loaded since startup, without touching the
+    /// database, for metrics callbacks that cannot await.
+    pub fn queue_meta_snapshot(&self) -> Vec<(String, QueueMeta)> {
+        self.counters
+            .iter()
+            .map(|entry| (entry.key().clone(), Self::meta_of(entry.value())))
+            .collect()
+    }
+
+    fn meta_of(counters: &QueueCounters) -> QueueMeta {
+        let s = counters.state.lock().expect("queue state poisoned");
+        QueueMeta {
             push_seq: s.push_seq_committed,
             claim_seq: s.claim_seq,
             claimed_count: s.claimed_count(),
             total_pushed: s.total_pushed,
             total_acked: s.total_acked,
-        })
+        }
     }
 
     /// Create a queue — write the 6 counter keys (all zeros).
@@ -676,22 +855,18 @@ impl AnvilStorage {
         // guard drops (post-`db.write`).
         let _push_guard = Self::reserve_push_range(&c, count);
         let base_seq = _push_guard.base_seq;
-        let (new_alloc, new_total_pushed) = {
-            let mut s = c.state.lock().expect("queue state poisoned");
-            s.total_pushed += count;
-            (s.push_seq_alloc, s.total_pushed)
-        };
-
+        c.state.lock().expect("queue state poisoned").total_pushed += count;
         let mut batch = WriteBatch::new();
+        batch.merge(Self::cnt_total_pushed_key(queue), count.to_le_bytes());
+
         for (i, msg) in messages.iter().enumerate() {
             let seq = base_seq + i as u64;
             batch.put(Self::msg_key(queue, &msg.msg_id), encode_message(msg));
-            batch.put(Self::pending_key(queue, seq), msg.msg_id.as_bytes());
+            batch.put(
+                Self::pending_key(queue, seq),
+                encode_pending(&msg.msg_id, 0),
+            );
         }
-        // Persist alloc cursor (monotonic across out-of-order commits) so
-        // restart recovers all committed pending_keys.
-        Self::persist_push_counters(&mut batch, queue, new_alloc, new_total_pushed);
-
         // Guard drops at end-of-scope — both on the Ok return below and on
         // the `?` propagation from `db.write` errors. No early-return path
         // can leak the reservation.
@@ -751,12 +926,17 @@ impl AnvilStorage {
         let mut claimed_items = Vec::new();
         for seq in start..end {
             let pending_key = Self::pending_key(queue, seq);
-            if let Some(msg_id_bytes) = self.db.get(&pending_key).await? {
-                let msg_id = String::from_utf8_lossy(&msg_id_bytes).to_string();
+            if let Some(pending_bytes) = self.db.get(&pending_key).await? {
+                let pending = decode_pending(&pending_bytes)?;
+                let msg_id = pending.msg_id;
                 if let Some(msg_data) = self.db.get(&Self::msg_key(queue, &msg_id)).await? {
                     let msg = decode_message(queue, &msg_data)?;
-                    let claim_info =
-                        ClaimInfo::new(msg_id.clone(), worker_id.to_string(), lease_id.to_string());
+                    let claim_info = ClaimInfo::new(
+                        msg_id.clone(),
+                        worker_id.to_string(),
+                        lease_id.to_string(),
+                        pending.delivery_count + 1,
+                    );
                     claimed_items.push((pending_key, msg_id, msg, claim_info));
                 }
             } else {
@@ -775,18 +955,22 @@ impl AnvilStorage {
         let actual_count = claimed_items.len() as u64;
         let reserved = end - start;
 
-        // Persist the new total_claimed value computed under the reserve
-        // lock, after correcting for any phantom seqs.
-        let persisted_total_claimed = {
-            let mut s = c.state.lock().expect("queue state poisoned");
-            if actual_count < reserved {
-                s.total_claimed -= reserved - actual_count;
-            }
-            s.total_claimed
-        };
+        if actual_count < reserved {
+            c.state.lock().expect("queue state poisoned").total_claimed -= reserved - actual_count;
+        }
 
         if claimed_items.is_empty() {
             return Ok(Vec::new());
+        }
+        let redelivered = claimed_items
+            .iter()
+            .filter(|(_, _, _, claim_info)| claim_info.delivery_count > 1)
+            .count() as u64;
+        if redelivered > 0 {
+            crate::metrics::events().redelivered.add(
+                redelivered,
+                &[opentelemetry::KeyValue::new("queue", queue.to_string())],
+            );
         }
 
         let mut batch = WriteBatch::new();
@@ -800,14 +984,11 @@ impl AnvilStorage {
             result.push(ClaimedMessage {
                 message: msg,
                 claim_token: claim_info.claim_token.clone(),
+                delivery_count: claim_info.delivery_count,
             });
         }
-        batch.put(Self::seq_claim_key(queue), end.to_le_bytes());
-        batch.put(
-            Self::cnt_total_claimed_key(queue),
-            persisted_total_claimed.to_le_bytes(),
-        );
-        // A claim need not be durable before the worker sees it. If the
+        // The claim persists no cursor or count: both are derived from the
+        // pending and claimed keys on load. A claim need not be durable before the worker sees it. If the
         // broker crashes first, recovery reloads the older durable cursor and
         // `pending` entry and redelivers the message, which at-least-once
         // already allows. The WAL is one ordered log, so the durable ack that
@@ -888,23 +1069,26 @@ impl AnvilStorage {
         let mut batch = WriteBatch::new();
 
         // 1. Validate claims + move messages from claimed to acked
+        let mut _settlement_hold = None;
         if !msg_ids.is_empty() {
-            self.validate_claims(
-                queue,
-                msg_ids,
-                claim_tokens.unwrap(),
-                expected_lease_id,
-                expected_worker_id,
-            )
-            .await?;
+            let (hold, _claims) = self
+                .validate_claims(
+                    queue,
+                    msg_ids,
+                    claim_tokens.unwrap(),
+                    expected_lease_id,
+                    expected_worker_id,
+                )
+                .await?;
+            _settlement_hold = Some(hold);
 
             let c = self.load_or_init_counters(queue).await?;
-            let (new_total_unclaimed, new_total_acked) = {
+            {
                 let mut s = c.state.lock().expect("queue state poisoned");
                 s.total_unclaimed += ack_count;
                 s.total_acked += ack_count;
-                (s.total_unclaimed, s.total_acked)
-            };
+            }
+            batch.merge(Self::cnt_total_acked_key(queue), ack_count.to_le_bytes());
 
             // The body is dead once acked: no reader of acked entries needs
             // the payload, and keeping it until GC multiplies the live data
@@ -914,14 +1098,6 @@ impl AnvilStorage {
                 batch.delete(Self::msg_key(queue, msg_id));
                 batch.put(Self::acked_key(queue, now_ns, msg_id), []);
             }
-            batch.put(
-                Self::cnt_total_unclaimed_key(queue),
-                new_total_unclaimed.to_le_bytes(),
-            );
-            batch.put(
-                Self::cnt_total_acked_key(queue),
-                new_total_acked.to_le_bytes(),
-            );
         }
 
         // 2. Push downstream messages (capacity checked in step 0,
@@ -936,11 +1112,11 @@ impl AnvilStorage {
                 let dc = &guard.counters;
                 let base_seq = guard.base_seq;
                 let count = messages.len() as u64;
-                let (new_alloc, new_total_pushed) = {
-                    let mut s = dc.state.lock().expect("queue state poisoned");
-                    s.total_pushed += count;
-                    (s.push_seq_alloc, s.total_pushed)
-                };
+                dc.state.lock().expect("queue state poisoned").total_pushed += count;
+                batch.merge(
+                    Self::cnt_total_pushed_key(downstream_queue),
+                    count.to_le_bytes(),
+                );
 
                 for (i, msg) in messages.iter().enumerate() {
                     batch.put(
@@ -949,15 +1125,9 @@ impl AnvilStorage {
                     );
                     batch.put(
                         Self::pending_key(downstream_queue, base_seq + i as u64),
-                        msg.msg_id.as_bytes(),
+                        encode_pending(&msg.msg_id, 0),
                     );
                 }
-                Self::persist_push_counters(
-                    &mut batch,
-                    downstream_queue,
-                    new_alloc,
-                    new_total_pushed,
-                );
             }
         }
 
@@ -1105,9 +1275,9 @@ impl AnvilStorage {
         self.nack_messages_internal(
             queue,
             msg_ids,
-            Some(claim_tokens),
-            Some(worker_id),
-            Some(lease_id),
+            claim_tokens,
+            worker_id,
+            lease_id,
             None,
             None,
             None,
@@ -1130,9 +1300,9 @@ impl AnvilStorage {
         self.nack_messages_internal(
             queue,
             msg_ids,
-            Some(claim_tokens),
-            Some(worker_id),
-            Some(lease_id),
+            claim_tokens,
+            worker_id,
+            lease_id,
             Some(state_namespace),
             Some(state_puts),
             Some(state_deletes),
@@ -1140,14 +1310,42 @@ impl AnvilStorage {
         .await
     }
 
-    /// Return messages to pending queue without claim validation (recovery path).
-    pub async fn nack_messages_unchecked(
+    /// Returns claims to pending after a worker stopped renewing them. It
+    /// races the claimants' own acks and nacks, so each claim is settled
+    /// only if it is not being settled already and still carries the token
+    /// the caller read; the rest are skipped. Returns the claims requeued.
+    pub async fn reclaim_messages(
         &self,
         queue: &str,
-        msg_ids: &[String],
-    ) -> Result<(), StorageError> {
-        self.nack_messages_internal(queue, msg_ids, None, None, None, None, None, None)
-            .await
+        claims: &[ClaimInfo],
+    ) -> Result<Vec<ClaimInfo>, StorageError> {
+        let mut hold = SettlementHold::new(&self.settling);
+        let mut reclaimed = Vec::with_capacity(claims.len());
+        for claim in claims {
+            let claim_key = Self::claimed_key(queue, &claim.msg_id);
+            if !hold.take(claim_key.clone()) {
+                continue;
+            }
+            let Some(data) = self.db.get(&claim_key).await? else {
+                continue;
+            };
+            let current: ClaimInfo = serde_json::from_slice(&data)?;
+            if current.claim_token == claim.claim_token {
+                reclaimed.push(ClaimInfo {
+                    msg_id: claim.msg_id.clone(),
+                    ..current
+                });
+            }
+        }
+        assert!(reclaimed.len() <= claims.len());
+        if reclaimed.is_empty() {
+            return Ok(reclaimed);
+        }
+        let msg_ids: Vec<String> = reclaimed.iter().map(|c| c.msg_id.clone()).collect();
+        let delivery_counts: Vec<u32> = reclaimed.iter().map(|c| c.delivery_count).collect();
+        self.requeue_claims(queue, &msg_ids, &delivery_counts, None, None, None)
+            .await?;
+        Ok(reclaimed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1155,9 +1353,9 @@ impl AnvilStorage {
         &self,
         queue: &str,
         msg_ids: &[String],
-        claim_tokens: Option<&[String]>,
-        worker_id: Option<&str>,
-        lease_id: Option<&str>,
+        claim_tokens: &[String],
+        worker_id: &str,
+        lease_id: &str,
         state_namespace: Option<&str>,
         state_puts: Option<&HashMap<String, Vec<u8>>>,
         state_deletes: Option<&[String]>,
@@ -1165,31 +1363,49 @@ impl AnvilStorage {
         if msg_ids.is_empty() {
             return Ok(());
         }
-
-        if let Some(tokens) = claim_tokens {
-            if tokens.len() != msg_ids.len() {
-                return Err(Box::new(SlateError::invalid(format!(
-                    "claim_tokens length mismatch (msg_ids={}, claim_tokens={})",
-                    msg_ids.len(),
-                    tokens.len()
-                ))));
-            }
+        if claim_tokens.len() != msg_ids.len() {
+            return Err(Box::new(SlateError::invalid(format!(
+                "claim_tokens length mismatch (msg_ids={}, claim_tokens={})",
+                msg_ids.len(),
+                claim_tokens.len()
+            ))));
         }
 
-        let expected_worker_id = worker_id.filter(|v| !v.is_empty());
-        let expected_lease_id = lease_id.filter(|v| !v.is_empty());
-
-        // Validate claim tokens via direct DB reads (no transaction needed)
-        if let Some(tokens) = claim_tokens {
-            self.validate_claims(
+        let (_settlement_hold, claims) = self
+            .validate_claims(
                 queue,
                 msg_ids,
-                tokens,
-                expected_lease_id,
-                expected_worker_id,
+                claim_tokens,
+                Some(lease_id).filter(|v| !v.is_empty()),
+                Some(worker_id).filter(|v| !v.is_empty()),
             )
             .await?;
-        }
+        // The requeued entries keep the delivery count their claims carried.
+        let delivery_counts: Vec<u32> = claims.iter().map(|c| c.delivery_count).collect();
+        self.requeue_claims(
+            queue,
+            msg_ids,
+            &delivery_counts,
+            state_namespace,
+            state_puts,
+            state_deletes,
+        )
+        .await
+    }
+
+    /// Moves held claims back to the tail of pending, with any state updates
+    /// in the same batch.
+    async fn requeue_claims(
+        &self,
+        queue: &str,
+        msg_ids: &[String],
+        delivery_counts: &[u32],
+        state_namespace: Option<&str>,
+        state_puts: Option<&HashMap<String, Vec<u8>>>,
+        state_deletes: Option<&[String]>,
+    ) -> Result<(), StorageError> {
+        assert!(!msg_ids.is_empty());
+        assert_eq!(delivery_counts.len(), msg_ids.len());
 
         let c = self.load_or_init_counters(queue).await?;
         let nack_count = msg_ids.len() as u64;
@@ -1198,27 +1414,19 @@ impl AnvilStorage {
         // Watermark stays put until this guard drops at end-of-scope.
         let _push_guard = Self::reserve_push_range(&c, nack_count);
         let base_seq = _push_guard.base_seq;
-        let (new_alloc, new_unclaimed) = {
-            let mut s = c.state.lock().expect("queue state poisoned");
-            s.total_unclaimed += nack_count;
-            (s.push_seq_alloc, s.total_unclaimed)
-        };
+        c.state
+            .lock()
+            .expect("queue state poisoned")
+            .total_unclaimed += nack_count;
 
         let mut batch = WriteBatch::new();
-        for (i, msg_id) in msg_ids.iter().enumerate() {
+        for (i, (msg_id, delivery_count)) in msg_ids.iter().zip(delivery_counts).enumerate() {
             batch.delete(Self::claimed_key(queue, msg_id));
             batch.put(
                 Self::pending_key(queue, base_seq + i as u64),
-                msg_id.as_bytes(),
+                encode_pending(msg_id, *delivery_count),
             );
         }
-        // Persist alloc cursor so a recovery from disk picks up everything
-        // committed (regardless of out-of-order commits).
-        batch.put(Self::seq_push_key(queue), new_alloc.to_le_bytes());
-        batch.put(
-            Self::cnt_total_unclaimed_key(queue),
-            new_unclaimed.to_le_bytes(),
-        );
 
         // State updates
         let has_state_updates = state_namespace.is_some()
@@ -1261,7 +1469,7 @@ impl AnvilStorage {
         let mut results = Vec::new();
         let mut iter = self.db.scan_prefix(&prefix, ..).await?;
 
-        while let Ok(Some(kv)) = iter.next().await {
+        while let Some(kv) = iter.next().await? {
             let key_str = String::from_utf8_lossy(&kv.key);
             let parts: Vec<&str> = key_str.split(':').collect();
 
@@ -1288,7 +1496,7 @@ impl AnvilStorage {
         let mut results = Vec::new();
         let mut iter = self.db.scan_prefix(&prefix, ..).await?;
 
-        while let Ok(Some(kv)) = iter.next().await {
+        while let Some(kv) = iter.next().await? {
             let key_str = String::from_utf8_lossy(&kv.key);
             let parts: Vec<&str> = key_str.split(':').collect();
 
@@ -1332,8 +1540,8 @@ impl AnvilStorage {
         // Delete pending entries and messages
         for seq in meta.claim_seq..meta.push_seq {
             let pending_key = Self::pending_key(queue, seq);
-            if let Some(msg_id_bytes) = self.db.get(&pending_key).await? {
-                let msg_id = String::from_utf8_lossy(&msg_id_bytes).to_string();
+            if let Some(pending_bytes) = self.db.get(&pending_key).await? {
+                let msg_id = decode_pending(&pending_bytes)?.msg_id;
                 batch.delete(&pending_key);
                 batch.delete(Self::msg_key(queue, &msg_id));
                 deleted += 1;
@@ -1354,9 +1562,8 @@ impl AnvilStorage {
             deleted += 1;
         }
 
-        if deleted > 0 || !claimed.is_empty() || !acked.is_empty() {
-            self.write_durable(batch).await?;
-        }
+        // Always written: an empty queue still has its counter keys.
+        self.write_durable(batch).await?;
 
         // Remove from in-memory caches
         self.counters.remove(queue);
@@ -1397,6 +1604,7 @@ impl AnvilStorage {
         }
         if deleted > 0 {
             tracing::info!("GC deleted {} acked entries", deleted);
+            crate::metrics::events().gc_deleted.add(deleted as u64, &[]);
         }
         Ok(deleted)
     }
@@ -1473,9 +1681,15 @@ impl AnvilStorage {
         }
 
         let mut total = 0;
-        for (queue, claims) in expired_by_queue {
-            let msg_ids: Vec<String> = claims.iter().map(|c| c.msg_id.clone()).collect();
-            self.nack_messages_unchecked(&queue, &msg_ids).await?;
+        for (queue, expired) in expired_by_queue {
+            let claims = self.reclaim_messages(&queue, &expired).await?;
+            if claims.is_empty() {
+                continue;
+            }
+            crate::metrics::events().reclaimed.add(
+                claims.len() as u64,
+                &[opentelemetry::KeyValue::new("queue", queue.clone())],
+            );
 
             let mut puts = HashMap::new();
             let ts_ns = now_nanos();
@@ -1504,7 +1718,7 @@ impl AnvilStorage {
                 let _ = self.state_put_batch("wq_events", &puts, &[]).await?;
             }
 
-            total += msg_ids.len();
+            total += claims.len();
         }
 
         if total > 0 {
@@ -1560,7 +1774,7 @@ impl AnvilStorage {
         let mut results = Vec::new();
         let namespace_prefix = format!("state:{}:", namespace);
 
-        while let Ok(Some(kv)) = iter.next().await {
+        while let Some(kv) = iter.next().await? {
             let key_str = String::from_utf8_lossy(&kv.key);
             if let Some(suffix) = key_str.strip_prefix(&namespace_prefix) {
                 results.push((suffix.to_string(), kv.value.to_vec()));
@@ -1577,7 +1791,7 @@ impl AnvilStorage {
         // Scan new counter key prefix first
         let mut queues = Vec::new();
         let mut iter = self.db.scan_prefix(b"seq_push:", ..).await?;
-        while let Ok(Some(kv)) = iter.next().await {
+        while let Some(kv) = iter.next().await? {
             let key_str = String::from_utf8_lossy(&kv.key);
             if let Some(queue) = key_str.strip_prefix("seq_push:") {
                 queues.push(queue.to_string());
@@ -1587,7 +1801,7 @@ impl AnvilStorage {
         // Fallback: also scan old meta: prefix for migration
         let mut iter = self.db.scan_prefix(b"meta:", ..).await?;
         let existing: std::collections::HashSet<String> = queues.iter().cloned().collect();
-        while let Ok(Some(kv)) = iter.next().await {
+        while let Some(kv) = iter.next().await? {
             let key_str = String::from_utf8_lossy(&kv.key);
             if let Some(queue) = key_str.strip_prefix("meta:") {
                 if !existing.contains(queue) {
@@ -1770,6 +1984,7 @@ impl AnvilStorage {
         let ack_count = upstream_msg_ids.len() as u64;
         let mut all_new_msg_ids = Vec::new();
         let mut batch = WriteBatch::new();
+        let mut _settlement_hold = None;
 
         // 1. Validate claims and ack upstream
         if !upstream_msg_ids.is_empty() {
@@ -1779,36 +1994,33 @@ impl AnvilStorage {
                 )));
             }
 
-            self.validate_claims(
-                upstream_queue,
-                upstream_msg_ids,
-                upstream_claim_tokens,
-                expected_lease_id,
-                expected_worker_id,
-            )
-            .await?;
+            let (hold, _claims) = self
+                .validate_claims(
+                    upstream_queue,
+                    upstream_msg_ids,
+                    upstream_claim_tokens,
+                    expected_lease_id,
+                    expected_worker_id,
+                )
+                .await?;
+            _settlement_hold = Some(hold);
 
             let uc = self.load_or_init_counters(upstream_queue).await?;
-            let (new_total_unclaimed, new_total_acked) = {
+            {
                 let mut s = uc.state.lock().expect("queue state poisoned");
                 s.total_unclaimed += ack_count;
                 s.total_acked += ack_count;
-                (s.total_unclaimed, s.total_acked)
-            };
+            }
+            batch.merge(
+                Self::cnt_total_acked_key(upstream_queue),
+                ack_count.to_le_bytes(),
+            );
 
             for msg_id in upstream_msg_ids {
                 batch.delete(Self::claimed_key(upstream_queue, msg_id));
                 batch.delete(Self::msg_key(upstream_queue, msg_id));
                 batch.put(Self::acked_key(upstream_queue, now_ns, msg_id), []);
             }
-            batch.put(
-                Self::cnt_total_unclaimed_key(upstream_queue),
-                new_total_unclaimed.to_le_bytes(),
-            );
-            batch.put(
-                Self::cnt_total_acked_key(upstream_queue),
-                new_total_acked.to_le_bytes(),
-            );
         }
 
         // 2. Push to each partition queue. Each push goes through the
@@ -1825,12 +2037,12 @@ impl AnvilStorage {
 
             let guard = Self::reserve_push_range(&dc, msg_count);
             let base_seq = guard.base_seq;
-            let (new_alloc, new_total_pushed) = {
-                let mut s = dc.state.lock().expect("queue state poisoned");
-                s.total_pushed += msg_count;
-                (s.push_seq_alloc, s.total_pushed)
-            };
+            dc.state.lock().expect("queue state poisoned").total_pushed += msg_count;
             push_guards.push(guard);
+            batch.merge(
+                Self::cnt_total_pushed_key(partition_queue),
+                msg_count.to_le_bytes(),
+            );
 
             for (i, msg) in messages.iter().enumerate() {
                 let seq = base_seq + i as u64;
@@ -1840,12 +2052,10 @@ impl AnvilStorage {
                 );
                 batch.put(
                     Self::pending_key(partition_queue, seq),
-                    msg.msg_id.as_bytes(),
+                    encode_pending(&msg.msg_id, 0),
                 );
                 all_new_msg_ids.push(msg.msg_id.clone());
             }
-
-            Self::persist_push_counters(&mut batch, partition_queue, new_alloc, new_total_pushed);
         }
 
         // 3. State updates
@@ -2200,7 +2410,10 @@ mod tests {
             storage.create_queue(queue, 0).await.unwrap();
             let msg = Message::new(queue.to_string(), b"payload".to_vec());
             storage.push_message(queue, &msg).await.unwrap();
-            let claimed = storage.claim_messages(queue, 1, "worker", "lease").await.unwrap();
+            let claimed = storage
+                .claim_messages(queue, 1, "worker", "lease")
+                .await
+                .unwrap();
             assert_eq!(claimed.len(), 1);
             (storage, msg.msg_id)
         });
@@ -2210,16 +2423,26 @@ mod tests {
         let recovered = tokio::runtime::Runtime::new().unwrap();
         recovered.block_on(async {
             let storage = AnvilStorage::new(&db_path).await.unwrap();
-            let mut delivered = storage.claim_messages(queue, 1, "worker", "lease-2").await.unwrap();
+            let mut delivered = storage
+                .claim_messages(queue, 1, "worker", "lease-2")
+                .await
+                .unwrap();
             if delivered.is_empty() {
                 // The claim did reach the WAL before the crash: then lease
                 // recovery is what hands the message out again.
                 let recovered_count = storage
-                    .recover_expired_claims(LEASE_TIMEOUT_SECS_TEST_FAST, CLAIM_AGE_TIMEOUT_SECS_TEST_LIVE_SAFE, Some(&HashMap::new()))
+                    .recover_expired_claims(
+                        LEASE_TIMEOUT_SECS_TEST_FAST,
+                        CLAIM_AGE_TIMEOUT_SECS_TEST_LIVE_SAFE,
+                        Some(&HashMap::new()),
+                    )
                     .await
                     .unwrap();
                 assert_eq!(recovered_count, 1);
-                delivered = storage.claim_messages(queue, 1, "worker", "lease-2").await.unwrap();
+                delivered = storage
+                    .claim_messages(queue, 1, "worker", "lease-2")
+                    .await
+                    .unwrap();
             }
             assert_eq!(delivered.len(), 1);
             assert_eq!(delivered[0].message.msg_id, msg_id);
@@ -2248,7 +2471,10 @@ mod tests {
                 .map(|i| Message::new(queue.to_string(), vec![i]))
                 .collect();
             storage.push_messages(queue, &messages).await.unwrap();
-            let claimed = storage.claim_messages(queue, 1, "worker", "lease").await.unwrap();
+            let claimed = storage
+                .claim_messages(queue, 1, "worker", "lease")
+                .await
+                .unwrap();
             let (msg_ids, claim_tokens) = split_claims(&claimed);
             storage
                 .ack_messages(queue, &msg_ids, &claim_tokens, "worker", "lease")
@@ -2267,16 +2493,88 @@ mod tests {
             assert_eq!(acked.len(), 1);
             assert_eq!(acked[0].2, acked_id);
 
-            let claimed = storage.claim_messages(queue, 10, "worker", "lease-2").await.unwrap();
+            let claimed = storage
+                .claim_messages(queue, 10, "worker", "lease-2")
+                .await
+                .unwrap();
             let mut pending_ids: Vec<String> =
                 claimed.iter().map(|c| c.message.msg_id.clone()).collect();
             pending_ids.sort();
-            let mut expected: Vec<String> =
-                pushed_ids.into_iter().filter(|id| *id != acked_id).collect();
+            let mut expected: Vec<String> = pushed_ids
+                .into_iter()
+                .filter(|id| *id != acked_id)
+                .collect();
             expected.sort();
             assert_eq!(pending_ids, expected);
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The delivery count starts at 1, survives a nack and a reclaimed lease
+    /// (each adds one), and restarts at 1 for a message forwarded downstream,
+    /// which is a new message.
+    #[tokio::test]
+    async fn test_delivery_count_across_redeliveries() {
+        let storage = create_temp_storage().await;
+        let queue = "count";
+        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue("count-down", 0).await.unwrap();
+        storage
+            .push_message(queue, &Message::new(queue.to_string(), b"x".to_vec()))
+            .await
+            .unwrap();
+
+        let first = storage
+            .claim_messages(queue, 1, "w1", "lease-1")
+            .await
+            .unwrap();
+        assert_eq!(first[0].delivery_count, 1);
+        let (msg_ids, claim_tokens) = split_claims(&first);
+        storage
+            .nack_messages(queue, &msg_ids, &claim_tokens, "w1", "lease-1")
+            .await
+            .unwrap();
+
+        let second = storage
+            .claim_messages(queue, 1, "w2", "lease-2")
+            .await
+            .unwrap();
+        assert_eq!(second[0].message.msg_id, msg_ids[0]);
+        assert_eq!(second[0].delivery_count, 2);
+        let no_live_leases = HashMap::new();
+        let reclaimed = storage
+            .recover_expired_claims(
+                LEASE_TIMEOUT_SECS_TEST_FAST,
+                CLAIM_AGE_TIMEOUT_SECS_TEST_LIVE_SAFE,
+                Some(&no_live_leases),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reclaimed, 1);
+
+        let third = storage
+            .claim_messages(queue, 1, "w3", "lease-3")
+            .await
+            .unwrap();
+        assert_eq!(third[0].delivery_count, 3);
+        let (msg_ids, claim_tokens) = split_claims(&third);
+        storage
+            .ack_and_forward(
+                queue,
+                &msg_ids,
+                &claim_tokens,
+                "w3",
+                "lease-3",
+                "count-down",
+                &[Message::new("count-down".to_string(), b"y".to_vec())],
+            )
+            .await
+            .unwrap();
+        let forwarded = storage
+            .claim_messages("count-down", 1, "w4", "lease-4")
+            .await
+            .unwrap();
+        assert_eq!(forwarded[0].delivery_count, 1);
     }
 
     #[tokio::test]
@@ -2446,6 +2744,263 @@ mod tests {
             .unwrap();
         assert_eq!(claimed_again.len(), 1);
         assert_ne!(claimed_again[0].claim_token, claim_tokens[0]);
+    }
+
+    /// A retried ack racing the original must settle the message once: one
+    /// call succeeds, the other is fenced, and the totals count it once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_duplicate_ack_settles_once() {
+        let storage = Arc::new(create_temp_storage().await);
+        let queue = "dup-ack";
+        storage.create_queue(queue, 0).await.unwrap();
+        let messages: Vec<Message> = (0..100)
+            .map(|_| Message::new(queue.to_string(), b"x".to_vec()))
+            .collect();
+        storage.push_messages(queue, &messages).await.unwrap();
+        let claimed = storage
+            .claim_messages(queue, messages.len(), "w", "l")
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), messages.len());
+
+        for c in &claimed {
+            let attempts: Vec<_> = (0..2)
+                .map(|_| {
+                    let storage = storage.clone();
+                    let msg_ids = vec![c.message.msg_id.clone()];
+                    let tokens = vec![c.claim_token.clone()];
+                    tokio::spawn(async move {
+                        storage
+                            .ack_messages(queue, &msg_ids, &tokens, "w", "l")
+                            .await
+                            .is_ok()
+                    })
+                })
+                .collect();
+            let mut succeeded = 0;
+            for attempt in attempts {
+                succeeded += usize::from(attempt.await.unwrap());
+            }
+            assert_eq!(
+                succeeded, 1,
+                "{} settled {succeeded} times",
+                c.message.msg_id
+            );
+        }
+
+        let meta = storage.get_meta(queue).await.unwrap();
+        assert_eq!(meta.total_acked, messages.len() as u64);
+        assert_eq!(meta.claimed_count, 0);
+        let acked = storage.scan_acked(Some(queue)).await.unwrap();
+        assert_eq!(acked.len(), messages.len());
+        assert!(storage.settling.is_empty());
+    }
+
+    /// Recovery reads claims, then reclaims them; a claim settled in
+    /// between (acked, or nacked and claimed again under a new token) must
+    /// be skipped. Requeueing it would deliver an acked message again and
+    /// undercount `claimed_count`, so the queue would report drained while
+    /// another message is still being processed.
+    #[tokio::test]
+    async fn test_reclaim_skips_claims_settled_since_read() {
+        let storage = create_temp_storage().await;
+        let queue = "reclaim-race";
+        storage.create_queue(queue, 0).await.unwrap();
+        let messages: Vec<Message> = (0..3)
+            .map(|_| Message::new(queue.to_string(), b"x".to_vec()))
+            .collect();
+        storage.push_messages(queue, &messages).await.unwrap();
+        let claimed = storage.claim_messages(queue, 3, "w", "l").await.unwrap();
+        let read_by_recovery: Vec<ClaimInfo> = storage
+            .scan_claimed(Some(queue))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, msg_id, info)| ClaimInfo { msg_id, ..info })
+            .collect();
+        let token_of = |msg_id: &str| {
+            claimed
+                .iter()
+                .find(|c| c.message.msg_id == msg_id)
+                .unwrap()
+                .claim_token
+                .clone()
+        };
+        let (acked_id, renewed_id, still_held_id) = (
+            read_by_recovery[0].msg_id.clone(),
+            read_by_recovery[1].msg_id.clone(),
+            read_by_recovery[2].msg_id.clone(),
+        );
+
+        storage
+            .ack_messages(
+                queue,
+                std::slice::from_ref(&acked_id),
+                &[token_of(&acked_id)],
+                "w",
+                "l",
+            )
+            .await
+            .unwrap();
+        storage
+            .nack_messages(
+                queue,
+                std::slice::from_ref(&renewed_id),
+                &[token_of(&renewed_id)],
+                "w",
+                "l",
+            )
+            .await
+            .unwrap();
+        let renewed = storage.claim_messages(queue, 1, "w2", "l2").await.unwrap();
+        assert_eq!(renewed[0].message.msg_id, renewed_id);
+
+        let reclaimed = storage
+            .reclaim_messages(queue, &read_by_recovery[..2])
+            .await
+            .unwrap();
+        assert!(
+            reclaimed.is_empty(),
+            "reclaimed settled claims: {reclaimed:?}"
+        );
+
+        let meta = storage.get_meta(queue).await.unwrap();
+        assert_eq!(meta.push_seq, meta.claim_seq, "nothing may be requeued");
+        assert_eq!(meta.claimed_count, 2, "renewed and still-held claims");
+        storage.mark_queue_finished(queue).await.unwrap();
+        let (_, drained, _, _) = storage.check_queue_completion(queue).await.unwrap();
+        assert!(
+            !drained,
+            "drained while {still_held_id} and {renewed_id} are in flight"
+        );
+
+        // A claim still holding the token recovery read is reclaimed.
+        let reclaimed = storage
+            .reclaim_messages(queue, &read_by_recovery[2..])
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].msg_id, still_held_id);
+    }
+
+    /// While one settlement holds a claim, every other settlement of it is
+    /// turned away, and the hold is released whether the settlement
+    /// succeeds or fails.
+    #[tokio::test]
+    async fn test_settlement_hold_excludes_other_settlements() {
+        let storage = create_temp_storage().await;
+        let queue = "hold";
+        storage.create_queue(queue, 0).await.unwrap();
+        storage
+            .push_message(queue, &Message::new(queue.to_string(), b"x".to_vec()))
+            .await
+            .unwrap();
+        let claimed = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
+        let (msg_ids, tokens) = split_claims(&claimed);
+        let read_by_recovery: Vec<ClaimInfo> = storage
+            .scan_claimed(Some(queue))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, msg_id, info)| ClaimInfo { msg_id, ..info })
+            .collect();
+
+        {
+            let mut held = SettlementHold::new(&storage.settling);
+            assert!(held.take(AnvilStorage::claimed_key(queue, &msg_ids[0])));
+            let err = storage
+                .ack_messages(queue, &msg_ids, &tokens, "w", "l")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("claim_settling"), "{err}");
+            let err = storage
+                .nack_messages(queue, &msg_ids, &tokens, "w", "l")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("claim_settling"), "{err}");
+            let reclaimed = storage
+                .reclaim_messages(queue, &read_by_recovery)
+                .await
+                .unwrap();
+            assert!(reclaimed.is_empty());
+        }
+        assert!(storage.settling.is_empty());
+
+        let stale = vec!["stale-token".to_string()];
+        assert!(storage
+            .ack_messages(queue, &msg_ids, &stale, "w", "l")
+            .await
+            .is_err());
+        assert!(
+            storage.settling.is_empty(),
+            "a failed check released its hold"
+        );
+
+        // The same message twice in one batch would settle it twice.
+        let twice = vec![msg_ids[0].clone(), msg_ids[0].clone()];
+        let err = storage
+            .ack_messages(
+                queue,
+                &twice,
+                &[tokens[0].clone(), tokens[0].clone()],
+                "w",
+                "l",
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("claim_settling"), "{err}");
+
+        storage
+            .ack_messages(queue, &msg_ids, &tokens, "w", "l")
+            .await
+            .unwrap();
+        assert!(storage.settling.is_empty());
+        assert_eq!(storage.get_meta(queue).await.unwrap().total_acked, 1);
+    }
+
+    /// Reopening derives the claim and push cursors and the in-flight count
+    /// from the keys, so a persisted cursor that lags its keys (as one written
+    /// by concurrent writers in the wrong order would) can neither hide
+    /// pending messages nor let a new push overwrite one.
+    #[tokio::test]
+    async fn test_reopen_derives_cursors_from_keys() {
+        let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("anvil_reopen_test_{counter}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = format!("file://{}", dir.display());
+        let queue = "reopen";
+
+        let storage = AnvilStorage::new(&db_path).await.unwrap();
+        storage.create_queue(queue, 0).await.unwrap();
+        let messages: Vec<Message> = (0u8..10)
+            .map(|i| Message::new(queue.to_string(), vec![i]))
+            .collect();
+        storage.push_messages(queue, &messages).await.unwrap();
+        let claimed = storage.claim_messages(queue, 4, "w", "l").await.unwrap();
+        assert_eq!(claimed.len(), 4);
+        // A lagging push cursor and the legacy claim cursor a claim used to
+        // persist, both behind the keys.
+        let lagging = 2u64.to_le_bytes();
+        let mut batch = WriteBatch::new();
+        batch.put(AnvilStorage::seq_push_key(queue), lagging);
+        batch.put(AnvilStorage::seq_claim_key(queue), 9u64.to_le_bytes());
+        storage.write_durable(batch).await.unwrap();
+        storage.close().await.unwrap();
+
+        let storage = AnvilStorage::new(&db_path).await.unwrap();
+        let meta = storage.get_meta(queue).await.unwrap();
+        assert_eq!(meta.claim_seq, 4);
+        assert_eq!(meta.push_seq, 10);
+        assert_eq!(meta.claimed_count, 4);
+
+        let late = Message::new(queue.to_string(), vec![10]);
+        storage.push_message(queue, &late).await.unwrap();
+        let rest = storage.claim_messages(queue, 100, "w", "l").await.unwrap();
+        let mut payloads: Vec<u8> = rest.iter().map(|c| c.message.payload[0]).collect();
+        payloads.sort();
+        assert_eq!(payloads, (4u8..=10).collect::<Vec<_>>());
+        storage.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -2746,10 +3301,25 @@ mod tests {
 
         let deleted = storage.delete_queue(queue).await.unwrap();
         assert!(deleted > 0);
+        // Checked before `get_meta`, which recreates a queue it reads.
+        assert!(!storage
+            .list_queues()
+            .await
+            .unwrap()
+            .contains(&queue.to_string()));
 
         let meta = storage.get_meta(queue).await.unwrap();
         assert_eq!(meta.claim_seq, 0);
         assert_eq!(meta.push_seq, 0);
+
+        // A queue that never held a message is deleted too.
+        storage.create_queue("empty", 0).await.unwrap();
+        assert_eq!(storage.delete_queue("empty").await.unwrap(), 0);
+        assert!(!storage
+            .list_queues()
+            .await
+            .unwrap()
+            .contains(&"empty".to_string()));
     }
 
     #[tokio::test]
@@ -2864,7 +3434,7 @@ mod tests {
     // in docs/lessons/anvil-publish-commit-race.md.
     //
     // Invariant: every message that has been push_messages'd (or
-    // nack_messages_unchecked'd back to pending) must be claimable at some
+    // nacked back to pending) must be claimable at some
     // point after the writer returns. The race arises because push_seq is
     // bumped via fetch_add *before* the WriteBatch containing the
     // pending_key commits; a concurrent claimer can observe the new
@@ -3014,7 +3584,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dead.len(), n as usize, "failed to claim all upfront");
-        let dead_ids: Vec<String> = dead.iter().map(|c| c.message.msg_id.clone()).collect();
+        let (dead_ids, dead_tokens) = split_claims(&dead);
         let dead_set: std::collections::HashSet<String> = dead_ids.iter().cloned().collect();
 
         // Use a barrier so nack + claimers start near-simultaneously.
@@ -3048,15 +3618,14 @@ mod tests {
             }));
         }
 
-        // Reclaim task: nack all the dead worker's claimed msgs unchecked,
-        // exactly as recover_expired_claims would.
+        // Requeue task: nack all the dead worker's claimed msgs in one batch.
         let reclaim = {
             let storage = storage.clone();
             let barrier = barrier.clone();
             tokio::spawn(async move {
                 barrier.wait().await;
                 storage
-                    .nack_messages_unchecked(queue, &dead_ids)
+                    .nack_messages(queue, &dead_ids, &dead_tokens, "dead", "dead-lease")
                     .await
                     .unwrap();
             })

@@ -1,0 +1,70 @@
+name: Bench
+
+on:
+  schedule:
+    - cron: "0 18 * * *" # daily, 02:00 UTC+8
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: bench-${{ github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: warn
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Latency-bound: each worker waits on two durable round trips per
+          # key, so throughput tracks the WAL flush latency. The bar is the
+          # 8.7k keys/s target the broker is sized for.
+          - profile: latency
+            keys: 300000
+            workers: 1000
+            keys_per_sec_min: 8700
+            ack_p99_ms_max: 300
+          # Contention: enough workers to saturate the runner, so a lock or
+          # a serialized write path on the hot path shows up as lost
+          # throughput. Provisional bar, to be raised once the runner's
+          # baseline is known.
+          - profile: contention
+            keys: 600000
+            workers: 4000
+            keys_per_sec_min: 12000
+            ack_p99_ms_max: 0
+    name: bench (${{ matrix.profile }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - run: cargo test --release --locked --no-run
+      - name: Run worker profile
+        env:
+          ANVIL_BENCH_KEYS: ${{ matrix.keys }}
+          ANVIL_BENCH_WORKERS: ${{ matrix.workers }}
+          ANVIL_BENCH_CLAIM_BATCH: 1
+          ANVIL_BENCH_MIN_KEYS_PER_SEC: ${{ matrix.keys_per_sec_min }}
+          ANVIL_BENCH_MAX_ACK_P99_MS: ${{ matrix.ack_p99_ms_max }}
+        run: |
+          ulimit -n "$(ulimit -Hn)"
+          db_dir=$(mktemp -d "$RUNNER_TEMP/anvil-bench.XXXXXX")
+          set -o pipefail
+          ANVIL_BENCH_DB="file://$db_dir" \
+            cargo test --release --locked --lib bench_worker_profile -- --ignored --nocapture \
+            2>&1 | tee bench.log
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.profile }}: bar ${{ matrix.keys_per_sec_min }} keys/s"
+            echo '```'
+            grep -E "===|dispatch:|process:|panicked|below the bar|above the bar" bench.log || echo "no bench output"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

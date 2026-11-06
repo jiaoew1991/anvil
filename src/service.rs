@@ -32,9 +32,11 @@ use tonic::{Request, Response, Status, Streaming};
 #[allow(unused_imports)]
 use crate::state::AnvilState;
 use crate::storage::AnvilStorage;
-use crate::types::Message;
+use crate::types::{ClaimedMessage, Message};
 
-// Generated protobuf types
+// Generated protobuf types. Generated code is not ours to lint: each Rust
+// release adds clippy lints that tonic's output trips.
+#[allow(clippy::all)]
 pub mod proto {
     tonic::include_proto!("anvil");
 }
@@ -54,12 +56,13 @@ impl AnvilService {
     }
 
     /// Convert internal Message to slim ClaimMessage (no queue, no created_at)
-    fn to_claim_message(msg: &Message, claim_token: String) -> ClaimMessage {
+    fn to_claim_message(claimed: &ClaimedMessage) -> ClaimMessage {
         ClaimMessage {
-            msg_id: msg.msg_id.clone(),
-            payload: msg.payload.clone(),
-            metadata: msg.metadata.clone(),
-            claim_token,
+            msg_id: claimed.message.msg_id.clone(),
+            payload: claimed.message.payload.clone(),
+            metadata: claimed.message.metadata.clone(),
+            claim_token: claimed.claim_token.clone(),
+            delivery_count: claimed.delivery_count,
         }
     }
 
@@ -315,10 +318,8 @@ impl AnvilService {
                         Status::internal(format!("Storage error: {e}"))
                     })?;
 
-                let messages: Vec<ClaimMessage> = claimed
-                    .iter()
-                    .map(|c| Self::to_claim_message(&c.message, c.claim_token.clone()))
-                    .collect();
+                let messages: Vec<ClaimMessage> =
+                    claimed.iter().map(Self::to_claim_message).collect();
 
                 let has_more = match self.storage.get_queue_stats(&queue).await {
                     Ok(meta) => meta.claim_seq < meta.push_seq,
@@ -382,10 +383,8 @@ impl AnvilService {
                         Status::internal(format!("Storage error: {e}"))
                     })?;
 
-                let messages: Vec<ClaimMessage> = claimed
-                    .iter()
-                    .map(|c| Self::to_claim_message(&c.message, c.claim_token.clone()))
-                    .collect();
+                let messages: Vec<ClaimMessage> =
+                    claimed.iter().map(Self::to_claim_message).collect();
 
                 // When empty, check if upstream group is finished + fully drained
                 let upstream_drained = if messages.is_empty() {

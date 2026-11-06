@@ -72,6 +72,9 @@ pub struct RustMessage {
     pub metadata: HashMap<String, String>,
     #[pyo3(get, set)]
     pub claim_token: Option<String>,
+    /// 1 on first delivery; each nack or reclaimed lease adds one.
+    #[pyo3(get)]
+    pub delivery_count: u32,
 }
 
 #[pymethods]
@@ -96,6 +99,7 @@ impl RustMessage {
             created_at: 0.0, // v2 drops created_at from wire
             metadata: msg.metadata.clone(),
             claim_token: Some(msg.claim_token.clone()),
+            delivery_count: msg.delivery_count,
         }
     }
 }

@@ -140,16 +140,21 @@ pub struct ClaimInfo {
     pub lease_id: String,
     pub claimed_at: f64,
     pub claim_token: String,
+    /// How many times the message has been handed out, this claim included.
+    #[serde(default)]
+    pub delivery_count: u32,
 }
 
 impl ClaimInfo {
-    pub fn new(msg_id: String, worker_id: String, lease_id: String) -> Self {
+    pub fn new(msg_id: String, worker_id: String, lease_id: String, delivery_count: u32) -> Self {
+        assert!(delivery_count >= 1);
         Self {
             msg_id,
             worker_id,
             lease_id,
             claimed_at: now_secs(),
             claim_token: uuid::Uuid::now_v7().to_string(),
+            delivery_count,
         }
     }
 }
@@ -159,6 +164,8 @@ impl ClaimInfo {
 pub struct ClaimedMessage {
     pub message: Message,
     pub claim_token: String,
+    /// 1 on first delivery; each nack or reclaimed lease adds one.
+    pub delivery_count: u32,
 }
 
 /// Queue group metadata (stored at group_meta:{group_name})
@@ -261,6 +268,7 @@ mod tests {
             "msg-123".to_string(),
             "worker-1".to_string(),
             "lease-456".to_string(),
+            1,
         );
 
         assert_eq!(claim.msg_id, "msg-123");
@@ -303,6 +311,7 @@ mod tests {
             "msg-123".to_string(),
             "worker-1".to_string(),
             "lease-456".to_string(),
+            1,
         );
 
         // Serialize

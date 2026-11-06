@@ -22,6 +22,7 @@ use std::thread::JoinHandle;
 use tokio::runtime::Runtime;
 
 pub mod client;
+mod metrics;
 mod recovery;
 mod server;
 mod service;

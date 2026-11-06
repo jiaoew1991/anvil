@@ -91,6 +91,7 @@ message ClaimMessage {
   bytes payload = 2;
   map<string, string> metadata = 3;
   string claim_token = 4;               // inline with message (was separate list)
+  uint32 delivery_count = 5;            // 1 on first delivery; +1 per nack or reclaimed lease
 }
 
 message ClaimResponse {

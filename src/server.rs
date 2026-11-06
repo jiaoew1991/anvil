@@ -17,14 +17,15 @@
 // Storage-only model: No startup recovery needed.
 // Storage is the source of truth - broker can restart anytime.
 
+use futures::StreamExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use futures::StreamExt;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
+use crate::metrics::{self, BrokerGauges, RpcMetricsLayer};
 use crate::recovery::{GcTask, RecoveryTask};
 use crate::service::proto::anvil_server::AnvilServer;
 use crate::service::AnvilService;
@@ -44,6 +45,8 @@ pub struct AnvilBrokerInner {
     pub recovery_task: RecoveryTask,
     pub gc_task: GcTask,
     pub actual_port: Option<u16>,
+    /// Queue and lease gauges, registered while the server runs.
+    gauges: Option<BrokerGauges>,
 }
 
 impl AnvilBrokerInner {
@@ -87,6 +90,7 @@ impl AnvilBrokerInner {
             recovery_task,
             gc_task,
             actual_port: None,
+            gauges: None,
         })
     }
 
@@ -100,6 +104,8 @@ impl AnvilBrokerInner {
 
         // Start background GC task (cleans up acked messages)
         self.gc_task.start();
+
+        self.gauges = BrokerGauges::register(&self.storage, &self.state);
 
         // Create gRPC service
         let service = AnvilService::new(self.state.clone(), self.storage.clone());
@@ -140,6 +146,7 @@ impl AnvilBrokerInner {
                 .http2_keepalive_timeout(Some(Duration::from_secs(20)))
                 // Allow keepalive pings even without active streams
                 .tcp_keepalive(Some(Duration::from_secs(30)))
+                .layer(RpcMetricsLayer)
                 .add_service(AnvilServer::new(service))
                 .serve_with_incoming(incoming)
                 .await
@@ -158,6 +165,13 @@ impl AnvilBrokerInner {
         // Stop our background tasks that use storage
         self.recovery_task.stop_async().await;
         self.gc_task.stop_async().await;
+
+        // Flushing blocks on the exporter's HTTP request, so keep it off the
+        // async workers.
+        self.gauges = None;
+        if let Err(e) = tokio::task::spawn_blocking(metrics::flush).await {
+            tracing::warn!("metrics flush task failed: {}", e);
+        }
     }
 
     /// Stop the broker (sync version - signals stop but doesn't wait)
