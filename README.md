@@ -83,6 +83,17 @@ either variable, every instrument is a no-op. `service.name` defaults to
 Queue gauges and totals are read from in-memory counters at export time and
 add no work to the request path.
 
+## Releasing
+
+1. `scripts/bump-version.sh 0.3.0` sets the version in `Cargo.toml`,
+   `pyproject.toml` and `Cargo.lock`; merge it through a pull request.
+2. Tag the merged commit and push the tag:
+   `git tag v0.3.0 origin/main && git push origin v0.3.0`.
+
+The tag starts the Release workflow. It refuses a tag that does not match the
+code's version or is not on `main`, runs the tests and the bench bars, builds
+the wheels and publishes a GitHub release with generated notes.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).

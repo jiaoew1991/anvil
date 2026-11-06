@@ -1,17 +1,18 @@
 name: Release
 
-# A release is cut by merging a version bump to main: when Cargo.toml's
-# version has no tag yet, the unit tests and the bench bars must pass, then
-# the wheels are built and v<version> is tagged and released with notes
-# generated from the pull requests merged since the previous tag.
+# A release is cut by pushing a v<version> tag on a commit of main whose
+# Cargo.toml and pyproject.toml already carry that version (see
+# scripts/bump-version.sh). The unit tests and the bench bars must pass,
+# then the wheels are built and the release is published with notes
+# generated from the pull requests merged since the previous tag. Re-run a
+# failed release from the Actions tab, or with workflow_dispatch on the tag.
 on:
   push:
-    branches: [main]
-    paths: [Cargo.toml, pyproject.toml]
+    tags: ["v*"]
   workflow_dispatch:
 
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -20,43 +21,43 @@ permissions:
 jobs:
   version:
     runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.version.outputs.tag }}
-      release: ${{ steps.version.outputs.release }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - id: version
+      - name: Check the tag against the code
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
         run: |
-          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
-          python_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -n 1)
-          if [ "$cargo_version" != "$python_version" ]; then
-            echo "::error::Cargo.toml ($cargo_version) and pyproject.toml ($python_version) versions differ"
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::error::run this workflow on a v<version> tag, not on $REF_TYPE $TAG"
             exit 1
           fi
-          tag="v$cargo_version"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if git rev-parse --quiet --verify "refs/tags/$tag" > /dev/null; then
-            echo "$tag is already released"
-            echo "release=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "release=true" >> "$GITHUB_OUTPUT"
+          tag_version=${TAG#v}
+          for manifest in Cargo.toml pyproject.toml; do
+            version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$manifest" | head -n 1)
+            if [ "$version" != "$tag_version" ]; then
+              echo "::error::$TAG does not match $manifest version $version; run scripts/bump-version.sh $tag_version and merge it before tagging"
+              exit 1
+            fi
+          done
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$TAG points at a commit that is not on main"
+            exit 1
           fi
 
   ci:
     needs: version
-    if: needs.version.outputs.release == 'true'
     uses: ./.github/workflows/ci.yml
 
   bench:
     needs: version
-    if: needs.version.outputs.release == 'true'
     uses: ./.github/workflows/bench.yml
 
   wheels:
     needs: version
-    if: needs.version.outputs.release == 'true'
     strategy:
       matrix:
         include:
@@ -93,7 +94,7 @@ jobs:
           path: dist/*.whl
 
   release:
-    needs: [version, ci, bench, wheels]
+    needs: [ci, bench, wheels]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -105,10 +106,10 @@ jobs:
           merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.version.outputs.tag }}
+          TAG: ${{ github.ref_name }}
         run: |
           gh release create "$TAG" dist/*.whl \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
+            --verify-tag \
             --title "$TAG" \
             --generate-notes
