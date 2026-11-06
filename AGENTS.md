@@ -66,6 +66,24 @@ must hold the claim between the two (`validate_claims` returns the
 second settlement of the same message is fenced instead of acking it twice or
 requeueing it after its ack.
 
+### Errors
+
+A failure the caller caused is a `storage::Rejection`, never a
+`SlateError::invalid` string: `Fenced` for a claim the caller no longer holds
+(token, lease or worker mismatch, not claimed, settling), `NotFound`,
+`InvalidArgument` and `QueueFull`. `service::storage_status` is the one place a
+storage error becomes a gRPC status; it recognizes a `Rejection` by type and
+maps everything else to `INTERNAL`. A worker drops a message on
+`FAILED_PRECONDITION` and retries on `INTERNAL`, so a new fencing check that
+returns anything but `Rejection::Fenced` makes it retry what cannot succeed.
+
+### Queue creation
+
+`load_counters` reads a queue and never creates it; `load_or_init_counters`
+creates it on first use, which push, forward, scatter and claim rely on.
+`get_meta` and `delete_queue` use `load_counters`, so asking about or deleting
+an unknown queue cannot bring it into existence; a new read path must too.
+
 ### O(1) Operations (Good ✅)
 
 | Operation | How | Complexity |

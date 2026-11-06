@@ -19,6 +19,9 @@ from anvil_py.anvil_py import (
 from anvil_py.anvil_py import (
     RustMessage as _RustMessage,
 )
+from anvil_py.anvil_py import (
+    ClaimLostError as _ClaimLostError,
+)
 
 # Re-export for better IDE support
 BrokerConfig = _BrokerConfig
@@ -27,6 +30,7 @@ AnvilBroker = _AnvilBroker
 AnvilStorageReader = _AnvilStorageReader
 AnvilRustClient = _AnvilRustClient
 RustMessage = _RustMessage
+ClaimLostError = _ClaimLostError
 
 
 class BrokerEventHandler:
@@ -83,5 +87,6 @@ __all__ = [
     "AnvilStorageReader",
     "AnvilRustClient",
     "RustMessage",
+    "ClaimLostError",
     "BrokerEventHandler",
 ]

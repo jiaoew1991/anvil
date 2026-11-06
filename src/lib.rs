@@ -601,5 +601,9 @@ fn anvil_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AnvilStorageReader>()?;
     m.add_class::<client::AnvilRustClient>()?;
     m.add_class::<client::RustMessage>()?;
+    m.add(
+        "ClaimLostError",
+        m.py().get_type::<client::ClaimLostError>(),
+    )?;
     Ok(())
 }
