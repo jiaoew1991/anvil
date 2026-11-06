@@ -353,6 +353,13 @@ pub struct AnvilStorage {
     db: Db,
     /// Per-queue atomic counters (in-memory cache, persisted to DB on each op)
     counters: DashMap<String, Arc<QueueCounters>>,
+    /// Held while counters missing from `counters` are loaded from, or
+    /// created in, the database. Each queue then has a single set of
+    /// counters, and nothing writes its keys while they are derived from
+    /// them: a loader racing a writer could see a later push land before an
+    /// earlier one and derive a claim cursor past the push cursor, and a late
+    /// zero write could reset totals another writer had merged.
+    counters_loading: tokio::sync::Mutex<()>,
     /// Per-group round-robin counters for O(1) steal path in claim_from_group
     steal_rr: std::sync::Mutex<HashMap<String, u64>>,
     /// Per-queue max pending limits (0 = unlimited). Used for bounded queue support.
@@ -423,6 +430,7 @@ impl AnvilStorage {
         Ok(Self {
             db,
             counters: DashMap::new(),
+            counters_loading: tokio::sync::Mutex::new(()),
             steal_rr: std::sync::Mutex::new(HashMap::new()),
             max_pending_limits: DashMap::new(),
             settling: DashSet::new(),
@@ -756,6 +764,21 @@ impl AnvilStorage {
         if let Some(c) = self.counters.get(queue) {
             return Ok(Some(c.clone()));
         }
+        let loading = self.counters_loading.lock().await;
+        self.load_counters_locked(queue, &loading).await
+    }
+
+    /// The slow path of `load_counters`, for a caller holding
+    /// `counters_loading`.
+    async fn load_counters_locked(
+        &self,
+        queue: &str,
+        _loading: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<Option<Arc<QueueCounters>>, StorageError> {
+        // Loaded by the previous holder of the lock.
+        if let Some(c) = self.counters.get(queue) {
+            return Ok(Some(c.clone()));
+        }
 
         let counters = if let Some(push_seq_data) = self.db.get(&Self::seq_push_key(queue)).await? {
             // Only the totals are taken as persisted. Cursors and the
@@ -834,28 +857,28 @@ impl AnvilStorage {
             c
         };
 
-        Ok(Some(
-            self.counters
-                .entry(queue.to_string())
-                .or_insert(counters)
-                .clone(),
-        ))
+        let previous = self.counters.insert(queue.to_string(), counters.clone());
+        assert!(previous.is_none(), "counters of {queue} loaded twice");
+        Ok(Some(counters))
     }
 
     /// Counters of `queue`, creating the queue if it does not exist: push,
     /// forward, scatter and claim create a queue on first use.
     async fn load_or_init_counters(&self, queue: &str) -> Result<Arc<QueueCounters>, StorageError> {
-        if let Some(counters) = self.load_counters(queue).await? {
+        if let Some(c) = self.counters.get(queue) {
+            return Ok(c.clone());
+        }
+        let loading = self.counters_loading.lock().await;
+        if let Some(counters) = self.load_counters_locked(queue, &loading).await? {
             return Ok(counters);
         }
         let mut batch = WriteBatch::new();
         Self::write_zero_counters(&mut batch, queue);
         self.write_durable(batch).await?;
-        Ok(self
-            .counters
-            .entry(queue.to_string())
-            .or_insert_with(|| Arc::new(QueueCounters::default()))
-            .clone())
+        let counters = Arc::new(QueueCounters::default());
+        let previous = self.counters.insert(queue.to_string(), counters.clone());
+        assert!(previous.is_none(), "counters of {queue} created twice");
+        Ok(counters)
     }
 
     // === Queue Metadata (legacy + new) ===
@@ -913,6 +936,8 @@ impl AnvilStorage {
                 .insert(queue.to_string(), max_pending);
         }
 
+        // Held from the check to the write: see `counters_loading`.
+        let _loading = self.counters_loading.lock().await;
         // Check if already exists (either new or old format)
         if self.db.get(&Self::seq_push_key(queue)).await?.is_some() {
             return Ok(());
@@ -2042,6 +2067,8 @@ impl AnvilStorage {
         num_partitions: u32,
         max_pending_per_partition: u64,
     ) -> Result<QueueGroupMeta, StorageError> {
+        // Held from the check to the write: see `counters_loading`.
+        let _loading = self.counters_loading.lock().await;
         // Check for existing group
         if let Some(existing) = self.get_group_meta(group_name).await? {
             // Always set in-memory limits (survives idempotent create on persistent DB).
@@ -2397,6 +2424,42 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// Goal: the first accesses to a queue, arriving together, agree on one
+    /// set of counters. A loader that derives the cursors from the keys while
+    /// another caller already pushes through counters it loaded can see a
+    /// later push land before an earlier one and derive a claim cursor past
+    /// the push cursor. Method: on fresh stores, let many tasks push to a
+    /// queue no one has touched since it was created, then check every
+    /// message is pending exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_concurrent_first_access_loads_counters_once() {
+        const ROUNDS: usize = 60;
+        const PUSHERS: usize = 32;
+        const PUSHES: usize = 2;
+        for _ in 0..ROUNDS {
+            let storage = Arc::new(AnvilStorage::new("memory://").await.unwrap());
+            let queue = "first_access";
+            storage.create_queue(queue, 0).await.unwrap();
+            let pushers: Vec<_> = (0..PUSHERS)
+                .map(|_| {
+                    let storage = storage.clone();
+                    tokio::spawn(async move {
+                        for _ in 0..PUSHES {
+                            let msg = Message::new(queue.to_string(), b"x".to_vec());
+                            storage.push_message(queue, &msg).await.unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for pusher in pushers {
+                pusher.await.unwrap();
+            }
+            let meta = storage.get_meta(queue).await.unwrap();
+            assert_eq!(meta.claim_seq, 0);
+            assert_eq!(meta.push_seq, (PUSHERS * PUSHES) as u64);
+        }
+    }
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
