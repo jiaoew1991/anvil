@@ -34,7 +34,9 @@ use crate::state::AnvilState;
 use crate::storage::AnvilStorage;
 use crate::types::{ClaimedMessage, Message};
 
-// Generated protobuf types
+// Generated protobuf types. Generated code is not ours to lint: each Rust
+// release adds clippy lints that tonic's output trips.
+#[allow(clippy::all)]
 pub mod proto {
     tonic::include_proto!("anvil");
 }
