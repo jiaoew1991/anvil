@@ -58,6 +58,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - uses: astral-sh/setup-uv@v6
       - run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
-      - run: uvx maturin build --release --locked --interpreter python
-      - run: uv venv --python python && uv pip install target/wheels/*.whl
+      # An absolute path: maturin reads a bare `python` as the python/
+      # source directory.
+      - run: uvx maturin build --release --locked --interpreter "$(command -v python)"
+      - run: uv venv --python "$(command -v python)" && uv pip install target/wheels/*.whl
       - run: .venv/bin/python python/tests/smoke.py

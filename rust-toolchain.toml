@@ -1,0 +1,5 @@
+# Pinned so local builds and CI lint and test with the same compiler; a new
+# Rust release adds clippy lints, and the bump should be a deliberate change.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

@@ -47,6 +47,11 @@ tower-layer = "0.3"
 tower-service = "0.3"
 http = "1"
 
+[lints.clippy]
+# tonic::Status is the error type of every RPC, fixed by the generated service
+# traits, and it is larger than this lint's threshold.
+result_large_err = "allow"
+
 [dev-dependencies]
 rand = "0.9"
 
