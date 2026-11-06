@@ -6,8 +6,10 @@ on:
   pull_request:
   workflow_call:
 
+# A workflow called by another runs under the caller's github.workflow, so
+# its group stays apart from this workflow's own push and PR runs.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
