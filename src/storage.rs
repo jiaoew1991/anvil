@@ -42,7 +42,7 @@ use crate::types::{now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta
 
 /// Upper bound on keys one GC write deletes, so a large expired backlog is
 /// retired in many small commits instead of one batch that stalls writers.
-const GC_BATCH_KEYS_MAX: usize = 10_000;
+pub(crate) const GC_BATCH_KEYS_MAX: usize = 10_000;
 
 /// Upper bound on keys one GC pass deletes; the next pass resumes the rest.
 pub(crate) const GC_PASS_KEYS_MAX: usize = 1_000_000;
@@ -2393,7 +2393,7 @@ impl AnvilStorage {
 
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)] // SIM_TIME_LOCK is intentionally held across awaits to serialize time-sensitive tests
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -2463,7 +2463,7 @@ mod tests {
             .unwrap()
     }
 
-    fn split_claims(claimed: &[ClaimedMessage]) -> (Vec<String>, Vec<String>) {
+    pub(crate) fn split_claims(claimed: &[ClaimedMessage]) -> (Vec<String>, Vec<String>) {
         let msg_ids = claimed.iter().map(|c| c.message.msg_id.clone()).collect();
         let claim_tokens = claimed.iter().map(|c| c.claim_token.clone()).collect();
         (msg_ids, claim_tokens)

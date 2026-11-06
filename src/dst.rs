@@ -27,7 +27,7 @@
 
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)] // SIM_TIME_LOCK is intentionally held across awaits to serialize time-sensitive tests
-mod tests {
+pub(crate) mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -366,7 +366,7 @@ mod tests {
     }
 
     /// Scan storage and verify all invariants.
-    async fn check_invariants(storage: &AnvilStorage, queues: &[String]) {
+    pub(crate) async fn check_invariants(storage: &AnvilStorage, queues: &[String]) {
         for queue in queues {
             let meta = storage.get_queue_stats(queue).await.unwrap();
             let pending_from_meta = meta.push_seq.saturating_sub(meta.claim_seq);
@@ -901,7 +901,7 @@ mod tests {
     /// Claims taken per call while draining a reopened queue.
     const DRAIN_CLAIM_BATCH: usize = 256;
 
-    fn crash_test_db_path(name: &str) -> (std::path::PathBuf, String) {
+    pub(crate) fn crash_test_db_path(name: &str) -> (std::path::PathBuf, String) {
         static TRIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let trial = TRIAL.fetch_add(1, Ordering::SeqCst);
         let dir = std::env::temp_dir().join(format!("anvil_{name}_{}_{trial}", std::process::id()));
@@ -911,7 +911,7 @@ mod tests {
     }
 
     /// Ends `runtime` the way a killed process would end the broker.
-    fn crash<T>(runtime: tokio::runtime::Runtime, storage: T) {
+    pub(crate) fn crash<T>(runtime: tokio::runtime::Runtime, storage: T) {
         runtime.shutdown_background();
         std::mem::forget(storage);
     }
@@ -920,7 +920,7 @@ mod tests {
     /// counters agree with the keys, every successful ack is still acked
     /// exactly once, and every successful push is either acked or comes out
     /// of the queue exactly once when everything left is drained.
-    async fn check_recovered(
+    pub(crate) async fn check_recovered(
         storage: &AnvilStorage,
         queues: &[String],
         pushed: &HashSet<(String, String)>,
