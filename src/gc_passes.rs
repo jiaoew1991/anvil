@@ -255,7 +255,6 @@ mod tests {
     /// at the time of the pass and run a pass with `gc` also present; the
     /// entry, younger than the retention, must survive.
     #[tokio::test]
-    #[ignore = "bug: GC of queue `q` deletes unexpired acked entries of queue `q:00`"]
     async fn test_gc_spares_unexpired_entries_of_a_queue_sharing_the_prefix() {
         let _guard = SIM_TIME_LOCK.lock().unwrap();
         let storage = AnvilStorage::new("memory://").await.unwrap();
