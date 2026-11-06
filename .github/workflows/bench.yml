@@ -6,8 +6,10 @@ on:
   workflow_dispatch:
   workflow_call:
 
+# Keyed like ci.yml, so a release's bench never cancels or queues behind
+# the daily run.
 concurrency:
-  group: bench-${{ github.ref }}
+  group: bench-${{ github.workflow }}-${{ github.ref }}
 
 env:
   CARGO_TERM_COLOR: always
