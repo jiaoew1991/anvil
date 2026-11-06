@@ -17,8 +17,10 @@ runs as the per-job broker embedded in the Ray driver.
   one storage batch, so a crash never leaves a message acked without its output.
 - **Heartbeat leases.** Workers keep a `HeartbeatStream` open. Claims held by a
   lease that misses heartbeats for `lease_timeout_secs` return to pending; a
-  claim held longer than `claim_age_timeout_secs` under a live lease is treated
-  as stuck. Set the second above your slowest task.
+  claim neither taken nor renewed within `claim_age_timeout_secs` under a live
+  lease is treated as stuck. A task that may run longer renews its claim from
+  its processing loop (`renew`), so it is reclaimed only once it stops making
+  progress.
 - **Drain signal.** `claim` reports `upstream_drained` once a queue is marked
   finished and empty.
 - **Delivery count.** Every claimed message carries `delivery_count`: 1 on
@@ -46,7 +48,7 @@ from anvil_py import AnvilBroker, AnvilRustClient, BrokerConfig
 broker = AnvilBroker(BrokerConfig(
     "file:///tmp/anvil",
     lease_timeout_secs=30.0,
-    claim_age_timeout_secs=6 * 3600.0,
+    claim_age_timeout_secs=60.0,
 ))
 broker.start()  # binds asynchronously; poll get_port() until it is set
 
@@ -57,6 +59,10 @@ client.push("work", b"payload")
 
 messages, drained = client.claim("work", batch_size=1)
 for message in messages:
+    for chunk in work_in_chunks(message.payload):
+        process(chunk)
+        # Each chunk restarts the claim_age_timeout_secs window.
+        client.renew("work", [message.msg_id], [message.claim_token])
     client.ack("work", [message.msg_id], claim_tokens=[message.claim_token])
 ```
 

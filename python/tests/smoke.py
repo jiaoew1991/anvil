@@ -1,7 +1,7 @@
 """Round-trips one message through a broker built from the installed wheel.
 
 Exercises the Python bindings end to end: start a broker on a temporary
-file:// store, push, claim, check the delivery count, ack, and stop.
+file:// store, push, claim, check the delivery count, renew, ack, and stop.
 """
 
 import sys
@@ -42,6 +42,7 @@ def main():
         (message,) = wait_for(claim_one)
         assert message.payload == b"payload", message.payload
         assert message.delivery_count == 1, message.delivery_count
+        client.renew("work", [message.msg_id], [message.claim_token])
         client.ack("work", [message.msg_id], claim_tokens=[message.claim_token])
 
         client.stop()

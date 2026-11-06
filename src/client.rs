@@ -493,6 +493,42 @@ impl AnvilRustClient {
         })
     }
 
+    /// Renews claims this worker is still making progress on, restarting
+    /// their `claim_age_timeout_secs` window. Call it periodically from the
+    /// processing loop of a task that may outlast the window, so that a task
+    /// that stops making progress also stops renewing and is reclaimed.
+    fn renew(
+        &self,
+        py: Python<'_>,
+        queue: String,
+        msg_ids: Vec<String>,
+        claim_tokens: Vec<String>,
+    ) -> PyResult<()> {
+        if claim_tokens.len() != msg_ids.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "claim_tokens must match msg_ids length",
+            ));
+        }
+        let inner = self.inner.clone();
+        py.allow_threads(move || {
+            inner.runtime.block_on(async {
+                let mut client = inner.get_client()?;
+                let request = proto::RenewClaimsRequest {
+                    queue,
+                    msg_ids,
+                    claim_tokens,
+                    worker_id: inner.worker_id.clone(),
+                    lease_id: inner.get_lease_id(),
+                };
+                client
+                    .renew_claims(request)
+                    .await
+                    .map_err(status_to_pyerr)?;
+                Ok(())
+            })
+        })
+    }
+
     #[pyo3(signature = (queue, msg_ids, claim_tokens=None, reason="processing_failed", delay_ms=0, state_namespace=None, state_puts=None, state_deletes=None))]
     #[allow(clippy::too_many_arguments)]
     fn nack(

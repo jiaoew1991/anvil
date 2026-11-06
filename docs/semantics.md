@@ -314,7 +314,7 @@ pub async fn recover_expired_claims(&self, timeout_secs: f64) {
 
 **Configuration:**
 - `lease_timeout_secs`: Default 60s - how long a lease may miss heartbeats before its worker is considered dead and all its claims are reclaimed
-- `claim_age_timeout_secs`: Default 60s - how long one claim may be held under a live lease before it is considered stuck; must exceed the slowest task
+- `claim_age_timeout_secs`: Default 60s - how long a claim under a live lease may go without being taken or renewed before it is considered stuck. A task that may run longer renews its claims (`RenewClaims`) from its processing loop; renewing from a background timer would keep a stuck task's claims alive
 - `recovery_interval_secs`: Default 10s - how often to check for expired claims
 
 ### 4.2 Worker-Level Recovery

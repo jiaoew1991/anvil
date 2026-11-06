@@ -25,6 +25,11 @@ service Anvil {
   // Complete message processing: ack, nack, forward, or scatter
   rpc Complete(CompleteRequest) returns (CompleteResponse);
 
+  // Renew claims a worker is still making progress on, restarting their
+  // claim_age_timeout window. A long task renews periodically from its
+  // processing loop, so a stuck one stops renewing and is reclaimed.
+  rpc RenewClaims(RenewClaimsRequest) returns (RenewClaimsResponse);
+
   // Push one or more messages to a queue
   rpc Push(PushRequest) returns (PushResponse);
 
@@ -153,6 +158,17 @@ message CompleteResponse {
   int32 processed_count = 2;            // number of messages acked/nacked
   repeated string new_msg_ids = 3;      // downstream message IDs (forward/scatter)
 }
+
+// All or none: one claim that is no longer the caller's fails the call.
+message RenewClaimsRequest {
+  string queue = 1;
+  repeated string msg_ids = 2;
+  repeated string claim_tokens = 3;     // same length as msg_ids
+  string worker_id = 4;
+  string lease_id = 5;
+}
+
+message RenewClaimsResponse {}
 
 // ============================================================================
 // Unified Push (replaces Push + PushBatch)
