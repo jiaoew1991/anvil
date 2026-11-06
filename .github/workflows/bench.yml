@@ -22,23 +22,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The bars guard against regressions on GitHub's 4-vCPU runners, at
+        # about 80% of the throughput first measured there (latency 8.4k
+        # keys/s, contention 9.3k): room for runner noise, while the kind of
+        # hot-path lock this is meant to catch cost a third. Revisit them once
+        # the daily runs show the real spread. The runner is CPU-bound well
+        # below production hardware, so it cannot check the 8.7k keys/s target
+        # itself; that needs a 32-core host.
         include:
-          # Latency-bound: each worker waits on two durable round trips per
-          # key, so throughput tracks the WAL flush latency. The bar is the
-          # 8.7k keys/s target the broker is sized for.
+          # Each worker waits on two durable round trips per key.
           - profile: latency
             keys: 300000
             workers: 1000
-            keys_per_sec_min: 8700
+            keys_per_sec_min: 6700
             ack_p99_ms_max: 300
-          # Contention: enough workers to saturate the runner, so a lock or
-          # a serialized write path on the hot path shows up as lost
-          # throughput. Provisional bar, to be raised once the runner's
-          # baseline is known.
+          # Enough workers to saturate the runner, so contention on the hot
+          # path shows up as lost throughput.
           - profile: contention
             keys: 600000
             workers: 4000
-            keys_per_sec_min: 12000
+            keys_per_sec_min: 7400
             ack_p99_ms_max: 0
     name: bench (${{ matrix.profile }})
     steps:
