@@ -86,6 +86,10 @@ mod tests {
         num_workers: usize,
         workers: Vec<WorkerState>,
         lease_ids: Vec<String>,
+        /// Every (queue, msg_id) whose push or forward returned success.
+        pushed: HashSet<(String, String)>,
+        /// Every (queue, msg_id) whose ack returned success.
+        acked: HashSet<(String, String)>,
     }
 
     impl DstSimulator {
@@ -120,6 +124,8 @@ mod tests {
                 num_workers,
                 workers,
                 lease_ids,
+                pushed: HashSet::new(),
+                acked: HashSet::new(),
             }
         }
 
@@ -134,6 +140,8 @@ mod tests {
             self.workers = (0..self.num_workers)
                 .map(|_| WorkerState::default())
                 .collect();
+            self.pushed.clear();
+            self.acked.clear();
             set_sim_time_nanos(1_735_689_600_000_000_000);
         }
 
@@ -190,6 +198,7 @@ mod tests {
                     let queue = &self.queues[queue_idx];
                     let msg = Message::new(queue.clone(), b"dst-payload".to_vec());
                     self.storage.push_message(queue, &msg).await.unwrap();
+                    self.pushed.insert((queue.clone(), msg.msg_id));
                 }
 
                 Op::PushBatch { queue_idx, count } => {
@@ -198,6 +207,8 @@ mod tests {
                         .map(|_| Message::new(queue.clone(), b"dst-batch".to_vec()))
                         .collect();
                     self.storage.push_messages(queue, &msgs).await.unwrap();
+                    self.pushed
+                        .extend(msgs.into_iter().map(|m| (queue.clone(), m.msg_id)));
                 }
 
                 Op::Claim {
@@ -244,6 +255,8 @@ mod tests {
                             .ack_messages(queue, msg_ids, tokens, &worker_id, lease_id)
                             .await
                             .unwrap();
+                        self.acked
+                            .extend(msg_ids.iter().map(|id| (queue.clone(), id.clone())));
                     }
                 }
 
@@ -293,7 +306,7 @@ mod tests {
                     self.storage
                         .ack_and_forward(
                             &queue,
-                            &[msg_id],
+                            std::slice::from_ref(&msg_id),
                             &[token],
                             &worker_id,
                             lease_id,
@@ -302,6 +315,9 @@ mod tests {
                         )
                         .await
                         .unwrap();
+                    self.acked.insert((queue, msg_id));
+                    self.pushed
+                        .extend(out_msgs.into_iter().map(|m| (downstream.clone(), m.msg_id)));
                 }
 
                 Op::AdvanceTime { secs } => {
@@ -339,83 +355,83 @@ mod tests {
             }
         }
 
-        /// Scan storage and verify all invariants.
-        async fn check_invariants(&self) {
-            for queue in &self.queues {
-                let meta = self.storage.get_queue_stats(queue).await.unwrap();
-                let pending_from_meta = meta.push_seq.saturating_sub(meta.claim_seq);
-
-                let claimed_entries = self.storage.scan_claimed(Some(queue)).await.unwrap();
-                let acked_entries = self.storage.scan_acked(Some(queue)).await.unwrap();
-
-                let actual_claimed = claimed_entries.len() as u64;
-                let actual_acked = acked_entries.len() as u64;
-
-                // Invariant 1: claimed_count == actual claimed keys
-                assert_eq!(
-                    meta.claimed_count, actual_claimed,
-                    "[{}] claimed_count: meta={} actual={} (meta={:?})",
-                    queue, meta.claimed_count, actual_claimed, meta
-                );
-
-                // Invariant 2: actual acked keys <= total_acked (GC may have deleted some)
-                assert!(
-                    actual_acked <= meta.total_acked,
-                    "[{}] acked keys ({}) > total_acked ({}) (meta={:?})",
-                    queue,
-                    actual_acked,
-                    meta.total_acked,
-                    meta
-                );
-
-                // Invariant 3: conservation — pending + claimed + acked >= total_pushed
-                // (excess = cumulative nack count, always >= 0)
-                let lhs = pending_from_meta + meta.claimed_count + meta.total_acked;
-                assert!(
-                    lhs >= meta.total_pushed,
-                    "[{}] conservation: {} + {} + {} = {} < total_pushed={} (meta={:?})",
-                    queue,
-                    pending_from_meta,
-                    meta.claimed_count,
-                    meta.total_acked,
-                    lhs,
-                    meta.total_pushed,
-                    meta
-                );
-
-                // Invariant 4: no msg_id in both claimed AND acked
-                let claimed_ids: HashSet<&str> = claimed_entries
-                    .iter()
-                    .map(|(_, id, _)| id.as_str())
-                    .collect();
-                let acked_ids: HashSet<&str> =
-                    acked_entries.iter().map(|(_, _, id)| id.as_str()).collect();
-                let overlap: Vec<_> = claimed_ids.intersection(&acked_ids).collect();
-                assert!(
-                    overlap.is_empty(),
-                    "[{}] msg_ids in both claimed and acked: {:?}",
-                    queue,
-                    overlap
-                );
-
-                // Invariant 5: claim_seq <= push_seq
-                assert!(
-                    meta.claim_seq <= meta.push_seq,
-                    "[{}] claim_seq({}) > push_seq({})",
-                    queue,
-                    meta.claim_seq,
-                    meta.push_seq
-                );
-            }
-        }
-
         async fn run_seed(&mut self, seed: u64, op_count: usize) {
             self.reset(seed).await;
             let ops = self.generate_ops(op_count);
             for op in ops {
                 self.execute(op).await;
             }
-            self.check_invariants().await;
+            check_invariants(&self.storage, &self.queues).await;
+        }
+    }
+
+    /// Scan storage and verify all invariants.
+    async fn check_invariants(storage: &AnvilStorage, queues: &[String]) {
+        for queue in queues {
+            let meta = storage.get_queue_stats(queue).await.unwrap();
+            let pending_from_meta = meta.push_seq.saturating_sub(meta.claim_seq);
+
+            let claimed_entries = storage.scan_claimed(Some(queue)).await.unwrap();
+            let acked_entries = storage.scan_acked(Some(queue)).await.unwrap();
+
+            let actual_claimed = claimed_entries.len() as u64;
+            let actual_acked = acked_entries.len() as u64;
+
+            // Invariant 1: claimed_count == actual claimed keys
+            assert_eq!(
+                meta.claimed_count, actual_claimed,
+                "[{}] claimed_count: meta={} actual={} (meta={:?})",
+                queue, meta.claimed_count, actual_claimed, meta
+            );
+
+            // Invariant 2: actual acked keys <= total_acked (GC may have deleted some)
+            assert!(
+                actual_acked <= meta.total_acked,
+                "[{}] acked keys ({}) > total_acked ({}) (meta={:?})",
+                queue,
+                actual_acked,
+                meta.total_acked,
+                meta
+            );
+
+            // Invariant 3: conservation — pending + claimed + acked >= total_pushed
+            // (excess = cumulative nack count, always >= 0)
+            let lhs = pending_from_meta + meta.claimed_count + meta.total_acked;
+            assert!(
+                lhs >= meta.total_pushed,
+                "[{}] conservation: {} + {} + {} = {} < total_pushed={} (meta={:?})",
+                queue,
+                pending_from_meta,
+                meta.claimed_count,
+                meta.total_acked,
+                lhs,
+                meta.total_pushed,
+                meta
+            );
+
+            // Invariant 4: no msg_id in both claimed AND acked
+            let claimed_ids: HashSet<&str> = claimed_entries
+                .iter()
+                .map(|(_, id, _)| id.as_str())
+                .collect();
+            let acked_ids: HashSet<&str> =
+                acked_entries.iter().map(|(_, _, id)| id.as_str()).collect();
+            let overlap: Vec<_> = claimed_ids.intersection(&acked_ids).collect();
+            assert!(
+                overlap.is_empty(),
+                "[{}] msg_ids in both claimed and acked: {:?}",
+                queue,
+                overlap
+            );
+
+            // Invariant 5: claim_seq <= push_seq
+            assert!(
+                meta.claim_seq <= meta.push_seq,
+                "[{}] claim_seq({}) > push_seq({})",
+                queue,
+                meta.claim_seq,
+                meta.push_seq
+            );
         }
     }
 
@@ -871,5 +887,269 @@ mod tests {
         let meta = storage.get_queue_stats("bounded").await.unwrap();
         assert_eq!(meta.total_pushed, 4);
         assert_eq!(meta.total_acked, 1);
+    }
+
+    // =====================================================================
+    // Crash recovery on a file:// store
+    //
+    // A crash is simulated by tearing the runtime down without closing the
+    // database and leaking the storage handle, so nothing can flush after
+    // the last call returned. The directory is then reopened by a fresh
+    // runtime, as a restarted broker would.
+    // =====================================================================
+
+    /// Claims taken per call while draining a reopened queue.
+    const DRAIN_CLAIM_BATCH: usize = 256;
+
+    fn crash_test_db_path(name: &str) -> (std::path::PathBuf, String) {
+        static TRIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let trial = TRIAL.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("anvil_{name}_{}_{trial}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = format!("file://{}", dir.display());
+        (dir, db_path)
+    }
+
+    /// Ends `runtime` the way a killed process would end the broker.
+    fn crash<T>(runtime: tokio::runtime::Runtime, storage: T) {
+        runtime.shutdown_background();
+        std::mem::forget(storage);
+    }
+
+    /// Checks a reopened store against what the crashed run acknowledged:
+    /// counters agree with the keys, every successful ack is still acked
+    /// exactly once, and every successful push is either acked or comes out
+    /// of the queue exactly once when everything left is drained.
+    async fn check_recovered(
+        storage: &AnvilStorage,
+        queues: &[String],
+        pushed: &HashSet<(String, String)>,
+        acked: &HashSet<(String, String)>,
+    ) {
+        check_invariants(storage, queues).await;
+
+        let mut stored_acked: HashSet<(String, String)> = HashSet::new();
+        for queue in queues {
+            for (_, _, msg_id) in storage.scan_acked(Some(queue)).await.unwrap() {
+                let first = stored_acked.insert((queue.clone(), msg_id.clone()));
+                assert!(first, "[{queue}] {msg_id} acked twice");
+            }
+        }
+        let lost_acks: Vec<_> = acked.difference(&stored_acked).collect();
+        assert!(
+            lost_acks.is_empty(),
+            "acks lost in the crash: {lost_acks:?}"
+        );
+
+        // Every claim's holder died with the broker.
+        let no_live_leases = HashMap::new();
+        storage
+            .recover_expired_claims(0.0, 0.0, Some(&no_live_leases))
+            .await
+            .unwrap();
+
+        let mut drained: HashSet<(String, String)> = HashSet::new();
+        for queue in queues {
+            loop {
+                let claimed = storage
+                    .claim_messages(queue, DRAIN_CLAIM_BATCH, "drainer", "drainer-lease")
+                    .await
+                    .unwrap();
+                if claimed.is_empty() {
+                    break;
+                }
+                for c in claimed {
+                    let key = (queue.clone(), c.message.msg_id);
+                    assert!(
+                        !stored_acked.contains(&key),
+                        "{key:?} delivered after its ack"
+                    );
+                    let first = drained.insert(key.clone());
+                    assert!(first, "{key:?} delivered twice");
+                }
+            }
+            let meta = storage.get_queue_stats(queue).await.unwrap();
+            assert_eq!(
+                meta.push_seq, meta.claim_seq,
+                "[{queue}] pending left after drain"
+            );
+        }
+        let lost: Vec<_> = pushed
+            .iter()
+            .filter(|key| !stored_acked.contains(*key) && !drained.contains(*key))
+            .collect();
+        assert!(
+            lost.is_empty(),
+            "pushed messages lost in the crash: {lost:?}"
+        );
+    }
+
+    /// The DST workload on a file:// store, crashed after its last
+    /// operation and reopened: whatever each operation reported as done
+    /// must have survived.
+    #[test]
+    fn test_dst_crash_recovery() {
+        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        for seed in 300..304 {
+            let (dir, db_path) = crash_test_db_path("dst_crash");
+
+            let crashed = tokio::runtime::Runtime::new().unwrap();
+            let sim = crashed.block_on(async {
+                let storage = AnvilStorage::new(&db_path).await.unwrap();
+                let mut sim = DstSimulator::with_storage(storage, seed, 3, 4).await;
+                let ops = sim.generate_ops(150);
+                for op in ops {
+                    sim.execute(op).await;
+                }
+                sim
+            });
+            let queues = sim.queues.clone();
+            let pushed = sim.pushed.clone();
+            let acked = sim.acked.clone();
+            crash(crashed, sim);
+
+            let recovered = tokio::runtime::Runtime::new().unwrap();
+            recovered.block_on(async {
+                let storage = AnvilStorage::new(&db_path).await.unwrap();
+                check_recovered(&storage, &queues, &pushed, &acked).await;
+            });
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        set_sim_time_nanos(0);
+    }
+
+    /// Concurrent producers, workers acking and nacking, and a reclaimer
+    /// that keeps stealing claims out from under them, crashed mid-flight
+    /// at several points. The reclaimer races every settlement, and
+    /// concurrent writers race to persist the queue counters, so this is
+    /// where a check-then-write gap or an out-of-order counter write would
+    /// surface after the restart.
+    #[test]
+    fn test_crash_during_concurrent_workload() {
+        const PRODUCERS: usize = 4;
+        const PUSH_BATCH: usize = 8;
+        const WORKERS: usize = 16;
+        const CLAIM_BATCH: usize = 4;
+        const RECLAIM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+        const IDLE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
+        for crash_after_ms in [300u64, 1_000, 2_500] {
+            let (dir, db_path) = crash_test_db_path("concurrent_crash");
+            let queue = "work".to_string();
+            let pushed: Arc<std::sync::Mutex<HashSet<(String, String)>>> = Arc::default();
+            let acked: Arc<std::sync::Mutex<HashSet<(String, String)>>> = Arc::default();
+
+            let crashed = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let storage = crashed.block_on(async {
+                let storage = Arc::new(AnvilStorage::new(&db_path).await.unwrap());
+                storage.create_queue(&queue, 0).await.unwrap();
+
+                for _ in 0..PRODUCERS {
+                    let (storage, queue, pushed) = (storage.clone(), queue.clone(), pushed.clone());
+                    tokio::spawn(async move {
+                        loop {
+                            let batch: Vec<Message> = (0..PUSH_BATCH)
+                                .map(|_| Message::new(queue.clone(), b"x".to_vec()))
+                                .collect();
+                            storage.push_messages(&queue, &batch).await.unwrap();
+                            pushed
+                                .lock()
+                                .unwrap()
+                                .extend(batch.into_iter().map(|m| (queue.clone(), m.msg_id)));
+                        }
+                    });
+                }
+
+                for worker in 0..WORKERS {
+                    let (storage, queue, acked) = (storage.clone(), queue.clone(), acked.clone());
+                    tokio::spawn(async move {
+                        let worker_id = format!("w{worker}");
+                        let lease_id = format!("lease-{worker}");
+                        let mut rng = StdRng::seed_from_u64(worker as u64);
+                        loop {
+                            let claimed = storage
+                                .claim_messages(&queue, CLAIM_BATCH, &worker_id, &lease_id)
+                                .await
+                                .unwrap();
+                            if claimed.is_empty() {
+                                tokio::time::sleep(IDLE_BACKOFF).await;
+                                continue;
+                            }
+                            for c in claimed {
+                                let msg_ids = std::slice::from_ref(&c.message.msg_id);
+                                let tokens = std::slice::from_ref(&c.claim_token);
+                                let settled = if rng.random_bool(0.8) {
+                                    storage
+                                        .ack_messages(
+                                            &queue, msg_ids, tokens, &worker_id, &lease_id,
+                                        )
+                                        .await
+                                        .map(|()| true)
+                                } else {
+                                    storage
+                                        .nack_messages(
+                                            &queue, msg_ids, tokens, &worker_id, &lease_id,
+                                        )
+                                        .await
+                                        .map(|()| false)
+                                };
+                                match settled {
+                                    Ok(true) => {
+                                        acked
+                                            .lock()
+                                            .unwrap()
+                                            .insert((queue.clone(), c.message.msg_id));
+                                    }
+                                    Ok(false) => {}
+                                    // The reclaimer took the claim first.
+                                    Err(e) => assert!(
+                                        e.to_string().contains("message_not_claimed")
+                                            || e.to_string().contains("claim_token mismatch")
+                                            || e.to_string().contains("claim_settling"),
+                                        "unexpected settlement error: {e}"
+                                    ),
+                                }
+                            }
+                        }
+                    });
+                }
+
+                {
+                    let storage = storage.clone();
+                    tokio::spawn(async move {
+                        let no_live_leases = HashMap::new();
+                        loop {
+                            tokio::time::sleep(RECLAIM_INTERVAL).await;
+                            storage
+                                .recover_expired_claims(0.0, 0.0, Some(&no_live_leases))
+                                .await
+                                .unwrap();
+                        }
+                    });
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(crash_after_ms)).await;
+                storage
+            });
+            crash(crashed, storage);
+            // Copy the records out under the lock: tasks of the crashed
+            // runtime may still be unwinding.
+            let pushed = pushed.lock().unwrap().clone();
+            let acked = acked.lock().unwrap().clone();
+            assert!(
+                !acked.is_empty(),
+                "the workload acked nothing before the crash"
+            );
+
+            let recovered = tokio::runtime::Runtime::new().unwrap();
+            recovered.block_on(async {
+                let storage = AnvilStorage::new(&db_path).await.unwrap();
+                check_recovered(&storage, std::slice::from_ref(&queue), &pushed, &acked).await;
+            });
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

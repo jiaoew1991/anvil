@@ -30,13 +30,41 @@ A single `scan_claimed()` call with 1M claimed messages can block the server for
 ### Key Schema
 
 ```
-meta:{queue}                          → QueueMeta {claim_seq, push_seq}
-pending:{queue}:{seq:020d}            → msg_id
-msg:{queue}:{msg_id}                  → Message JSON
+seq_push:{queue}                      → u64 LE, marks the queue as created
+cnt_total_pushed:{queue}              → u64 LE, lifetime total (merge-summed)
+cnt_total_acked:{queue}               → u64 LE, lifetime total (merge-summed)
+pending:{queue}:{seq:020d}            → PendingEntry protobuf {msg_id, delivery_count}
+msg:{queue}:{msg_id}                  → StoredMessage protobuf (deleted on ack)
 claimed:{queue}:{msg_id}              → ClaimInfo JSON
 acked:{queue}:{ts:020d}:{msg_id}      → ""
 state:{namespace}:{key}               → value bytes
 ```
+
+`meta:{queue}`, `seq_claim:{queue}`, `cnt_total_claimed:{queue}` and
+`cnt_total_unclaimed:{queue}` are legacy: read for migration or deleted with
+the queue, never written.
+
+### Counters and restart
+
+Queue counters live in memory (`QueueState`) and are authoritative while the
+broker runs. On load, `load_or_init_counters` derives what must be exact from
+the keys: `claim_seq` is the oldest pending key, `push_seq` is past both the
+newest pending key and `seq_push`, and the in-flight count is the number of
+claimed keys. Only the lifetime totals are read as persisted.
+
+Never persist a counter as an absolute value. Concurrent writers compute their
+values under a lock but reach the WAL in any order, so an older value can land
+last: a claim cursor persisted that way once hid pending messages forever after
+a crash. A total that must survive is merged as an increment in the batch of
+the operation it counts (`TotalSumMergeOperator`), which makes it exact.
+
+### Settling a claim
+
+Ack, nack and reclaim each read a claim and then write its outcome. Every one
+must hold the claim between the two (`validate_claims` returns the
+`SettlementHold`; `reclaim_messages` takes it and re-reads the token), so a
+second settlement of the same message is fenced instead of acking it twice or
+requeueing it after its ack.
 
 ### O(1) Operations (Good ✅)
 
@@ -68,33 +96,9 @@ state:{namespace}:{key}               → value bytes
 
 **Problem**: `get_queue_stats` calls `scan_claimed` to count claimed messages.
 
-**Solution**: Maintain counters in QueueMeta, updated atomically in each operation.
-
-```rust
-// storage.rs - QueueMeta now has counters
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct QueueMeta {
-    pub claim_seq: u64,
-    pub push_seq: u64,
-    #[serde(default)]
-    pub claimed_count: u64,   // ✅ Updated in claim/ack/nack
-    #[serde(default)]
-    pub total_pushed: u64,    // ✅ Lifetime counter
-    #[serde(default)]
-    pub total_acked: u64,     // ✅ Lifetime counter
-}
-
-// get_queue_stats is now O(1)
-pub async fn get_queue_stats(&self, queue: &str) -> Result<QueueMeta, StorageError> {
-    self.get_meta(queue).await  // ✅ Single key lookup
-}
-```
-
-Counter updates:
-- `claim_messages`: `claimed_count += claimed.len()`
-- `ack_internal`: `claimed_count -= ack_count`, `total_acked += ack_count`
-- `nack_messages`: `claimed_count -= nack_count`
-- `push_messages`: `total_pushed += msg_count`
+**Solution**: `get_queue_stats` reads the in-memory `QueueState` counters
+(O(1), no I/O). The claimed keys are counted once per queue, when the broker
+loads it (see "Counters and restart").
 
 ### 3.2 Background Tasks (Acceptable O(n))
 
@@ -176,8 +180,8 @@ acked:{queue}:{msg_id} → {timestamp, ...}
 ### Principle 4: Counters for Cardinality
 
 ```
-# Instead of: SELECT COUNT(*) FROM claimed WHERE queue = ?
-# Use: meta:{queue} → {..., claimed_count: 42}
+# Instead of: SELECT COUNT(*) FROM claimed WHERE queue = ? on every call
+# Use: an in-memory counter, derived from the keys once when the queue loads
 ```
 
 ---
@@ -225,8 +229,7 @@ async fn test_claim_performance_scales_constant() {
 ### Hot Path: O(1) Required ✅
 
 1. **`get_queue_stats`** - FIXED
-   - Now uses `QueueMeta` counters (O(1) single key lookup)
-   - Counters updated atomically in claim/ack/nack operations
+   - Reads the in-memory queue counters (O(1), no I/O)
 
 ### Background Tasks: O(n) Acceptable ✅
 
