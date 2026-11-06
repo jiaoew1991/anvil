@@ -34,6 +34,12 @@ mod types;
 mod bench;
 #[cfg(test)]
 mod dst;
+#[cfg(test)]
+mod gc_passes;
+#[cfg(test)]
+mod grpc_e2e;
+#[cfg(test)]
+mod scatter_atomicity;
 
 use server::AnvilBrokerInner;
 use storage::AnvilStorage;
