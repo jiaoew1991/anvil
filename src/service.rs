@@ -445,6 +445,24 @@ impl Anvil for AnvilService {
             .map(Response::new)
     }
 
+    async fn renew_claims(
+        &self,
+        request: Request<RenewClaimsRequest>,
+    ) -> Result<Response<RenewClaimsResponse>, Status> {
+        let req = request.into_inner();
+        self.storage
+            .renew_claims(
+                &req.queue,
+                &req.msg_ids,
+                &req.claim_tokens,
+                &req.worker_id,
+                &req.lease_id,
+            )
+            .await
+            .map(|()| Response::new(RenewClaimsResponse {}))
+            .map_err(|e| Status::internal(format!("Storage error: {e}")))
+    }
+
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushResponse>, Status> {
         let req = request.into_inner();
 

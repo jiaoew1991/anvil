@@ -332,6 +332,12 @@ pub struct AnvilStorage {
     /// work still in flight. The broker is the database's only writer, so
     /// an in-memory set is enough.
     settling: DashSet<Vec<u8>>,
+    /// When each claim, by claim token, was last renewed by its worker. A
+    /// claim under a live lease is stuck once neither its claim nor its last
+    /// renewal is within `claim_age_timeout_secs`. Kept in memory only: a
+    /// restarted broker has no live leases, so every claim is reclaimed
+    /// regardless. Recovery prunes tokens that no longer hold a claim.
+    renewed_at: DashMap<String, f64>,
 }
 
 /// Claims held for settlement, released when dropped: after the durable
@@ -387,6 +393,7 @@ impl AnvilStorage {
             steal_rr: std::sync::Mutex::new(HashMap::new()),
             max_pending_limits: DashMap::new(),
             settling: DashSet::new(),
+            renewed_at: DashMap::new(),
         })
     }
 
@@ -507,43 +514,107 @@ impl AnvilStorage {
                     "claim_settling: queue={queue}, msg_id={msg_id} is being settled concurrently"
                 ))));
             }
-            let claim_data = self.db.get(&claim_key).await?.ok_or_else(|| {
-                SlateError::invalid(format!(
-                    "message_not_claimed: queue={queue}, msg_id={msg_id}"
-                ))
-            })?;
-            let claim_info: ClaimInfo = serde_json::from_slice(&claim_data)?;
-
-            if claim_info.claim_token != *token {
-                return Err(Box::new(SlateError::invalid(format!(
-                    "claim_token mismatch: queue={queue}, msg_id={msg_id}, \
-                     expected={token}, actual={}",
-                    claim_info.claim_token
-                ))));
-            }
-            if let Some(expected) = expected_lease_id {
-                if claim_info.lease_id != expected {
-                    return Err(Box::new(SlateError::invalid(format!(
-                        "lease_id mismatch: queue={queue}, msg_id={msg_id}, \
-                         expected={expected}, actual={}",
-                        claim_info.lease_id
-                    ))));
-                }
-            }
-            if let Some(expected) = expected_worker_id {
-                if claim_info.worker_id != expected {
-                    return Err(Box::new(SlateError::invalid(format!(
-                        "worker_id mismatch: queue={queue}, msg_id={msg_id}, \
-                         expected={expected}, actual={}",
-                        claim_info.worker_id
-                    ))));
-                }
-            }
-            claims.push(claim_info);
+            claims.push(
+                self.read_owned_claim(queue, msg_id, token, expected_lease_id, expected_worker_id)
+                    .await?,
+            );
         }
         assert_eq!(claims.len(), msg_ids.len());
         assert_eq!(hold.claim_keys.len(), msg_ids.len());
         Ok((hold, claims))
+    }
+
+    /// Reads the claim on `msg_id` and checks that its holder presented the
+    /// right token, lease and worker.
+    async fn read_owned_claim(
+        &self,
+        queue: &str,
+        msg_id: &str,
+        token: &str,
+        expected_lease_id: Option<&str>,
+        expected_worker_id: Option<&str>,
+    ) -> Result<ClaimInfo, StorageError> {
+        let claim_data = self
+            .db
+            .get(&Self::claimed_key(queue, msg_id))
+            .await?
+            .ok_or_else(|| {
+                SlateError::invalid(format!(
+                    "message_not_claimed: queue={queue}, msg_id={msg_id}"
+                ))
+            })?;
+        let claim_info: ClaimInfo = serde_json::from_slice(&claim_data)?;
+
+        if claim_info.claim_token != token {
+            return Err(Box::new(SlateError::invalid(format!(
+                "claim_token mismatch: queue={queue}, msg_id={msg_id}, \
+                 expected={token}, actual={}",
+                claim_info.claim_token
+            ))));
+        }
+        if let Some(expected) = expected_lease_id {
+            if claim_info.lease_id != expected {
+                return Err(Box::new(SlateError::invalid(format!(
+                    "lease_id mismatch: queue={queue}, msg_id={msg_id}, \
+                     expected={expected}, actual={}",
+                    claim_info.lease_id
+                ))));
+            }
+        }
+        if let Some(expected) = expected_worker_id {
+            if claim_info.worker_id != expected {
+                return Err(Box::new(SlateError::invalid(format!(
+                    "worker_id mismatch: queue={queue}, msg_id={msg_id}, \
+                     expected={expected}, actual={}",
+                    claim_info.worker_id
+                ))));
+            }
+        }
+        Ok(claim_info)
+    }
+
+    /// Renews the claims of a worker that is still making progress on them,
+    /// restarting their `claim_age_timeout_secs` window. Nothing is written:
+    /// the renewal only has to outlive the broker process (see `renewed_at`).
+    ///
+    /// It does not take the settlement hold, so a worker can renew from one
+    /// thread while acking from another. A renewal that lands just as
+    /// recovery reclaims the claim is lost with it; the worker's next renewal
+    /// or ack is then fenced like any stale claim.
+    pub async fn renew_claims(
+        &self,
+        queue: &str,
+        msg_ids: &[String],
+        claim_tokens: &[String],
+        worker_id: &str,
+        lease_id: &str,
+    ) -> Result<(), StorageError> {
+        if claim_tokens.len() != msg_ids.len() {
+            return Err(Box::new(SlateError::invalid(format!(
+                "claim_tokens length mismatch (msg_ids={}, claim_tokens={})",
+                msg_ids.len(),
+                claim_tokens.len()
+            ))));
+        }
+        let mut claims = Vec::with_capacity(msg_ids.len());
+        for (msg_id, token) in msg_ids.iter().zip(claim_tokens) {
+            claims.push(
+                self.read_owned_claim(
+                    queue,
+                    msg_id,
+                    token,
+                    Some(lease_id).filter(|v| !v.is_empty()),
+                    Some(worker_id).filter(|v| !v.is_empty()),
+                )
+                .await?,
+            );
+        }
+        // All or none: one stale claim fails the call before any renews.
+        let now = crate::types::now_secs();
+        for claim in claims {
+            self.renewed_at.insert(claim.claim_token, now);
+        }
+        Ok(())
     }
 
     /// Reserve a contiguous push range and register a pending entry in
@@ -1310,14 +1381,17 @@ impl AnvilStorage {
         .await
     }
 
-    /// Returns claims to pending after a worker stopped renewing them. It
-    /// races the claimants' own acks and nacks, so each claim is settled
-    /// only if it is not being settled already and still carries the token
-    /// the caller read; the rest are skipped. Returns the claims requeued.
+    /// Returns claims to pending after their worker died or stopped renewing
+    /// them. It races the claimants' own acks, nacks and renewals, so each
+    /// claim is settled only if it is not being settled already, still
+    /// carries the token the caller read at `read_at` (from `now_secs`), and
+    /// was not renewed since; the rest are skipped. Returns the claims
+    /// requeued.
     pub async fn reclaim_messages(
         &self,
         queue: &str,
         claims: &[ClaimInfo],
+        read_at: f64,
     ) -> Result<Vec<ClaimInfo>, StorageError> {
         let mut hold = SettlementHold::new(&self.settling);
         let mut reclaimed = Vec::with_capacity(claims.len());
@@ -1330,7 +1404,11 @@ impl AnvilStorage {
                 continue;
             };
             let current: ClaimInfo = serde_json::from_slice(&data)?;
-            if current.claim_token == claim.claim_token {
+            let renewed_since_read = self
+                .renewed_at
+                .get(&current.claim_token)
+                .is_some_and(|renewed_at| *renewed_at >= read_at);
+            if current.claim_token == claim.claim_token && !renewed_since_read {
                 reclaimed.push(ClaimInfo {
                     msg_id: claim.msg_id.clone(),
                     ..current
@@ -1634,6 +1712,12 @@ impl AnvilStorage {
     ) -> Result<usize, StorageError> {
         let now = crate::types::now_secs();
         let all_claimed = self.scan_claimed(None).await?;
+        let live_tokens: std::collections::HashSet<&str> = all_claimed
+            .iter()
+            .map(|(_, _, claim_info)| claim_info.claim_token.as_str())
+            .collect();
+        self.renewed_at
+            .retain(|token, _| live_tokens.contains(token.as_str()));
 
         // Group expired by queue
         let mut expired_by_queue: HashMap<String, Vec<ClaimInfo>> = HashMap::new();
@@ -1650,12 +1734,18 @@ impl AnvilStorage {
             };
 
             if lease_alive {
-                // Live lease — only recover if the claim has been held longer
-                // than `claim_age_timeout_secs`. This catches both a genuinely
-                // stuck worker (alive but not making progress) AND the lag
-                // window between a Ray-level worker death and the broker
-                // noticing the lease drop.
-                if now - claim_info.claimed_at > claim_age_timeout_secs {
+                // Live lease — only recover if neither the claim nor its last
+                // renewal is within `claim_age_timeout_secs`. This catches
+                // both a genuinely stuck worker (alive but not making
+                // progress) AND the lag window between a Ray-level worker
+                // death and the broker noticing the lease drop.
+                let held_since = self
+                    .renewed_at
+                    .get(&claim_info.claim_token)
+                    .map_or(claim_info.claimed_at, |renewed_at| {
+                        renewed_at.max(claim_info.claimed_at)
+                    });
+                if now - held_since > claim_age_timeout_secs {
                     let mut info = claim_info.clone();
                     info.msg_id = msg_id;
                     expired_by_queue.entry(queue).or_default().push(info);
@@ -1682,7 +1772,7 @@ impl AnvilStorage {
 
         let mut total = 0;
         for (queue, expired) in expired_by_queue {
-            let claims = self.reclaim_messages(&queue, &expired).await?;
+            let claims = self.reclaim_messages(&queue, &expired, now).await?;
             if claims.is_empty() {
                 continue;
             }
@@ -2811,6 +2901,7 @@ mod tests {
             .collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage.claim_messages(queue, 3, "w", "l").await.unwrap();
+        let read_at = crate::types::now_secs();
         let read_by_recovery: Vec<ClaimInfo> = storage
             .scan_claimed(Some(queue))
             .await
@@ -2856,7 +2947,7 @@ mod tests {
         assert_eq!(renewed[0].message.msg_id, renewed_id);
 
         let reclaimed = storage
-            .reclaim_messages(queue, &read_by_recovery[..2])
+            .reclaim_messages(queue, &read_by_recovery[..2], read_at)
             .await
             .unwrap();
         assert!(
@@ -2876,7 +2967,7 @@ mod tests {
 
         // A claim still holding the token recovery read is reclaimed.
         let reclaimed = storage
-            .reclaim_messages(queue, &read_by_recovery[2..])
+            .reclaim_messages(queue, &read_by_recovery[2..], read_at)
             .await
             .unwrap();
         assert_eq!(reclaimed.len(), 1);
@@ -2897,6 +2988,7 @@ mod tests {
             .unwrap();
         let claimed = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
         let (msg_ids, tokens) = split_claims(&claimed);
+        let read_at = crate::types::now_secs();
         let read_by_recovery: Vec<ClaimInfo> = storage
             .scan_claimed(Some(queue))
             .await
@@ -2919,7 +3011,7 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("claim_settling"), "{err}");
             let reclaimed = storage
-                .reclaim_messages(queue, &read_by_recovery)
+                .reclaim_messages(queue, &read_by_recovery, read_at)
                 .await
                 .unwrap();
             assert!(reclaimed.is_empty());
@@ -3087,6 +3179,168 @@ mod tests {
         assert_eq!(still_claimed[0].1, claimed[0].message.msg_id);
 
         set_sim_time_nanos(0);
+    }
+
+    /// A claim under a live lease survives `claim_age_timeout_secs` for as
+    /// long as its worker keeps renewing it, and is reclaimed one window
+    /// after the renewals stop; an unrenewed claim beside it is reclaimed
+    /// on the usual schedule.
+    #[tokio::test]
+    async fn test_renewal_keeps_claim_past_claim_age() {
+        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SIM_TIME_LOCK};
+        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        set_sim_time_nanos(2_200_000_000_000_000_000);
+
+        let storage = create_temp_storage().await;
+        let queue = "renew";
+        storage.create_queue(queue, 0).await.unwrap();
+        let messages: Vec<Message> = (0..2)
+            .map(|_| Message::new(queue.to_string(), b"x".to_vec()))
+            .collect();
+        storage.push_messages(queue, &messages).await.unwrap();
+        let claimed = storage.claim_messages(queue, 2, "w", "l").await.unwrap();
+        let (renewed, idle) = (&claimed[0], &claimed[1]);
+        let storage = &storage;
+        let renew = || {
+            storage.renew_claims(
+                queue,
+                std::slice::from_ref(&renewed.message.msg_id),
+                std::slice::from_ref(&renewed.claim_token),
+                "w",
+                "l",
+            )
+        };
+        let recover = || {
+            let live = HashMap::from([("l".to_string(), crate::types::now_secs())]);
+            async move {
+                storage
+                    .recover_expired_claims(
+                        LEASE_TIMEOUT_SECS_PRODUCTION,
+                        CLAIM_AGE_TIMEOUT_SECS_PRODUCTION,
+                        Some(&live),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let window = CLAIM_AGE_TIMEOUT_SECS_PRODUCTION;
+
+        // Renewed every two thirds of a window, for three windows; recovery
+        // runs a moment after the last renewal, so only expiry keeps it.
+        for _ in 0..4 {
+            advance_sim_time_secs(window * 2.0 / 3.0);
+            renew().await.unwrap();
+        }
+        advance_sim_time_secs(1.0);
+        assert_eq!(recover().await, 1, "only the unrenewed claim is stuck");
+        let held: Vec<String> = storage
+            .scan_claimed(Some(queue))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, msg_id, _)| msg_id)
+            .collect();
+        assert_eq!(held, vec![renewed.message.msg_id.clone()]);
+        assert_ne!(held[0], idle.message.msg_id);
+
+        advance_sim_time_secs(window + 1.0);
+        assert_eq!(recover().await, 1, "renewals stopped a window ago");
+        assert!(storage.scan_claimed(Some(queue)).await.unwrap().is_empty());
+        assert!(
+            renew().await.is_err(),
+            "a reclaimed claim cannot be renewed"
+        );
+
+        set_sim_time_nanos(0);
+    }
+
+    /// Renewal is fenced like an ack, and all or none: a stale token, or
+    /// another worker's claim, fails the whole call and renews nothing.
+    #[tokio::test]
+    async fn test_renewal_rejects_claims_not_held() {
+        let storage = create_temp_storage().await;
+        let queue = "renew-fenced";
+        storage.create_queue(queue, 0).await.unwrap();
+        let messages: Vec<Message> = (0..2)
+            .map(|_| Message::new(queue.to_string(), b"x".to_vec()))
+            .collect();
+        storage.push_messages(queue, &messages).await.unwrap();
+        let claimed = storage.claim_messages(queue, 2, "w", "l").await.unwrap();
+        let (msg_ids, tokens) = split_claims(&claimed);
+
+        let stale = vec![tokens[0].clone(), "stale".to_string()];
+        let err = storage
+            .renew_claims(queue, &msg_ids, &stale, "w", "l")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("claim_token mismatch"), "{err}");
+        assert!(storage.renewed_at.is_empty(), "nothing renews on failure");
+
+        let err = storage
+            .renew_claims(queue, &msg_ids, &tokens, "w", "other-lease")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("lease_id mismatch"), "{err}");
+        assert!(storage.renewed_at.is_empty());
+
+        storage
+            .renew_claims(queue, &msg_ids, &tokens, "w", "l")
+            .await
+            .unwrap();
+        assert_eq!(storage.renewed_at.len(), 2);
+    }
+
+    /// Recovery reads a claim as expired, then its worker renews it before
+    /// the reclaim commits: the renewal wins. Settled claims' renewal
+    /// records are pruned by the next recovery pass.
+    #[tokio::test]
+    async fn test_reclaim_skips_claim_renewed_since_read() {
+        let storage = create_temp_storage().await;
+        let queue = "renew-race";
+        storage.create_queue(queue, 0).await.unwrap();
+        storage
+            .push_message(queue, &Message::new(queue.to_string(), b"x".to_vec()))
+            .await
+            .unwrap();
+        let claimed = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
+        let (msg_ids, tokens) = split_claims(&claimed);
+        let read_at = crate::types::now_secs();
+        let read_by_recovery: Vec<ClaimInfo> = storage
+            .scan_claimed(Some(queue))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, msg_id, info)| ClaimInfo { msg_id, ..info })
+            .collect();
+
+        storage
+            .renew_claims(queue, &msg_ids, &tokens, "w", "l")
+            .await
+            .unwrap();
+        let reclaimed = storage
+            .reclaim_messages(queue, &read_by_recovery, read_at)
+            .await
+            .unwrap();
+        assert!(reclaimed.is_empty(), "reclaimed a renewed claim");
+
+        storage
+            .ack_messages(queue, &msg_ids, &tokens, "w", "l")
+            .await
+            .unwrap();
+        assert_eq!(storage.renewed_at.len(), 1);
+        let live = HashMap::from([("l".to_string(), crate::types::now_secs())]);
+        storage
+            .recover_expired_claims(
+                LEASE_TIMEOUT_SECS_PRODUCTION,
+                CLAIM_AGE_TIMEOUT_SECS_PRODUCTION,
+                Some(&live),
+            )
+            .await
+            .unwrap();
+        assert!(
+            storage.renewed_at.is_empty(),
+            "settled claim's renewal pruned"
+        );
     }
 
     #[tokio::test]
