@@ -713,6 +713,9 @@ mod tests {
         let process_secs_max: u64 = env_or("ANVIL_BENCH_PROCESS_SECS", 0);
         // Shortened to make acked GC run within a bench of a few minutes.
         let acked_retention_secs: f64 = env_or("ANVIL_BENCH_ACKED_RETENTION_SECS", 3600.0);
+        // Pass bars for the processing phase, for CI; 0 disables a bar.
+        let process_keys_per_sec_min: f64 = env_or("ANVIL_BENCH_MIN_KEYS_PER_SEC", 0.0);
+        let ack_p99_ms_max: u64 = env_or("ANVIL_BENCH_MAX_ACK_P99_MS", 0);
         assert!(payload_bytes >= ITEM_KEY_BYTES);
 
         let config = AnvilConfig {
@@ -916,17 +919,27 @@ mod tests {
         ack_latencies.sort();
         let process_secs = process_start.elapsed().as_secs_f64();
         let total = acked.load(Ordering::Relaxed);
+        let process_keys_per_sec = total as f64 / process_secs;
+        let ack_p99_ms = percentile(&ack_latencies, 99.0) / 1000;
         println!(
-            "process: {total} keys in {process_secs:.1}s = {:.0} keys/s | claim p50={}ms p99={}ms | ack+ledger p50={}ms p99={}ms | rss={}MiB",
-            total as f64 / process_secs,
+            "process: {total} keys in {process_secs:.1}s = {process_keys_per_sec:.0} keys/s | claim p50={}ms p99={}ms | ack+ledger p50={}ms p99={ack_p99_ms}ms | rss={}MiB",
             percentile(&claim_latencies, 50.0) / 1000,
             percentile(&claim_latencies, 99.0) / 1000,
             percentile(&ack_latencies, 50.0) / 1000,
-            percentile(&ack_latencies, 99.0) / 1000,
             process_rss_mib()
         );
         if process_secs_max == 0 {
             assert_eq!(total, keys as u64);
+        }
+        assert!(
+            process_keys_per_sec >= process_keys_per_sec_min,
+            "throughput {process_keys_per_sec:.0} keys/s is below the bar of {process_keys_per_sec_min:.0}"
+        );
+        if ack_p99_ms_max > 0 {
+            assert!(
+                ack_p99_ms <= ack_p99_ms_max,
+                "ack p99 {ack_p99_ms}ms is above the bar of {ack_p99_ms_max}ms"
+            );
         }
     }
 }
