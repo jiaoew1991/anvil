@@ -116,6 +116,26 @@ Key Schema:
 
 All operations use `WriteBatch` for atomicity.
 
+### 2.4 Error Contract
+
+A failed RPC's status code tells the caller what to do next:
+
+| Code | Meaning | Caller's response |
+|------|---------|-------------------|
+| `FAILED_PRECONDITION` | The caller no longer holds a claim it acks, nacks, forwards, scatters or renews: its token, lease or worker does not match, the message is no longer claimed, or another settlement holds it | Drop the message; another worker owns it or it is done |
+| `NOT_FOUND` | The queue or queue group does not exist | Create it first |
+| `INVALID_ARGUMENT` | The request is malformed, e.g. claim tokens that do not pair up with message ids | Fix the request |
+| `RESOURCE_EXHAUSTED` | A bounded queue is full (message starts with `QueueFull`) | Back off and retry |
+| `INTERNAL` | The broker's storage failed | Retry |
+
+`Complete` reports every failure, including forward and scatter, as an error
+status; `success` in its response is always true. The Python client raises
+`ClaimLostError` (a `RuntimeError`) for `FAILED_PRECONDITION`.
+
+Reading a queue never creates it: `GetStats` for an unknown queue returns
+`NOT_FOUND`. A queue is created by `CreateQueue`, `CreateQueueGroup`, or on
+first use by a push, claim, forward or scatter.
+
 ---
 
 ## 3. Semantic Guarantees
@@ -468,7 +488,8 @@ Timeline:
   t6: Server recovers M to PENDING
   t7: Worker B claims and processes M
   t8: Network heals
-  t9: Worker A's late ack fails (message already acked by B)
+  t9: Worker A's late ack fails with FAILED_PRECONDITION (its claim token
+      was rotated by the redelivery)
 
 Result: Message processed twice
         → Same as crash scenario, need deduplication

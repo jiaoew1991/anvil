@@ -14,6 +14,14 @@ option java_outer_classname = "AnvilProto";
 //   - ClaimAndComplete: new combined RPC (halves round trips)
 //
 // Cold-path RPCs (admin, state, heartbeat) are unchanged.
+//
+// Error codes:
+//   - FAILED_PRECONDITION: the caller no longer holds a claim it completes or
+//     renews (settled, reclaimed or redelivered). Drop the message.
+//   - NOT_FOUND:           the queue or queue group does not exist.
+//   - INVALID_ARGUMENT:    the request is malformed.
+//   - RESOURCE_EXHAUSTED:  a bounded queue is full.
+//   - INTERNAL:            the broker's storage failed. Retry.
 // ============================================================================
 
 service Anvil {
@@ -154,7 +162,7 @@ message StateUpdate {
 }
 
 message CompleteResponse {
-  bool success = 1;
+  bool success = 1;                     // always true: a failed complete is an error status
   int32 processed_count = 2;            // number of messages acked/nacked
   repeated string new_msg_ids = 3;      // downstream message IDs (forward/scatter)
 }
@@ -267,7 +275,7 @@ message DeleteQueueResponse {
 }
 
 message GetStatsRequest {
-  string queue = 1;                      // empty = all queues
+  string queue = 1;                      // empty = all queues; an unknown queue is NOT_FOUND
 }
 
 message GetStatsResponse {

@@ -11,7 +11,9 @@ runs as the per-job broker embedded in the Ray driver.
 
 - **Fenced completion.** Every claim carries a `claim_token` and the worker's
   `lease_id`. A worker whose message was redelivered cannot ack it: the token
-  rotates on redelivery and a stale ack is rejected.
+  rotates on redelivery and a stale ack is rejected with
+  `FAILED_PRECONDITION` (`ClaimLostError` in Python), distinct from the
+  `INTERNAL` of a broker failure: drop the message rather than retry.
 - **Atomic complete.** `Complete` acks upstream messages, pushes downstream
   payloads (`ack_and_forward`, `ack_and_scatter`) and writes key-value state in
   one storage batch, so a crash never leaves a message acked without its output.
@@ -28,7 +30,7 @@ runs as the per-job broker embedded in the Ray driver.
   park a poison message instead of retrying it forever.
 
 See [docs/semantics.md](docs/semantics.md) for the full consistency and
-recovery model.
+recovery model and the error codes of every RPC.
 
 ## Build
 

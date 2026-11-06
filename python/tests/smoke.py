@@ -1,14 +1,15 @@
 """Round-trips one message through a broker built from the installed wheel.
 
 Exercises the Python bindings end to end: start a broker on a temporary
-file:// store, push, claim, check the delivery count, renew, ack, and stop.
+file:// store, push, claim, check the delivery count, renew, ack, see a
+second ack fenced, and stop.
 """
 
 import sys
 import tempfile
 import time
 
-from anvil_py import AnvilBroker, AnvilRustClient, BrokerConfig
+from anvil_py import AnvilBroker, AnvilRustClient, BrokerConfig, ClaimLostError
 
 DEADLINE_SECS = 30.0
 
@@ -44,6 +45,14 @@ def main():
         assert message.delivery_count == 1, message.delivery_count
         client.renew("work", [message.msg_id], [message.claim_token])
         client.ack("work", [message.msg_id], claim_tokens=[message.claim_token])
+        # The message is settled, so a second ack is fenced: a worker must
+        # be able to tell this from a broker failure it would retry.
+        try:
+            client.ack("work", [message.msg_id], claim_tokens=[message.claim_token])
+        except ClaimLostError:
+            pass
+        else:
+            sys.exit("a second ack of a settled message was not fenced")
 
         client.stop()
         broker.stop()

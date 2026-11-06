@@ -113,6 +113,38 @@ fn decode_message(queue: &str, bytes: &[u8]) -> Result<Message, StorageError> {
 
 pub type StorageError = Box<dyn std::error::Error + Send + Sync>;
 
+/// A request refused because of what the caller asked, not because storage
+/// failed: retrying it unchanged fails the same way. It travels as a
+/// `StorageError` and is recognized by type, so the service can tell it from
+/// a failure of the broker itself, which the caller may retry.
+#[derive(Debug)]
+pub enum Rejection {
+    /// The caller no longer holds the claim it settles or renews: the
+    /// message was settled, reclaimed or redelivered, or another settlement
+    /// holds it right now. The worker must drop the message.
+    Fenced(String),
+    /// The queue or queue group does not exist.
+    NotFound(String),
+    /// The request contradicts itself, such as claim tokens that do not pair
+    /// up with message ids.
+    InvalidArgument(String),
+    /// A bounded queue has no room for the messages pushed.
+    QueueFull(String),
+}
+
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Rejection::Fenced(message)
+            | Rejection::NotFound(message)
+            | Rejection::InvalidArgument(message)
+            | Rejection::QueueFull(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for Rejection {}
+
 /// Per-queue in-memory state. **Single source of truth** for everything
 /// claimers and stage masters need to reason about queue progress.
 ///
@@ -177,6 +209,7 @@ impl QueueState {
 
 /// Per-queue counters / state holder. Just wraps the `QueueState` in a
 /// mutex; everything else lives on the heap inside.
+#[derive(Default)]
 pub struct QueueCounters {
     pub state: std::sync::Mutex<QueueState>,
 }
@@ -510,7 +543,7 @@ impl AnvilStorage {
         for (msg_id, token) in msg_ids.iter().zip(claim_tokens.iter()) {
             let claim_key = Self::claimed_key(queue, msg_id);
             if !hold.take(claim_key.clone()) {
-                return Err(Box::new(SlateError::invalid(format!(
+                return Err(Box::new(Rejection::Fenced(format!(
                     "claim_settling: queue={queue}, msg_id={msg_id} is being settled concurrently"
                 ))));
             }
@@ -539,14 +572,14 @@ impl AnvilStorage {
             .get(&Self::claimed_key(queue, msg_id))
             .await?
             .ok_or_else(|| {
-                SlateError::invalid(format!(
+                Rejection::Fenced(format!(
                     "message_not_claimed: queue={queue}, msg_id={msg_id}"
                 ))
             })?;
         let claim_info: ClaimInfo = serde_json::from_slice(&claim_data)?;
 
         if claim_info.claim_token != token {
-            return Err(Box::new(SlateError::invalid(format!(
+            return Err(Box::new(Rejection::Fenced(format!(
                 "claim_token mismatch: queue={queue}, msg_id={msg_id}, \
                  expected={token}, actual={}",
                 claim_info.claim_token
@@ -554,7 +587,7 @@ impl AnvilStorage {
         }
         if let Some(expected) = expected_lease_id {
             if claim_info.lease_id != expected {
-                return Err(Box::new(SlateError::invalid(format!(
+                return Err(Box::new(Rejection::Fenced(format!(
                     "lease_id mismatch: queue={queue}, msg_id={msg_id}, \
                      expected={expected}, actual={}",
                     claim_info.lease_id
@@ -563,7 +596,7 @@ impl AnvilStorage {
         }
         if let Some(expected) = expected_worker_id {
             if claim_info.worker_id != expected {
-                return Err(Box::new(SlateError::invalid(format!(
+                return Err(Box::new(Rejection::Fenced(format!(
                     "worker_id mismatch: queue={queue}, msg_id={msg_id}, \
                      expected={expected}, actual={}",
                     claim_info.worker_id
@@ -590,7 +623,7 @@ impl AnvilStorage {
         lease_id: &str,
     ) -> Result<(), StorageError> {
         if claim_tokens.len() != msg_ids.len() {
-            return Err(Box::new(SlateError::invalid(format!(
+            return Err(Box::new(Rejection::InvalidArgument(format!(
                 "claim_tokens length mismatch (msg_ids={}, claim_tokens={})",
                 msg_ids.len(),
                 claim_tokens.len()
@@ -712,15 +745,16 @@ impl AnvilStorage {
         Ok(count)
     }
 
-    /// Load or initialize counters for a queue.
+    /// Counters of a created queue, or `None` for a queue that does not
+    /// exist, which this never creates.
     /// 1. Check DashMap (fast path)
     /// 2. If missing, try to load from new counter keys
     /// 3. If new keys don't exist, fall back to old meta:{queue} JSON (migration)
     /// 4. Write new counter keys if migrating
-    async fn load_or_init_counters(&self, queue: &str) -> Result<Arc<QueueCounters>, StorageError> {
+    async fn load_counters(&self, queue: &str) -> Result<Option<Arc<QueueCounters>>, StorageError> {
         // Fast path: already in cache
         if let Some(c) = self.counters.get(queue) {
-            return Ok(c.clone());
+            return Ok(Some(c.clone()));
         }
 
         let counters = if let Some(push_seq_data) = self.db.get(&Self::seq_push_key(queue)).await? {
@@ -759,10 +793,10 @@ impl AnvilStorage {
             })
         } else {
             // Try old meta:{queue} JSON (migration path)
-            let old_meta: QueueMeta = match self.db.get(&Self::meta_key(queue)).await? {
-                Some(data) => serde_json::from_slice(&data)?,
-                None => QueueMeta::default(),
+            let Some(old_meta_data) = self.db.get(&Self::meta_key(queue)).await? else {
+                return Ok(None);
             };
+            let old_meta: QueueMeta = serde_json::from_slice(&old_meta_data)?;
 
             // Compute total_claimed and total_unclaimed from old format:
             // claimed_count = total_claimed - total_unclaimed
@@ -800,8 +834,28 @@ impl AnvilStorage {
             c
         };
 
-        let _ = self.counters.entry(queue.to_string()).or_insert(counters);
-        Ok(self.counters.get(queue).unwrap().clone())
+        Ok(Some(
+            self.counters
+                .entry(queue.to_string())
+                .or_insert(counters)
+                .clone(),
+        ))
+    }
+
+    /// Counters of `queue`, creating the queue if it does not exist: push,
+    /// forward, scatter and claim create a queue on first use.
+    async fn load_or_init_counters(&self, queue: &str) -> Result<Arc<QueueCounters>, StorageError> {
+        if let Some(counters) = self.load_counters(queue).await? {
+            return Ok(counters);
+        }
+        let mut batch = WriteBatch::new();
+        Self::write_zero_counters(&mut batch, queue);
+        self.write_durable(batch).await?;
+        Ok(self
+            .counters
+            .entry(queue.to_string())
+            .or_insert_with(|| Arc::new(QueueCounters::default()))
+            .clone())
     }
 
     // === Queue Metadata (legacy + new) ===
@@ -819,9 +873,15 @@ impl AnvilStorage {
         }
     }
 
-    /// Get queue metadata — single locked snapshot of in-memory state.
+    /// Get queue metadata — single locked snapshot of in-memory state. A
+    /// read must not create the queue it reads, so an unknown queue is
+    /// `Rejection::NotFound`.
     pub async fn get_meta(&self, queue: &str) -> Result<QueueMeta, StorageError> {
-        Ok(Self::meta_of(&*self.load_or_init_counters(queue).await?))
+        let counters = self
+            .load_counters(queue)
+            .await?
+            .ok_or_else(|| Rejection::NotFound(format!("queue not found: {queue}")))?;
+        Ok(Self::meta_of(&counters))
     }
 
     /// Metadata of every queue loaded since startup, without touching the
@@ -887,7 +947,7 @@ impl AnvilStorage {
                     s.total_pushed.saturating_sub(s.total_acked)
                 };
                 if in_flight + additional as u64 > max {
-                    return Err(Box::new(std::io::Error::other(format!(
+                    return Err(Box::new(Rejection::QueueFull(format!(
                         "QueueFull: queue={queue}, in_flight={in_flight}, max_pending={max}, attempted={additional}"
                     ))));
                 }
@@ -1088,10 +1148,10 @@ impl AnvilStorage {
             None
         } else {
             let tokens = opts.claim_tokens.ok_or_else(|| {
-                SlateError::invalid("claim_tokens is required for ack".to_string())
+                Rejection::InvalidArgument("claim_tokens is required for ack".to_string())
             })?;
             if tokens.len() != msg_ids.len() {
-                return Err(Box::new(SlateError::invalid(format!(
+                return Err(Box::new(Rejection::InvalidArgument(format!(
                     "claim_tokens length mismatch (msg_ids={}, claim_tokens={})",
                     msg_ids.len(),
                     tokens.len()
@@ -1442,7 +1502,7 @@ impl AnvilStorage {
             return Ok(());
         }
         if claim_tokens.len() != msg_ids.len() {
-            return Err(Box::new(SlateError::invalid(format!(
+            return Err(Box::new(Rejection::InvalidArgument(format!(
                 "claim_tokens length mismatch (msg_ids={}, claim_tokens={})",
                 msg_ids.len(),
                 claim_tokens.len()
@@ -1597,8 +1657,14 @@ impl AnvilStorage {
 
     // === Delete Operations ===
 
+    /// Deletes a queue and every message in it. Deleting a queue that does
+    /// not exist deletes nothing and is not an error, so a retried delete
+    /// succeeds.
     pub async fn delete_queue(&self, queue: &str) -> Result<usize, StorageError> {
-        let meta = self.get_meta(queue).await?;
+        let Some(counters) = self.load_counters(queue).await? else {
+            return Ok(0);
+        };
+        let meta = Self::meta_of(&counters);
         let claimed = self.scan_claimed(Some(queue)).await?;
         let acked = self.scan_acked(Some(queue)).await?;
 
@@ -2037,12 +2103,12 @@ impl AnvilStorage {
         let group = self
             .get_group_meta(group_name)
             .await?
-            .ok_or_else(|| SlateError::invalid(format!("Queue group not found: {}", group_name)))?;
+            .ok_or_else(|| Rejection::NotFound(format!("Queue group not found: {}", group_name)))?;
 
         // Validate partition indices
         for (pid, _) in partition_payloads {
             if *pid >= group.num_partitions {
-                return Err(Box::new(SlateError::invalid(format!(
+                return Err(Box::new(Rejection::InvalidArgument(format!(
                     "Partition {} out of range [0, {})",
                     pid, group.num_partitions
                 ))));
@@ -2079,7 +2145,7 @@ impl AnvilStorage {
         // 1. Validate claims and ack upstream
         if !upstream_msg_ids.is_empty() {
             if upstream_claim_tokens.len() != upstream_msg_ids.len() {
-                return Err(Box::new(SlateError::invalid(
+                return Err(Box::new(Rejection::InvalidArgument(
                     "claim_tokens length must match msg_ids".to_string(),
                 )));
             }
@@ -2181,7 +2247,7 @@ impl AnvilStorage {
         let group = self
             .get_group_meta(group_name)
             .await?
-            .ok_or_else(|| SlateError::invalid(format!("Queue group not found: {}", group_name)))?;
+            .ok_or_else(|| Rejection::NotFound(format!("Queue group not found: {}", group_name)))?;
 
         // O(A) where A is small (2-4): try claim directly, no meta reads needed.
         if !assigned_partitions.is_empty() {
@@ -2256,7 +2322,7 @@ impl AnvilStorage {
         let group = self
             .get_group_meta(group_name)
             .await?
-            .ok_or_else(|| SlateError::invalid(format!("Queue group not found: {}", group_name)))?;
+            .ok_or_else(|| Rejection::NotFound(format!("Queue group not found: {}", group_name)))?;
 
         let mut all_finished = true;
         let mut all_drained = true;
@@ -2285,7 +2351,7 @@ impl AnvilStorage {
         let group = self
             .get_group_meta(group_name)
             .await?
-            .ok_or_else(|| SlateError::invalid(format!("Queue group not found: {}", group_name)))?;
+            .ok_or_else(|| Rejection::NotFound(format!("Queue group not found: {}", group_name)))?;
 
         let mut stats = Vec::new();
         for (i, queue_name) in group.partition_queues.iter().enumerate() {
@@ -2301,7 +2367,7 @@ impl AnvilStorage {
         let group = self
             .get_group_meta(group_name)
             .await?
-            .ok_or_else(|| SlateError::invalid(format!("Queue group not found: {}", group_name)))?;
+            .ok_or_else(|| Rejection::NotFound(format!("Queue group not found: {}", group_name)))?;
 
         let mut batch = WriteBatch::new();
         for queue_name in &group.partition_queues {
@@ -2401,6 +2467,19 @@ mod tests {
         let msg_ids = claimed.iter().map(|c| c.message.msg_id.clone()).collect();
         let claim_tokens = claimed.iter().map(|c| c.claim_token.clone()).collect();
         (msg_ids, claim_tokens)
+    }
+
+    /// Asserts that `error` is a fencing rejection, which the service maps to
+    /// FAILED_PRECONDITION, for `reason`.
+    fn assert_fenced(error: &StorageError, reason: &str) {
+        assert!(
+            matches!(
+                error.downcast_ref::<Rejection>(),
+                Some(Rejection::Fenced(_))
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains(reason), "{error}");
     }
 
     #[tokio::test]
@@ -3004,12 +3083,12 @@ mod tests {
                 .ack_messages(queue, &msg_ids, &tokens, "w", "l")
                 .await
                 .unwrap_err();
-            assert!(err.to_string().contains("claim_settling"), "{err}");
+            assert_fenced(&err, "claim_settling");
             let err = storage
                 .nack_messages(queue, &msg_ids, &tokens, "w", "l")
                 .await
                 .unwrap_err();
-            assert!(err.to_string().contains("claim_settling"), "{err}");
+            assert_fenced(&err, "claim_settling");
             let reclaimed = storage
                 .reclaim_messages(queue, &read_by_recovery, read_at)
                 .await
@@ -3040,7 +3119,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("claim_settling"), "{err}");
+        assert_fenced(&err, "claim_settling");
 
         storage
             .ack_messages(queue, &msg_ids, &tokens, "w", "l")
@@ -3273,14 +3352,14 @@ mod tests {
             .renew_claims(queue, &msg_ids, &stale, "w", "l")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("claim_token mismatch"), "{err}");
+        assert_fenced(&err, "claim_token mismatch");
         assert!(storage.renewed_at.is_empty(), "nothing renews on failure");
 
         let err = storage
             .renew_claims(queue, &msg_ids, &tokens, "w", "other-lease")
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("lease_id mismatch"), "{err}");
+        assert_fenced(&err, "lease_id mismatch");
         assert!(storage.renewed_at.is_empty());
 
         storage
@@ -3555,16 +3634,30 @@ mod tests {
 
         let deleted = storage.delete_queue(queue).await.unwrap();
         assert!(deleted > 0);
-        // Checked before `get_meta`, which recreates a queue it reads.
         assert!(!storage
             .list_queues()
             .await
             .unwrap()
             .contains(&queue.to_string()));
 
-        let meta = storage.get_meta(queue).await.unwrap();
-        assert_eq!(meta.claim_seq, 0);
-        assert_eq!(meta.push_seq, 0);
+        // Reading a deleted queue does not bring it back.
+        let err = storage.get_meta(queue).await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<Rejection>(),
+                Some(Rejection::NotFound(_))
+            ),
+            "{err}"
+        );
+        assert!(!storage
+            .list_queues()
+            .await
+            .unwrap()
+            .contains(&queue.to_string()));
+
+        // Deleting it again deletes nothing and creates nothing.
+        assert_eq!(storage.delete_queue(queue).await.unwrap(), 0);
+        assert!(storage.get_meta(queue).await.is_err());
 
         // A queue that never held a message is deleted too.
         storage.create_queue("empty", 0).await.unwrap();

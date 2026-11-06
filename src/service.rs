@@ -31,7 +31,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 #[allow(unused_imports)]
 use crate::state::AnvilState;
-use crate::storage::AnvilStorage;
+use crate::storage::{AnvilStorage, Rejection, StorageError};
 use crate::types::{ClaimedMessage, Message};
 
 // Generated protobuf types. Generated code is not ours to lint: each Rust
@@ -43,6 +43,24 @@ pub mod proto {
 
 use proto::anvil_server::Anvil;
 use proto::*;
+
+/// The one place a storage error becomes a gRPC status. A `Rejection` gets
+/// the code its caller acts on, so a worker can tell `FAILED_PRECONDITION`
+/// (its claim is lost: drop the message) from `INTERNAL` (the broker failed:
+/// retry).
+fn storage_status(rpc: &str, error: StorageError) -> Status {
+    let Some(rejection) = error.downcast_ref::<Rejection>() else {
+        tracing::error!("{rpc} failed: {error}");
+        return Status::internal(format!("Storage error: {error}"));
+    };
+    tracing::warn!("{rpc} rejected: {rejection}");
+    match rejection {
+        Rejection::Fenced(message) => Status::failed_precondition(message.as_str()),
+        Rejection::NotFound(message) => Status::not_found(message.as_str()),
+        Rejection::InvalidArgument(message) => Status::invalid_argument(message.as_str()),
+        Rejection::QueueFull(message) => Status::resource_exhausted(message.as_str()),
+    }
+}
 
 /// Anvil gRPC service implementation
 pub struct AnvilService {
@@ -126,10 +144,7 @@ impl AnvilService {
                         processed_count: req.msg_ids.len() as i32,
                         new_msg_ids: vec![],
                     }),
-                    Err(e) => {
-                        tracing::error!("Complete(ack) failed: {}", e);
-                        Err(Status::internal(format!("Storage error: {e}")))
-                    }
+                    Err(e) => Err(storage_status("Complete(ack)", e)),
                 }
             }
 
@@ -165,10 +180,7 @@ impl AnvilService {
                         processed_count: req.msg_ids.len() as i32,
                         new_msg_ids: vec![],
                     }),
-                    Err(e) => {
-                        tracing::error!("Complete(nack) failed: {}", e);
-                        Err(Status::internal(format!("Storage error: {e}")))
-                    }
+                    Err(e) => Err(storage_status("Complete(nack)", e)),
                 }
             }
 
@@ -218,18 +230,7 @@ impl AnvilService {
                         processed_count: req.msg_ids.len() as i32,
                         new_msg_ids,
                     }),
-                    Err(e) => {
-                        if e.to_string().contains("QueueFull") {
-                            Err(Status::resource_exhausted("QueueFull"))
-                        } else {
-                            tracing::error!("Complete(forward) failed: {}", e);
-                            Ok(CompleteResponse {
-                                success: false,
-                                processed_count: 0,
-                                new_msg_ids: vec![],
-                            })
-                        }
-                    }
+                    Err(e) => Err(storage_status("Complete(forward)", e)),
                 }
             }
 
@@ -277,18 +278,7 @@ impl AnvilService {
                         processed_count: req.msg_ids.len() as i32,
                         new_msg_ids,
                     }),
-                    Err(e) => {
-                        if e.to_string().contains("QueueFull") {
-                            Err(Status::resource_exhausted("QueueFull"))
-                        } else {
-                            tracing::error!("Complete(scatter) failed: {}", e);
-                            Ok(CompleteResponse {
-                                success: false,
-                                processed_count: 0,
-                                new_msg_ids: vec![],
-                            })
-                        }
-                    }
+                    Err(e) => Err(storage_status("Complete(scatter)", e)),
                 }
             }
 
@@ -313,10 +303,7 @@ impl AnvilService {
                     .storage
                     .claim_messages(&queue, batch_size, &req.worker_id, &req.lease_id)
                     .await
-                    .map_err(|e| {
-                        tracing::error!("Claim failed: {}", e);
-                        Status::internal(format!("Storage error: {e}"))
-                    })?;
+                    .map_err(|e| storage_status("Claim", e))?;
 
                 let messages: Vec<ClaimMessage> =
                     claimed.iter().map(Self::to_claim_message).collect();
@@ -378,10 +365,7 @@ impl AnvilService {
                         group.steal_pending_threshold as u64,
                     )
                     .await
-                    .map_err(|e| {
-                        tracing::error!("ClaimFromGroup failed: {}", e);
-                        Status::internal(format!("Storage error: {e}"))
-                    })?;
+                    .map_err(|e| storage_status("Claim(group)", e))?;
 
                 let messages: Vec<ClaimMessage> =
                     claimed.iter().map(Self::to_claim_message).collect();
@@ -460,7 +444,7 @@ impl Anvil for AnvilService {
             )
             .await
             .map(|()| Response::new(RenewClaimsResponse {}))
-            .map_err(|e| Status::internal(format!("Storage error: {e}")))
+            .map_err(|e| storage_status("RenewClaims", e))
     }
 
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushResponse>, Status> {
@@ -486,14 +470,7 @@ impl Anvil for AnvilService {
 
         match self.storage.push_messages(&req.queue, &messages).await {
             Ok(()) => Ok(Response::new(PushResponse { msg_ids })),
-            Err(e) => {
-                if e.to_string().contains("QueueFull") {
-                    Err(Status::resource_exhausted("QueueFull"))
-                } else {
-                    tracing::error!("Push failed: {}", e);
-                    Err(Status::internal(format!("Storage error: {e}")))
-                }
-            }
+            Err(e) => Err(storage_status("Push", e)),
         }
     }
 
@@ -543,10 +520,7 @@ impl Anvil for AnvilService {
             .await
         {
             Ok(values) => Ok(Response::new(StateGetResponse { values })),
-            Err(e) => {
-                tracing::error!("Failed to get state: {}", e);
-                Err(Status::internal(format!("Storage error: {e}")))
-            }
+            Err(e) => Err(storage_status("StateGet", e)),
         }
     }
 
@@ -571,10 +545,7 @@ impl Anvil for AnvilService {
                 puts_count: puts_count as i32,
                 deletes_count: deletes_count as i32,
             })),
-            Err(e) => {
-                tracing::error!("Failed to put state: {}", e);
-                Err(Status::internal(format!("Storage error: {e}")))
-            }
+            Err(e) => Err(storage_status("StatePut", e)),
         }
     }
 
@@ -640,10 +611,7 @@ impl Anvil for AnvilService {
                 self.state.get_or_create_queue(&req.queue);
                 Ok(Response::new(CreateQueueResponse { created: true }))
             }
-            Err(e) => {
-                tracing::error!("Failed to create queue: {}", e);
-                Err(Status::internal(format!("Storage error: {e}")))
-            }
+            Err(e) => Err(storage_status("CreateQueue", e)),
         }
     }
 
@@ -660,10 +628,7 @@ impl Anvil for AnvilService {
                     messages_deleted: deleted as i32,
                 }))
             }
-            Err(e) => {
-                tracing::error!("Failed to delete queue: {}", e);
-                Err(Status::internal(format!("Storage error: {e}")))
-            }
+            Err(e) => Err(storage_status("DeleteQueue", e)),
         }
     }
 
@@ -696,6 +661,12 @@ impl Anvil for AnvilService {
                     );
                 }
                 Err(e) => {
+                    // A request for one queue reports why it failed, such as
+                    // NOT_FOUND; a listing skips a queue deleted since it was
+                    // listed.
+                    if !req.queue.is_empty() {
+                        return Err(storage_status("GetStats", e));
+                    }
                     tracing::warn!("Failed to get stats for queue {}: {}", queue, e);
                 }
             }
@@ -722,10 +693,7 @@ impl Anvil for AnvilService {
         }
         match self.storage.mark_queue_finished(&req.queue).await {
             Ok(()) => Ok(Response::new(MarkQueueFinishedResponse { success: true })),
-            Err(e) => {
-                tracing::error!("Failed to mark queue finished: {}", e);
-                Err(Status::internal(format!("Storage error: {e}")))
-            }
+            Err(e) => Err(storage_status("MarkQueueFinished", e)),
         }
     }
 
@@ -747,10 +715,7 @@ impl Anvil for AnvilService {
                     claimed_count: claimed_count as i64,
                 }))
             }
-            Err(e) => {
-                tracing::error!("Failed to check queue finished: {}", e);
-                Err(Status::internal(format!("Storage error: {e}")))
-            }
+            Err(e) => Err(storage_status("IsQueueFinished", e)),
         }
     }
 
@@ -774,10 +739,7 @@ impl Anvil for AnvilService {
             .storage
             .get_group_meta(&req.group_name)
             .await
-            .map_err(|e| {
-                tracing::error!("Failed to check group: {}", e);
-                Status::internal(format!("Storage error: {e}"))
-            })?
+            .map_err(|e| storage_status("CreateQueueGroup", e))?
             .is_some();
 
         match self
@@ -799,10 +761,7 @@ impl Anvil for AnvilService {
                     created: !existed,
                 }))
             }
-            Err(e) => {
-                tracing::error!("Failed to create queue group: {}", e);
-                Err(Status::internal(format!("Storage error: {e}")))
-            }
+            Err(e) => Err(storage_status("CreateQueueGroup", e)),
         }
     }
 
@@ -833,10 +792,7 @@ impl Anvil for AnvilService {
                     partitions,
                 }))
             }
-            Err(e) => {
-                tracing::error!("Failed is_group_finished: {}", e);
-                Err(Status::internal(format!("Storage error: {e}")))
-            }
+            Err(e) => Err(storage_status("IsGroupFinished", e)),
         }
     }
 
@@ -915,10 +871,7 @@ impl Anvil for AnvilService {
                     version: group_meta.version as i32,
                 }))
             }
-            Err(e) => {
-                tracing::error!("Failed get_group_stats: {}", e);
-                Err(Status::internal(format!("Storage error: {e}")))
-            }
+            Err(e) => Err(storage_status("GetGroupStats", e)),
         }
     }
 
@@ -935,10 +888,233 @@ impl Anvil for AnvilService {
                 success: true,
                 queues_marked: count as i32,
             })),
-            Err(e) => {
-                tracing::error!("Failed mark_group_finished: {}", e);
-                Err(Status::internal(format!("Storage error: {e}")))
-            }
+            Err(e) => Err(storage_status("MarkGroupFinished", e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    async fn create_service() -> (AnvilService, Arc<AnvilStorage>) {
+        let storage = Arc::new(AnvilStorage::new("memory://").await.unwrap());
+        let service = AnvilService::new(Arc::new(AnvilState::new()), storage.clone());
+        (service, storage)
+    }
+
+    /// Pushes one message to `queue` and claims it as worker `w` on lease `l`.
+    async fn push_and_claim(service: &AnvilService, queue: &str) -> ClaimMessage {
+        service
+            .push(Request::new(PushRequest {
+                queue: queue.to_string(),
+                payloads: vec![b"x".to_vec()],
+                metadata: HashMap::new(),
+            }))
+            .await
+            .unwrap();
+        let claimed = service
+            .claim(Request::new(ClaimRequest {
+                source: Some(claim_request::Source::Queue(queue.to_string())),
+                worker_id: "w".to_string(),
+                lease_id: "l".to_string(),
+                batch_size: 1,
+                timeout_ms: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(claimed.messages.len(), 1);
+        claimed.messages.into_iter().next().unwrap()
+    }
+
+    fn assert_status(status: &Status, code: Code, reason: &str) {
+        assert_eq!(status.code(), code, "{status:?}");
+        assert!(status.message().contains(reason), "{status:?}");
+    }
+
+    /// Every way a worker can lose its claim reaches it as FAILED_PRECONDITION,
+    /// whichever action settles the claim: each request below presents one
+    /// stale credential, or settles a message already settled.
+    #[tokio::test]
+    async fn test_fencing_failures_are_failed_precondition() {
+        let (service, _storage) = create_service().await;
+        let queue = "fenced";
+        service
+            .create_queue_group(Request::new(CreateQueueGroupRequest {
+                group_name: "group".to_string(),
+                num_partitions: 2,
+                max_pending_per_partition: 0,
+            }))
+            .await
+            .unwrap();
+        let message = push_and_claim(&service, queue).await;
+
+        let ack = CompleteRequest {
+            upstream_queue: queue.to_string(),
+            msg_ids: vec![message.msg_id.clone()],
+            claim_tokens: vec![message.claim_token.clone()],
+            worker_id: "w".to_string(),
+            lease_id: "l".to_string(),
+            action: Some(complete_request::Action::Ack(AckAction {})),
+            state: None,
+        };
+        let stale_token = vec!["stale".to_string()];
+        let forward = complete_request::Action::Forward(ForwardAction {
+            downstream_queue: "downstream".to_string(),
+            payloads: vec![b"y".to_vec()],
+        });
+        let scatter = complete_request::Action::Scatter(ScatterAction {
+            group_name: "group".to_string(),
+            partitions: vec![PartitionPayload {
+                partition_id: 0,
+                payloads: vec![b"y".to_vec()],
+            }],
+        });
+        let fenced = [
+            (
+                "claim_token mismatch",
+                CompleteRequest {
+                    claim_tokens: stale_token.clone(),
+                    ..ack.clone()
+                },
+            ),
+            (
+                "lease_id mismatch",
+                CompleteRequest {
+                    lease_id: "other".to_string(),
+                    ..ack.clone()
+                },
+            ),
+            (
+                "worker_id mismatch",
+                CompleteRequest {
+                    worker_id: "other".to_string(),
+                    action: Some(complete_request::Action::Nack(NackAction {})),
+                    ..ack.clone()
+                },
+            ),
+            (
+                "claim_token mismatch",
+                CompleteRequest {
+                    claim_tokens: stale_token.clone(),
+                    action: Some(forward),
+                    ..ack.clone()
+                },
+            ),
+            (
+                "claim_token mismatch",
+                CompleteRequest {
+                    claim_tokens: stale_token.clone(),
+                    action: Some(scatter),
+                    ..ack.clone()
+                },
+            ),
+        ];
+        for (reason, request) in fenced {
+            let status = service.complete(Request::new(request)).await.unwrap_err();
+            assert_status(&status, Code::FailedPrecondition, reason);
+        }
+
+        let renew = RenewClaimsRequest {
+            queue: queue.to_string(),
+            msg_ids: vec![message.msg_id.clone()],
+            claim_tokens: vec![message.claim_token.clone()],
+            worker_id: "w".to_string(),
+            lease_id: "l".to_string(),
+        };
+        let status = service
+            .renew_claims(Request::new(RenewClaimsRequest {
+                claim_tokens: stale_token,
+                ..renew.clone()
+            }))
+            .await
+            .unwrap_err();
+        assert_status(&status, Code::FailedPrecondition, "claim_token mismatch");
+
+        // None of the fenced requests settled the message.
+        service.complete(Request::new(ack.clone())).await.unwrap();
+        let status = service.complete(Request::new(ack)).await.unwrap_err();
+        assert_status(&status, Code::FailedPrecondition, "message_not_claimed");
+        let status = service.renew_claims(Request::new(renew)).await.unwrap_err();
+        assert_status(&status, Code::FailedPrecondition, "message_not_claimed");
+    }
+
+    /// A push past a bounded queue's capacity is RESOURCE_EXHAUSTED, and the
+    /// message still names QueueFull, which clients match on.
+    #[tokio::test]
+    async fn test_full_queue_is_resource_exhausted() {
+        let (service, _storage) = create_service().await;
+        service
+            .create_queue(Request::new(CreateQueueRequest {
+                queue: "bounded".to_string(),
+                max_pending: 1,
+            }))
+            .await
+            .unwrap();
+        let push = PushRequest {
+            queue: "bounded".to_string(),
+            payloads: vec![b"x".to_vec()],
+            metadata: HashMap::new(),
+        };
+        service.push(Request::new(push.clone())).await.unwrap();
+        let status = service.push(Request::new(push)).await.unwrap_err();
+        assert_status(&status, Code::ResourceExhausted, "QueueFull");
+    }
+
+    /// A failure of the storage itself stays INTERNAL, the code a worker
+    /// retries: the database is closed under the service.
+    #[tokio::test]
+    async fn test_storage_failure_is_internal() {
+        let (service, storage) = create_service().await;
+        storage.close().await.unwrap();
+        let status = service
+            .push(Request::new(PushRequest {
+                queue: "closed".to_string(),
+                payloads: vec![b"x".to_vec()],
+                metadata: HashMap::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_status(&status, Code::Internal, "Storage error");
+    }
+
+    /// Reading the stats of a queue that does not exist reports NOT_FOUND
+    /// and creates nothing: neither the stored queues nor a later listing
+    /// gain it.
+    #[tokio::test]
+    async fn test_stats_of_unknown_queue_is_not_found() {
+        let (service, storage) = create_service().await;
+        service
+            .create_queue(Request::new(CreateQueueRequest {
+                queue: "known".to_string(),
+                max_pending: 0,
+            }))
+            .await
+            .unwrap();
+        let queues_before = storage.list_queues().await.unwrap();
+        assert_eq!(queues_before, vec!["known".to_string()]);
+
+        for _ in 0..2 {
+            let status = service
+                .get_stats(Request::new(GetStatsRequest {
+                    queue: "missing".to_string(),
+                }))
+                .await
+                .unwrap_err();
+            assert_status(&status, Code::NotFound, "missing");
+        }
+        assert_eq!(storage.list_queues().await.unwrap(), queues_before);
+
+        let stats = service
+            .get_stats(Request::new(GetStatsRequest {
+                queue: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(stats.queues.len(), 1);
+        assert!(stats.queues.contains_key("known"));
     }
 }

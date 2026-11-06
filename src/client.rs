@@ -39,12 +39,22 @@ use proto::anvil_client::AnvilClient;
 // Error Handling
 // ============================================================================
 
+pyo3::create_exception!(
+    anvil_py,
+    ClaimLostError,
+    pyo3::exceptions::PyRuntimeError,
+    "The worker no longer holds the claim it acked, nacked or renewed: the \
+     message was settled, reclaimed or redelivered. Drop the message; \
+     retrying cannot succeed. A RuntimeError, so older handlers still catch it."
+);
+
 fn status_to_pyerr(status: tonic::Status) -> PyErr {
     let msg = format!("{}: {}", status.code(), status.message());
     match status.code() {
         tonic::Code::NotFound | tonic::Code::AlreadyExists | tonic::Code::InvalidArgument => {
             pyo3::exceptions::PyValueError::new_err(msg)
         }
+        tonic::Code::FailedPrecondition => ClaimLostError::new_err(msg),
         tonic::Code::Unavailable | tonic::Code::Aborted => {
             pyo3::exceptions::PyConnectionError::new_err(msg)
         }
