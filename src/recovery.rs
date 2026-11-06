@@ -35,6 +35,9 @@ use crate::types::AnvilConfig;
 /// the per-pass cap), so a pathological backlog still yields to shutdown.
 const GC_PASSES_PER_TICK_MAX: usize = 100;
 
+/// Upper bound on how long a stop waits for its background task to end.
+const TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Recovery task manager - recovers expired claims
 pub struct RecoveryTask {
     storage: Arc<AnvilStorage>,
@@ -127,7 +130,7 @@ impl RecoveryTask {
         // Wait for the task to finish gracefully
         if let Some(handle) = self.handle.take() {
             // Wait for task to complete (with timeout for safety)
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            let _ = tokio::time::timeout(TASK_STOP_TIMEOUT, handle).await;
         }
 
         tracing::info!("Recovery task stopped");
@@ -188,7 +191,6 @@ impl GcTask {
         self.running.store(true, Ordering::SeqCst);
 
         let storage = self.storage.clone();
-        let running = self.running.clone();
         let shutdown_notify = self.shutdown_notify.clone();
         let interval_secs = self.config.gc_interval_secs;
         let retention_secs = self.config.acked_retention_secs;
@@ -200,34 +202,37 @@ impl GcTask {
             loop {
                 tokio::select! {
                     biased;
-                    // Check for shutdown signal first (highest priority)
-                    _ = shutdown_notify.notified() => {
-                        break;
-                    }
-                    _ = ticker.tick() => {
-                        // Double-check running flag after waking up
-                        if !running.load(Ordering::SeqCst) {
-                            break;
-                        }
+                    _ = shutdown_notify.notified() => break,
+                    _ = ticker.tick() => {}
+                }
 
-                        // A pass that hit its cap left expired entries behind.
-                        // Acks can outpace one capped pass per interval, so keep
-                        // passing until the backlog is cleared rather than let
-                        // it grow without bound.
-                        for _ in 0..GC_PASSES_PER_TICK_MAX {
-                            if !running.load(Ordering::SeqCst) {
+                // A pass that hit its cap left expired entries behind.
+                // Acks can outpace one capped pass per interval, so keep
+                // passing until the backlog is cleared rather than let it
+                // grow without bound.
+                let passes = async {
+                    for _ in 0..GC_PASSES_PER_TICK_MAX {
+                        match storage.gc_acked_messages(retention_ns).await {
+                            Ok(deleted) if deleted == GC_PASS_KEYS_MAX => continue,
+                            Ok(_) => break,
+                            Err(e) => {
+                                tracing::error!("GC error: {}", e);
                                 break;
                             }
-                            match storage.gc_acked_messages(retention_ns).await {
-                                Ok(deleted) if deleted == GC_PASS_KEYS_MAX => continue,
-                                Ok(_) => break,
-                                Err(e) => {
-                                    tracing::error!("GC error: {}", e);
-                                    break;
-                                }
-                            }
                         }
                     }
+                };
+                // A pass reads and deletes up to GC_PASS_KEYS_MAX entries and
+                // runs for seconds, so a stop drops it at its next await
+                // instead of waiting it out: otherwise it outlives the stop,
+                // still scanning when the storage is closed or its runtime
+                // shuts down. Dropping it is safe because GC only deletes
+                // expired entries: the batches already committed stand, and
+                // the next pass deletes the rest.
+                tokio::select! {
+                    biased;
+                    _ = shutdown_notify.notified() => break,
+                    _ = passes => {}
                 }
             }
         });
@@ -247,9 +252,19 @@ impl GcTask {
         self.running.store(false, Ordering::SeqCst);
         self.shutdown_notify.notify_one();
 
-        // Wait for the task to finish gracefully
-        if let Some(handle) = self.handle.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        if let Some(mut handle) = self.handle.take() {
+            // The task drops its pass in flight on the signal, so it ends at
+            // its next await; a task still running at the deadline is wedged.
+            if tokio::time::timeout(TASK_STOP_TIMEOUT, &mut handle)
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    "GC task still running {:?} after stop, aborting it",
+                    TASK_STOP_TIMEOUT
+                );
+                handle.abort();
+            }
         }
 
         tracing::info!("GC task stopped");

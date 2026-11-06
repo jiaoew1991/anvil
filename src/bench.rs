@@ -734,7 +734,6 @@ mod tests {
             .await
             .unwrap();
         let port = broker.start().await.unwrap();
-        std::mem::forget(broker);
 
         println!(
             "\n=== worker profile: keys={keys} workers={workers} producers={producers} \
@@ -918,6 +917,9 @@ mod tests {
         claim_latencies.sort();
         ack_latencies.sort();
         let process_secs = process_start.elapsed().as_secs_f64();
+        // Stopped rather than leaked, so no GC pass is left to be cut off
+        // mid-scan when the test's runtime shuts down.
+        broker.stop_async().await;
         let total = acked.load(Ordering::Relaxed);
         let process_keys_per_sec = total as f64 / process_secs;
         let ack_p99_ms = percentile(&ack_latencies, 99.0) / 1000;

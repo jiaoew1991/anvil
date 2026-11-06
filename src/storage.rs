@@ -3526,6 +3526,63 @@ pub(crate) mod tests {
         set_sim_time_nanos(0);
     }
 
+    /// Stopping GC must not wait out the pass in flight. A full pass takes
+    /// seconds, so a stop that waited for it, or gave up and left it running,
+    /// let the pass outlive the broker and still be reading the storage when
+    /// the runtime shut down under it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_gc_stop_interrupts_an_in_flight_pass() {
+        use crate::recovery::GcTask;
+        use crate::types::AnvilConfig;
+
+        const STOP_DEADLINE: Duration = Duration::from_secs(1);
+        let storage = Arc::new(create_temp_storage().await);
+        let queue = "gc-stop";
+        storage.create_queue(queue, 0).await.unwrap();
+        // A full pass of expired entries, so the pass is still running long
+        // after its first commit.
+        let entry_key = |i: usize| AnvilStorage::acked_key(queue, 1, &format!("{i:012}"));
+        for first in (0..GC_PASS_KEYS_MAX).step_by(GC_BATCH_KEYS_MAX) {
+            let mut batch = WriteBatch::new();
+            for i in first..first + GC_BATCH_KEYS_MAX {
+                batch.put(entry_key(i), b"");
+            }
+            storage.write_durable(batch).await.unwrap();
+        }
+
+        let config = AnvilConfig {
+            acked_retention_secs: 0.0,
+            ..AnvilConfig::default()
+        };
+        let mut gc = GcTask::new(storage.clone(), config);
+        gc.start();
+        // The first tick fires at once; the pass is in flight once its first
+        // batch of deletes has landed.
+        tokio::time::timeout(CONCURRENCY_TEST_DRAIN_DEADLINE, async {
+            while storage.db.get(entry_key(0)).await.unwrap().is_some() {
+                tokio::time::sleep(TEST_BUSY_SLEEP).await;
+            }
+        })
+        .await
+        .expect("GC pass did not start");
+        assert!(storage
+            .db
+            .get(entry_key(GC_PASS_KEYS_MAX - 1))
+            .await
+            .unwrap()
+            .is_some());
+
+        tokio::time::timeout(STOP_DEADLINE, gc.stop_async())
+            .await
+            .expect("stop waited for the GC pass in flight");
+        drop(gc);
+        assert_eq!(
+            Arc::strong_count(&storage),
+            1,
+            "the GC task outlived its stop"
+        );
+    }
+
     #[tokio::test]
     async fn test_queue_stats() {
         let storage = create_temp_storage().await;
