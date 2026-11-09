@@ -16,6 +16,7 @@ from anvil_py import (
     AnvilStorageReader,
     BrokerConfig,
     ClaimLostError,
+    QueueFinishedError,
     StorageFormatError,
 )
 
@@ -85,6 +86,17 @@ def main():
         client.nack("poison", [again.msg_id], claim_tokens=[again.claim_token], dead_letter=True)
         purged = client.purge_dead_letters("poison", [again.msg_id])
         assert purged == {"purged": [again.msg_id], "missing": []}, purged
+        # A finished queue refuses a redrive with an error of its own, which a
+        # worker's handler for lost claims does not swallow.
+        client.mark_queue_finished("poison")
+        try:
+            client.redrive_dead_letters("poison", [again.msg_id])
+        except ClaimLostError:
+            sys.exit("a refused redrive was reported as a lost claim")
+        except QueueFinishedError:
+            pass
+        else:
+            sys.exit("a redrive into a finished queue was not refused")
 
         client.stop()
         broker.stop()

@@ -167,7 +167,7 @@ message ScatterAction {
 // delivery the queue allows: then they are dead-lettered.
 message NackAction {
   bool dead_letter = 1;                  // dead-letter now: a retry cannot succeed
-  string reason = 2;                     // kept with any message dead-lettered
+  string reason = 2;                     // kept with any message dead-lettered, cut to its first 4 KiB
 }
 
 message StateUpdate {
@@ -326,9 +326,12 @@ message ListDeadLettersRequest {
   uint32 limit = 3;                      // 1..=1000
 }
 
+// A page holds at most `limit` letters and, unless a single letter is
+// larger, at most 1 MiB of them, payloads included, so it decodes under a
+// client's default 4 MiB message limit.
 message ListDeadLettersResponse {
   repeated DeadLetter dead_letters = 1;  // in msg_id order
-  string next_start_after = 2;           // empty once the list is exhausted
+  string next_start_after = 2;           // start_after of the next page; empty once the list is exhausted
 }
 
 message DeadLetter {

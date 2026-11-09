@@ -803,14 +803,13 @@ impl Anvil for AnvilService {
             )));
         }
         let start_after = Some(req.start_after.as_str()).filter(|id| !id.is_empty());
-        let letters = self
+        let (letters, more) = self
             .storage
             .list_dead_letters(&req.queue, start_after, limit)
             .await
             .map_err(|e| storage_status("ListDeadLetters", e))?;
-        // A full page may be followed by more; a short one is the last.
         let next_start_after = match letters.last() {
-            Some(last) if letters.len() == limit => last.message.msg_id.clone(),
+            Some(last) if more => last.message.msg_id.clone(),
             _ => String::new(),
         };
         let dead_letters = letters

@@ -283,7 +283,7 @@ impl AnvilBroker {
                 // are bound to the tokio runtime that creates the Db. Storage must be created
                 // and used in the same runtime to avoid "channel closed" panics.
                 let storage = match AnvilStorage::new(&config.db_path).await {
-                    Ok(s) => Arc::new(s.with_default_max_deliveries(config.default_max_deliveries)),
+                    Ok(s) => Arc::new(s),
                     Err(e) => {
                         running.store(false, Ordering::SeqCst);
                         let _ = opened_tx.send(Err(open_error(&config.db_path, e)));
@@ -656,6 +656,10 @@ fn anvil_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "ClaimLostError",
         m.py().get_type::<client::ClaimLostError>(),
+    )?;
+    m.add(
+        "QueueFinishedError",
+        m.py().get_type::<client::QueueFinishedError>(),
     )?;
     m.add(
         "StorageFormatError",

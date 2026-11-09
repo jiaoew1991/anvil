@@ -30,6 +30,7 @@
 mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::path::Path;
+    use std::sync::atomic::Ordering;
 
     use crate::storage::tests::split_claims;
     use crate::storage::{AnvilStorage, NackOptions, Rejection};
@@ -64,10 +65,13 @@ mod tests {
     }
 
     async fn open(dir: &Path) -> AnvilStorage {
-        AnvilStorage::new(&format!("file://{}", dir.display()))
+        let storage = AnvilStorage::new(&format!("file://{}", dir.display()))
             .await
-            .unwrap()
-            .with_default_max_deliveries(VERIFY_DEFAULT_MAX_DELIVERIES)
+            .unwrap();
+        storage
+            .default_max_deliveries
+            .store(VERIFY_DEFAULT_MAX_DELIVERIES, Ordering::Relaxed);
+        storage
     }
 
     fn payload(queue: &str, i: usize) -> Vec<u8> {
@@ -409,7 +413,8 @@ mod tests {
         let letters = storage
             .list_dead_letters("redelivered", None, 10)
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(letters.len(), 1);
         assert_eq!(letters[0].message.msg_id, ids[0]);
         assert_eq!(letters[0].cause, DeadLetterCause::NackLimit);
@@ -482,7 +487,7 @@ mod tests {
     /// redrives, purges and settles them.
     async fn verify_dead_letters(storage: &AnvilStorage) {
         assert_eq!(counts(storage, "dead").await, (3, 0, 0, 0));
-        let mut letters = storage.list_dead_letters("dead", None, 10).await.unwrap();
+        let (mut letters, _) = storage.list_dead_letters("dead", None, 10).await.unwrap();
         letters.sort_by(|a, b| a.message.payload.cmp(&b.message.payload));
         let found: Vec<(Vec<u8>, DeadLetterCause, &str, u32, &str)> = letters
             .iter()

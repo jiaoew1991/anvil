@@ -359,7 +359,7 @@ pub(crate) mod tests {
 
                 Op::Redrive { queue_idx } => {
                     let queue = &self.queues[queue_idx];
-                    let letters = self
+                    let (letters, _) = self
                         .storage
                         .list_dead_letters(queue, None, 3)
                         .await
@@ -379,7 +379,7 @@ pub(crate) mod tests {
 
                 Op::Purge { queue_idx } => {
                     let queue = &self.queues[queue_idx];
-                    let letters = self
+                    let (letters, _) = self
                         .storage
                         .list_dead_letters(queue, None, 2)
                         .await
@@ -450,15 +450,15 @@ pub(crate) mod tests {
         let mut ids = HashSet::new();
         let mut start_after: Option<String> = None;
         loop {
-            let page = storage
+            let (page, more) = storage
                 .list_dead_letters(queue, start_after.as_deref(), DEAD_LETTERS_PER_CALL_MAX)
                 .await
                 .unwrap();
-            let Some(last) = page.last() else {
-                return ids;
-            };
-            start_after = Some(last.message.msg_id.clone());
+            start_after = page.last().map(|l| l.message.msg_id.clone());
             ids.extend(page.into_iter().map(|l| l.message.msg_id));
+            if !more {
+                return ids;
+            }
         }
     }
 

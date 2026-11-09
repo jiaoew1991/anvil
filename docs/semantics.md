@@ -349,17 +349,23 @@ unlimited. A nack or reclaim that settles a claim with `delivery_count >=
 max_deliveries` moves the message to the queue's dead letters instead of
 pending, in the same atomic write: the claim and the pending body go, and the
 dead letter keeps the body, the delivery count, the cause (`nack_limit`,
-`reclaim_limit`), the last nack's `reason` and the worker. A nack with
+`reclaim_limit`), the last nack's `reason` (its first 4 KiB, cut at a
+character boundary, so a nack carrying a whole traceback still succeeds) and
+the worker. A nack with
 `dead_letter` set dead-letters its messages at once, cause `rejected`. The
 limit is read when the claim is settled, so a lowered limit applies from the
 next nack or reclaim, and a message already past it gets that one more
 delivery.
 
 Dead letters are neither pending nor claimed: they count as settled for the
-drain signal and take no room in a bounded queue. They stay until an operator
+drain signal and take no room in a bounded queue. A queue reported drained
+while it holds dead letters logs a warning, once, so work a pipeline skipped
+does not go unnoticed. They stay until an operator
 acts on them, at most 1000 per call:
 
-- `ListDeadLetters` pages through them in msg_id order.
+- `ListDeadLetters` pages through them in msg_id order. A page holds at
+  most `limit` letters and, unless one letter alone is larger, at most 1 MiB
+  of them, payloads included; `next_start_after` continues the listing.
 - `RedriveDeadLetters` returns them to the tail of pending as messages
   delivered no time before, so each gets a full set of deliveries again. A
   queue marked finished refuses it with `FAILED_PRECONDITION`, since its
@@ -368,7 +374,8 @@ acts on them, at most 1000 per call:
 - `PurgeDeadLetters` deletes them and adds them to `total_acked`.
 
 Both report the msg_ids that held no dead letter instead of failing, so a
-retry after a timeout is safe; a redrive and a purge never act on one dead
+retry after a timeout is safe. The Python client raises `QueueFinishedError`,
+not `ClaimLostError`, for a redrive refused on a finished queue; a redrive and a purge never act on one dead
 letter at once. `DeleteQueue` deletes a queue's dead letters with it.
 - Lease age and claim age run on the broker's monotonic clock, not the wall
   clock, so a clock step neither revives a dead lease nor reclaims a live
@@ -662,14 +669,9 @@ Result: Message processed twice
 
 **Question**: Should we limit how many times a message can be nacked?
 
-**Resolved**: Option 2, max deliveries with a dead letter queue built into
-each queue (section 4.1, "Dead letters"). The limit defaults to 20 per broker
-and is set per queue; 0 keeps the old unlimited retries.
-
-**Options considered:**
-1. **Unlimited retries**: Simple, but poison messages never die
-2. **Max retries with dead-letter queue**: Move to DLQ after N failures
-3. **Max retries with skip**: Log and drop after N failures
+**Current**: Each queue allows a number of deliveries, 20 by default, after
+which a failed message moves to the queue's dead letters (section 4.1, "Dead
+letters"); 0 allows unlimited retries.
 
 ### 8.3 Cross-Stage Transactions
 

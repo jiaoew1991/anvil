@@ -22,6 +22,7 @@
 // This eliminates transaction conflicts at high concurrency.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,6 +49,16 @@ pub(crate) const GC_PASS_KEYS_MAX: usize = 1_000_000;
 /// admin call reads and writes a bounded batch however many letters a queue
 /// holds.
 pub const DEAD_LETTERS_PER_CALL_MAX: usize = 1_000;
+
+/// Upper bound on the encoded dead letters one list returns, payloads
+/// included, so a page stays well under the 4 MiB a gRPC client decodes by
+/// default. A page holds at least one letter, whatever its size.
+pub const DEAD_LETTER_PAGE_BYTES_MAX: usize = 1 << 20;
+
+/// Upper bound on the reason a dead letter keeps, in bytes. A longer nack
+/// reason, such as a whole traceback, is cut at a character boundary rather
+/// than refused: refusing it would fail the nack it explains.
+pub const DEAD_LETTER_REASON_BYTES_MAX: usize = 4 << 10;
 
 pub type StorageError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -409,8 +420,44 @@ struct Landing {
     settlement: Option<SettlementHold>,
     /// `delete_queue`'s hold on `counters_loading`.
     loading: Option<tokio::sync::OwnedMutexGuard<()>>,
-    /// A redrive's or purge's hold on `QueueCounters::dead_letter_admin`.
+    /// A hold on `QueueCounters::dead_letter_admin`: a redrive's or purge's,
+    /// or a settlement's that dead-letters.
     dead_letter_admin: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// Queue records the batch writes, applied to `AnvilStorage::limits`
+    /// once it lands, before `loading` is released: a failed write leaves
+    /// the limits as the store has them.
+    limits: Vec<(String, format::proto::QueueRecord)>,
+    /// Messages the batch dead-letters, counted in the metric once it lands,
+    /// as the dead count is.
+    dead_lettered: Vec<(String, DeadLetterCause)>,
+}
+
+/// The limits of the queue records loaded or written so far, read by every
+/// push and settlement without touching the database. A record never drops
+/// a bound or a limit once set, so an entry is removed only with its queue.
+#[derive(Default)]
+struct QueueLimits {
+    /// Bounds of bounded queues; an unbounded queue has no entry.
+    max_pending: DashMap<String, u64>,
+    /// Delivery limits of the queues that set one, 0 included; a queue
+    /// without an entry takes `AnvilStorage::default_max_deliveries`.
+    max_deliveries: DashMap<String, u32>,
+}
+
+impl QueueLimits {
+    /// Applies the limits of a queue record that is loaded or has landed.
+    /// Both happen under `counters_loading`, so no loader overwrites them
+    /// with the limits it read before.
+    fn apply(&self, queue: &str, record: &format::proto::QueueRecord) {
+        if record.max_pending > 0 {
+            self.max_pending
+                .insert(queue.to_string(), record.max_pending);
+        }
+        if let Some(max_deliveries) = record.max_deliveries {
+            self.max_deliveries
+                .insert(queue.to_string(), max_deliveries);
+        }
+    }
 }
 
 /// What a push reservation puts at the tail of pending.
@@ -554,17 +601,16 @@ pub struct AnvilStorage {
     counters_loading: Arc<tokio::sync::Mutex<()>>,
     /// Per-group round-robin counters for O(1) steal path in claim_from_group
     steal_rr: std::sync::Mutex<HashMap<String, u64>>,
-    /// Bounds of bounded queues; an unbounded queue has no entry. Mirrors the
-    /// `max_pending` of the queue records loaded so far.
-    max_pending_limits: DashMap<String, u64>,
-    /// Delivery limits of the queues that set one, 0 included; a queue
-    /// without an entry takes `default_max_deliveries`. Mirrors the
-    /// `max_deliveries` of the queue records loaded so far.
-    max_deliveries_limits: DashMap<String, u32>,
-    /// The delivery limit of a queue that sets none (see
-    /// `AnvilConfig::default_max_deliveries`). It is broker policy, not
-    /// data: a queue record stores only whether the queue set its own.
-    pub(crate) default_max_deliveries: u32,
+    /// The limits of the queue records loaded or written so far.
+    limits: Arc<QueueLimits>,
+    /// The delivery limit of a queue that sets none. It is broker policy,
+    /// not data: a queue record stores only whether the queue set its own.
+    /// The broker sets it from `AnvilConfig::default_max_deliveries` before
+    /// it serves (`AnvilBrokerInner::new_with_storage`).
+    pub(crate) default_max_deliveries: AtomicU32,
+    /// Queues reported drained while holding dead letters, each warned
+    /// about once.
+    drained_with_dead_letters: DashSet<String>,
     /// Claims, as claim key and the token presented for it, whose
     /// settlement (ack, nack or reclaim) is between its check and its
     /// write. Without the hold, two settlements of one message both
@@ -617,6 +663,14 @@ impl SettlementHold {
         self.claims.push(claim);
         true
     }
+
+    /// Releases the claim taken last, which the caller found it must not
+    /// settle: the hold covers exactly the claims settled.
+    fn release_last(&mut self) {
+        let claim = self.claims.pop().expect("a claim taken");
+        let released = self.settling.remove(&claim);
+        assert!(released.is_some(), "settlement hold released twice");
+    }
 }
 
 impl Drop for SettlementHold {
@@ -664,9 +718,9 @@ impl AnvilStorage {
             counters: DashMap::new(),
             counters_loading: Arc::new(tokio::sync::Mutex::new(())),
             steal_rr: std::sync::Mutex::new(HashMap::new()),
-            max_pending_limits: DashMap::new(),
-            max_deliveries_limits: DashMap::new(),
-            default_max_deliveries: DEFAULT_MAX_DELIVERIES,
+            limits: Arc::new(QueueLimits::default()),
+            default_max_deliveries: AtomicU32::new(DEFAULT_MAX_DELIVERIES),
+            drained_with_dead_letters: DashSet::new(),
             settling: Arc::new(DashSet::new()),
             taken_at: DashMap::new(),
             renewed_at: DashMap::new(),
@@ -680,13 +734,6 @@ impl AnvilStorage {
             return Err(e);
         }
         Ok(storage)
-    }
-
-    /// Sets the delivery limit of every queue that sets none. Set before
-    /// the storage serves, since the limit is read at every settlement.
-    pub fn with_default_max_deliveries(mut self, default_max_deliveries: u32) -> Self {
-        self.default_max_deliveries = default_max_deliveries;
-        self
     }
 
     /// Brings the store to `FORMAT_VERSION` before anything else reads it:
@@ -754,18 +801,33 @@ impl AnvilStorage {
         landing: Landing,
     ) -> Result<(), StorageError> {
         let db = self.db.clone();
+        let queue_limits = self.limits.clone();
         let handle = tokio::spawn(async move {
             let Landing {
                 mut writes,
                 settlement,
                 loading,
                 dead_letter_admin,
+                limits,
+                dead_lettered,
             } = landing;
             #[allow(clippy::disallowed_methods)] // the one sanctioned write path
             let written = db.write(batch).await;
             if written.is_ok() {
                 for write in &mut writes {
                     write.landed = true;
+                }
+                for (queue, record) in &limits {
+                    queue_limits.apply(queue, record);
+                }
+                for (queue, cause) in dead_lettered {
+                    crate::metrics::events().dead_lettered.add(
+                        1,
+                        &[
+                            opentelemetry::KeyValue::new("queue", queue),
+                            opentelemetry::KeyValue::new("cause", cause.as_str()),
+                        ],
+                    );
                 }
             }
             // The counters first: a settlement or load let in by a release
@@ -1084,7 +1146,7 @@ impl AnvilStorage {
             }),
             ..QueueCounters::default()
         });
-        self.set_limits(queue, &record);
+        self.limits.apply(queue, &record);
         let previous = self.counters.insert(queue.to_string(), counters.clone());
         assert!(previous.is_none(), "counters of {queue} loaded twice");
         Ok(Some(counters))
@@ -1169,21 +1231,15 @@ impl AnvilStorage {
         // reading the persisted ones.
         let loading = self.counters_loading.clone().lock_owned().await;
         let mut batch = WriteBatch::new();
-        let (exists, changed) = self
-            .put_queue_record(&mut batch, queue, max_pending, max_deliveries)
+        let mut landing = Landing::default();
+        let exists = self
+            .put_queue_record(&mut batch, &mut landing, queue, max_pending, max_deliveries)
             .await?;
-        if !changed {
+        if landing.limits.is_empty() {
             return Ok(());
         }
-        self.commit(
-            batch,
-            Wait::Durable,
-            Landing {
-                loading: Some(loading),
-                ..Landing::default()
-            },
-        )
-        .await?;
+        landing.loading = Some(loading);
+        self.commit(batch, Wait::Durable, landing).await?;
         if !exists {
             self.db.flush().await?;
         }
@@ -1192,16 +1248,18 @@ impl AnvilStorage {
 
     /// Puts into `batch` the record of `queue` with `max_pending` and
     /// `max_deliveries` over what it holds, a bound of 0 and a `None` limit
-    /// keeping the record's, and applies it. Returns whether the queue
-    /// existed and whether its record changed; an unchanged one is not put.
-    /// The caller holds `counters_loading` until the batch is applied.
+    /// keeping the record's, and into `landing` the limits to apply once it
+    /// lands. An unchanged record is put in neither. Returns whether the
+    /// queue existed. The caller holds `counters_loading` until the batch
+    /// lands.
     async fn put_queue_record(
         &self,
         batch: &mut WriteBatch,
+        landing: &mut Landing,
         queue: &str,
         max_pending: u64,
         max_deliveries: Option<u32>,
-    ) -> Result<(bool, bool), StorageError> {
+    ) -> Result<bool, StorageError> {
         let existing = match self.db.get(keys::queue(queue)).await? {
             Some(bytes) => Some(format::decode_queue(&bytes)?),
             None => None,
@@ -1214,30 +1272,14 @@ impl AnvilStorage {
             record.max_deliveries = max_deliveries;
         }
         if existing.as_ref() == Some(&record) {
-            return Ok((true, false));
+            return Ok(true);
         }
         batch.put(
             keys::queue(queue),
             format::encode_queue(record.max_pending, record.max_deliveries),
         );
-        self.set_limits(queue, &record);
-        Ok((existing.is_some(), true))
-    }
-
-    /// Applies the limits of a queue record that is loaded, or about to be
-    /// committed. The caller holds `counters_loading` until that batch is
-    /// applied, so no loader overwrites them with the limits it read before.
-    /// A record never drops a bound or a limit once set, so neither is
-    /// removed here.
-    fn set_limits(&self, queue: &str, record: &format::proto::QueueRecord) {
-        if record.max_pending > 0 {
-            self.max_pending_limits
-                .insert(queue.to_string(), record.max_pending);
-        }
-        if let Some(max_deliveries) = record.max_deliveries {
-            self.max_deliveries_limits
-                .insert(queue.to_string(), max_deliveries);
-        }
+        landing.limits.push((queue.to_string(), record));
+        Ok(existing.is_some())
     }
 
     /// Check if a queue has capacity for `additional` messages.
@@ -1253,7 +1295,7 @@ impl AnvilStorage {
         let Some(counters) = self.load_counters(queue).await? else {
             return Ok(());
         };
-        let Some(max) = self.max_pending_limits.get(queue).map(|limit| *limit) else {
+        let Some(max) = self.limits.max_pending.get(queue).map(|limit| *limit) else {
             return Ok(());
         };
         assert!(max > 0, "unbounded queue {queue} has a bound");
@@ -1720,19 +1762,25 @@ impl AnvilStorage {
             if !hold.take(claim_key.clone(), &claim.claim_token) {
                 continue;
             }
-            let Some(data) = self.db.get(&claim_key).await? else {
-                continue;
+            let current = match self.db.get(&claim_key).await? {
+                Some(data) => Some(format::decode_claim(&claim.msg_id, &data)?),
+                None => None,
             };
-            let current = format::decode_claim(&claim.msg_id, &data)?;
-            let renewed_since_read = self
-                .renewed_at
-                .get(&current.claim_token)
-                .is_some_and(|renewed_at| *renewed_at >= read_at);
-            if current.claim_token == claim.claim_token && !renewed_since_read {
-                reclaimed.push(current);
+            // Settled, taken anew or renewed since it was read: not ours.
+            let stale = current.as_ref().is_none_or(|current| {
+                current.claim_token != claim.claim_token
+                    || self
+                        .renewed_at
+                        .get(&current.claim_token)
+                        .is_some_and(|renewed_at| *renewed_at >= read_at)
+            });
+            match current {
+                Some(current) if !stale => reclaimed.push(current),
+                _ => hold.release_last(),
             }
         }
         assert!(reclaimed.len() <= claims.len());
+        assert_eq!(reclaimed.len(), hold.claims.len());
         if reclaimed.is_empty() {
             return Ok(reclaimed);
         }
@@ -1813,14 +1861,15 @@ impl AnvilStorage {
         assert!(!claims.is_empty());
         assert_eq!(claims.len(), hold.claims.len());
 
-        let max_deliveries = self
-            .max_deliveries_limits
-            .get(queue)
-            .map_or(self.default_max_deliveries, |limit| *limit);
+        let max_deliveries = self.limits.max_deliveries.get(queue).map_or(
+            self.default_max_deliveries.load(Ordering::Relaxed),
+            |limit| *limit,
+        );
         let (reason, limit_cause) = match requeue {
             Requeue::Nack(nack) => (nack.reason, DeadLetterCause::NackLimit),
             Requeue::Reclaim => ("", DeadLetterCause::ReclaimLimit),
         };
+        let reason = &reason[..reason.floor_char_boundary(DEAD_LETTER_REASON_BYTES_MAX)];
         let mut requeued = Vec::with_capacity(claims.len());
         let mut dead = Vec::new();
         for claim in &claims {
@@ -1834,24 +1883,26 @@ impl AnvilStorage {
         }
         assert_eq!(requeued.len() + dead.len(), claims.len());
 
+        // The bodies are read before anything is reserved: a reservation
+        // holds the queue's push watermark until the write lands.
+        let bodies = futures::future::try_join_all(
+            dead.iter()
+                .map(|(claim, _)| self.db.get(keys::message(queue, &claim.msg_id))),
+        )
+        .await?;
         let mut batch = WriteBatch::new();
-        if !requeued.is_empty() {
-            let base_seq = write.reserve(requeued.len() as u64, Tail::Requeued);
-            for (i, claim) in requeued.iter().enumerate() {
-                batch.delete(keys::claim(queue, &claim.msg_id));
-                batch.put(
-                    keys::pending(queue, base_seq + i as u64),
-                    format::encode_pending(&claim.msg_id, claim.delivery_count),
-                );
-            }
-        }
+        let mut landing = Landing::default();
         if !dead.is_empty() {
+            // The dead letters are visible to reads once the batch is
+            // applied, before it lands and counts them: a redrive or purge
+            // must not take them out first.
+            landing.dead_letter_admin =
+                Some(write.counters.dead_letter_admin.clone().lock_owned().await);
             write.dead_letter(dead.len() as u64);
             let dead_at_ms = now_nanos() / 1_000_000;
-            for (claim, cause) in &dead {
-                let body_key = keys::message(queue, &claim.msg_id);
+            for ((claim, cause), body) in dead.iter().zip(bodies) {
                 // A claimed message keeps its body until it is settled.
-                let body = self.db.get(&body_key).await?.ok_or_else(|| {
+                let body = body.ok_or_else(|| {
                     format::CorruptValue(format!(
                         "claimed message {queue}/{} without a body",
                         claim.msg_id
@@ -1866,36 +1917,30 @@ impl AnvilStorage {
                     dead_at_ms,
                 };
                 batch.delete(keys::claim(queue, &claim.msg_id));
-                batch.delete(body_key);
+                batch.delete(keys::message(queue, &claim.msg_id));
                 batch.put(
                     keys::dead_letter(queue, &claim.msg_id),
                     format::encode_dead_letter(&letter),
+                );
+                landing.dead_lettered.push((queue.to_string(), *cause));
+            }
+        }
+        if !requeued.is_empty() {
+            let base_seq = write.reserve(requeued.len() as u64, Tail::Requeued);
+            for (i, claim) in requeued.iter().enumerate() {
+                batch.delete(keys::claim(queue, &claim.msg_id));
+                batch.put(
+                    keys::pending(queue, base_seq + i as u64),
+                    format::encode_pending(&claim.msg_id, claim.delivery_count),
                 );
             }
         }
         if let Some(namespace) = state_namespace {
             Self::put_state(&mut batch, namespace, state_puts, state_deletes);
         }
-        self.commit(
-            batch,
-            Wait::Durable,
-            Landing {
-                writes: vec![write],
-                settlement: Some(hold),
-                ..Landing::default()
-            },
-        )
-        .await?;
-        for (_, cause) in &dead {
-            crate::metrics::events().dead_lettered.add(
-                1,
-                &[
-                    opentelemetry::KeyValue::new("queue", queue.to_string()),
-                    opentelemetry::KeyValue::new("cause", cause.as_str()),
-                ],
-            );
-        }
-        Ok(())
+        landing.writes.push(write);
+        landing.settlement = Some(hold);
+        self.commit(batch, Wait::Durable, landing).await
     }
 
     // === Scan Operations ===
@@ -1940,16 +1985,17 @@ impl AnvilStorage {
 
     // === Dead Letter Operations ===
 
-    /// Up to `limit` dead letters of `queue` in msg_id order, those after
-    /// `start_after` only when it is given, so a caller pages through them
-    /// with the last msg_id it saw. An unknown queue is
-    /// `Rejection::NotFound`.
+    /// Up to `limit` dead letters of `queue` in msg_id order, and at most
+    /// `DEAD_LETTER_PAGE_BYTES_MAX` of them unless one alone is larger,
+    /// those after `start_after` only when it is given, and whether more
+    /// follow; a caller pages through them with the last msg_id it saw. An
+    /// unknown queue is `Rejection::NotFound`.
     pub async fn list_dead_letters(
         &self,
         queue: &str,
         start_after: Option<&str>,
         limit: usize,
-    ) -> Result<Vec<DeadLetter>, StorageError> {
+    ) -> Result<(Vec<DeadLetter>, bool), StorageError> {
         assert!(limit > 0);
         assert!(limit <= DEAD_LETTERS_PER_CALL_MAX);
         if self.load_counters(queue).await?.is_none() {
@@ -1959,15 +2005,21 @@ impl AnvilStorage {
         }
         let mut iter = self.db.scan(keys::dead_letters(queue, start_after)).await?;
         let mut letters = Vec::new();
-        while letters.len() < limit {
-            let Some(kv) = iter.next().await? else {
-                break;
-            };
+        let mut page_bytes = 0;
+        while let Some(kv) = iter.next().await? {
+            let full = letters.len() == limit
+                || (!letters.is_empty()
+                    && page_bytes + kv.value.len() > DEAD_LETTER_PAGE_BYTES_MAX);
+            if full {
+                return Ok((letters, true));
+            }
             let (key_queue, msg_id) = keys::parse_dead_letter(&kv.key)?;
             assert_eq!(key_queue, queue);
+            page_bytes += kv.value.len();
             letters.push(format::decode_dead_letter(&msg_id, &kv.value)?);
         }
-        Ok(letters)
+        assert!(letters.len() <= limit);
+        Ok((letters, false))
     }
 
     /// Returns the dead letters `msg_ids` of `queue` to the tail of pending,
@@ -2119,8 +2171,9 @@ impl AnvilStorage {
         // Removed before closing, so a write turned away loads anew, with
         // its bound, under `counters_loading`.
         self.counters.remove(queue);
-        self.max_pending_limits.remove(queue);
-        self.max_deliveries_limits.remove(queue);
+        self.limits.max_pending.remove(queue);
+        self.limits.max_deliveries.remove(queue);
+        self.drained_with_dead_letters.remove(queue);
         counters.close().await;
         let claimed = self.scan_claimed(Some(queue)).await?;
         let acked = self.scan_acked(Some(queue)).await?;
@@ -2428,13 +2481,20 @@ impl AnvilStorage {
         // Single locked snapshot of all queue counters. Includes in-flight
         // push reservations (`push_seq_alloc`) so a writer mid-commit
         // doesn't transiently look drained.
-        let (pending_count, claimed_count) = {
+        let (pending_count, claimed_count, dead_letters) = {
             let s = c.state.lock().expect("queue state poisoned");
-            (s.pending_count(), s.claimed_count())
+            (s.pending_count(), s.claimed_count(), s.dead_letters)
         };
 
         // A queue is drained only when explicitly marked finished AND fully empty.
         let drained = finished && pending_count == 0 && claimed_count == 0;
+        // Dead letters count as settled, so a pipeline can finish with work
+        // it never did: say so once per queue.
+        if drained && dead_letters > 0 && self.drained_with_dead_letters.insert(queue.to_string()) {
+            tracing::warn!(
+                "queue {queue} drained with {dead_letters} dead letters left unprocessed"
+            );
+        }
 
         Ok((finished, drained, pending_count, claimed_count))
     }
@@ -2491,30 +2551,22 @@ impl AnvilStorage {
                 meta
             }
         };
-        let mut changed = created;
+        let mut landing = Landing::default();
         if created || max_pending_per_partition > 0 || max_deliveries.is_some() {
             for queue_name in &meta.partition_queues {
-                let (_, partition_changed) = self
-                    .put_queue_record(
-                        &mut batch,
-                        queue_name,
-                        max_pending_per_partition,
-                        max_deliveries,
-                    )
-                    .await?;
-                changed |= partition_changed;
+                self.put_queue_record(
+                    &mut batch,
+                    &mut landing,
+                    queue_name,
+                    max_pending_per_partition,
+                    max_deliveries,
+                )
+                .await?;
             }
         }
-        if changed {
-            self.commit(
-                batch,
-                Wait::Durable,
-                Landing {
-                    loading: Some(loading),
-                    ..Landing::default()
-                },
-            )
-            .await?;
+        if created || !landing.limits.is_empty() {
+            landing.loading = Some(loading);
+            self.commit(batch, Wait::Durable, landing).await?;
         }
 
         if created {
@@ -4400,13 +4452,13 @@ pub(crate) mod tests {
         let mut letters: Vec<DeadLetter> = Vec::new();
         loop {
             let start_after = letters.last().map(|l| l.message.msg_id.clone());
-            let page = storage
+            let (page, more) = storage
                 .list_dead_letters(queue, start_after.as_deref(), 2)
                 .await
                 .unwrap();
-            let done = page.len() < 2;
+            assert!(!page.is_empty() || !more);
             letters.extend(page);
-            if done {
+            if !more {
                 return letters;
             }
         }
@@ -4519,7 +4571,8 @@ pub(crate) mod tests {
     /// five times, then reject the latter.
     #[tokio::test]
     async fn test_default_and_unlimited_and_rejected() {
-        let storage = create_temp_storage().await.with_default_max_deliveries(3);
+        let storage = create_temp_storage().await;
+        storage.default_max_deliveries.store(3, Ordering::Relaxed);
         storage.create_queue("default", 0, None).await.unwrap();
         storage.create_queue("unlimited", 0, Some(0)).await.unwrap();
         push_and_claim(&storage, "default", 1).await;
@@ -4580,7 +4633,7 @@ pub(crate) mod tests {
         assert_eq!(record(&storage).await, (7, Some(4)));
         storage.create_queue(queue, 0, Some(0)).await.unwrap();
         assert_eq!(record(&storage).await, (7, Some(0)));
-        assert_eq!(*storage.max_deliveries_limits.get(queue).unwrap(), 0);
+        assert_eq!(*storage.limits.max_deliveries.get(queue).unwrap(), 0);
 
         let (group, _) = storage
             .create_queue_group("g", 2, 0, Some(5))
@@ -4737,7 +4790,8 @@ pub(crate) mod tests {
     /// under the name starts without any, and with the default limit.
     #[tokio::test]
     async fn test_delete_queue_removes_dead_letters() {
-        let storage = create_temp_storage().await.with_default_max_deliveries(2);
+        let storage = create_temp_storage().await;
+        storage.default_max_deliveries.store(2, Ordering::Relaxed);
         let queue = "delete-dead";
         storage.create_queue(queue, 0, Some(1)).await.unwrap();
         let claimed = push_and_claim(&storage, queue, 2).await;
@@ -4818,6 +4872,200 @@ pub(crate) mod tests {
         assert_eq!(dead_counts(&storage, queue).await, (0, 0, 1, 3));
         storage.close().await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Goal: a reclaim of claims some of which were settled since recovery
+    /// read them settles the rest and leaves no hold behind. Method: read
+    /// two claims as recovery does, ack one, then reclaim both.
+    #[tokio::test]
+    async fn test_reclaim_of_partly_settled_claims() {
+        let storage = create_temp_storage().await;
+        let queue = "reclaim-mixed";
+        storage.create_queue(queue, 0, None).await.unwrap();
+        let claimed = push_and_claim(&storage, queue, 2).await;
+        let read_at = crate::types::mono_now();
+        let read_by_recovery: Vec<ClaimInfo> = storage
+            .scan_claimed(Some(queue))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, msg_id, info)| ClaimInfo { msg_id, ..info })
+            .collect();
+        let (msg_ids, tokens) = split_claims(&claimed[..1]);
+        storage
+            .ack_messages(queue, &msg_ids, &tokens, "w", "l")
+            .await
+            .unwrap();
+
+        let reclaimed = storage
+            .reclaim_messages(queue, &read_by_recovery, read_at)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].msg_id, claimed[1].message.msg_id);
+        assert!(storage.settling.is_empty());
+        assert_eq!(dead_counts(&storage, queue).await, (1, 0, 1, 0));
+    }
+
+    /// Goal: a redrive or purge never takes out a dead letter before the
+    /// settlement that wrote it has counted it, though the batch is visible
+    /// to reads before it lands. Method: round after round, reject a message
+    /// while another task redrives it as soon as it can, then settle it; on
+    /// many queues at once, each with its own dead letter lock, since every
+    /// round waits for durable writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_redrive_never_overtakes_the_dead_lettering() {
+        const QUEUES: usize = 50;
+        const ROUNDS: usize = 20;
+        const REDRIVE_ATTEMPTS_MAX: usize = 1_000_000;
+        let storage = Arc::new(AnvilStorage::new("memory://").await.unwrap());
+        let mut queues = Vec::with_capacity(QUEUES);
+        for i in 0..QUEUES {
+            let storage = storage.clone();
+            queues.push(tokio::spawn(async move {
+                let queue = format!("overtake-{i}");
+                storage.create_queue(&queue, 0, Some(0)).await.unwrap();
+                for round in 0..ROUNDS {
+                    let claimed = push_and_claim(&storage, &queue, 1).await;
+                    let redriver = {
+                        let (storage, queue) = (storage.clone(), queue.clone());
+                        let msg_ids = vec![claimed[0].message.msg_id.clone()];
+                        tokio::spawn(async move {
+                            for _ in 0..REDRIVE_ATTEMPTS_MAX {
+                                let (redriven, _) = storage
+                                    .redrive_dead_letters(&queue, &msg_ids)
+                                    .await
+                                    .unwrap();
+                                if !redriven.is_empty() {
+                                    return;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                            panic!("the dead letter never appeared");
+                        })
+                    };
+                    let reject = NackOptions {
+                        dead_letter: true,
+                        reason: "",
+                    };
+                    nack(&storage, &queue, &claimed, reject).await;
+                    redriver.await.unwrap();
+                    let again = storage.claim_messages(&queue, 1, "w", "l").await.unwrap();
+                    assert_eq!(again.len(), 1, "{queue} round {round}");
+                    let (msg_ids, tokens) = split_claims(&again);
+                    storage
+                        .ack_messages(&queue, &msg_ids, &tokens, "w", "l")
+                        .await
+                        .unwrap();
+                    let meta = storage.get_meta(&queue).await.unwrap();
+                    assert_eq!(meta.dead_count, 0, "{queue} round {round}");
+                }
+            }));
+        }
+        for queue in queues {
+            queue.await.unwrap();
+        }
+    }
+
+    /// Goal: a nack's reason is kept up to `DEAD_LETTER_REASON_BYTES_MAX`
+    /// bytes, cut at a character boundary, and the nack still succeeds.
+    #[tokio::test]
+    async fn test_long_nack_reason_is_truncated() {
+        let storage = create_temp_storage().await;
+        let queue = "long-reason";
+        storage.create_queue(queue, 0, None).await.unwrap();
+        let claimed = push_and_claim(&storage, queue, 1).await;
+        // A 3-byte character straddles the bound.
+        let reason = format!(
+            "{}€{}",
+            "x".repeat(DEAD_LETTER_REASON_BYTES_MAX - 1),
+            "y".repeat(10)
+        );
+        let reject = NackOptions {
+            dead_letter: true,
+            reason: &reason,
+        };
+        nack(&storage, queue, &claimed, reject).await;
+        let letter = &all_dead_letters(&storage, queue).await[0];
+        assert_eq!(letter.reason, "x".repeat(DEAD_LETTER_REASON_BYTES_MAX - 1));
+    }
+
+    /// Goal: a page of dead letters stops at the byte budget, holds at least
+    /// one letter however large, and reports that more follow. Method:
+    /// dead-letter four messages of 300 KiB and one larger than the budget,
+    /// and page through them.
+    #[tokio::test]
+    async fn test_dead_letter_pages_are_bounded_in_bytes() {
+        let storage = create_temp_storage().await;
+        let queue = "big-letters";
+        storage.create_queue(queue, 0, None).await.unwrap();
+        let big = DEAD_LETTER_PAGE_BYTES_MAX + 1;
+        let sizes = [300 << 10, 300 << 10, 300 << 10, big, 300 << 10];
+        let messages: Vec<Message> = sizes
+            .iter()
+            .map(|&size| Message::new(vec![0; size]))
+            .collect();
+        storage.push_messages(queue, &messages).await.unwrap();
+        let claimed = storage.claim_messages(queue, 5, "w", "l").await.unwrap();
+        let reject = NackOptions {
+            dead_letter: true,
+            reason: "",
+        };
+        nack(&storage, queue, &claimed, reject).await;
+
+        let mut pages: Vec<Vec<usize>> = Vec::new();
+        let mut start_after: Option<String> = None;
+        loop {
+            let (page, more) = storage
+                .list_dead_letters(queue, start_after.as_deref(), 10)
+                .await
+                .unwrap();
+            assert!(!page.is_empty());
+            start_after = page.last().map(|l| l.message.msg_id.clone());
+            pages.push(page.iter().map(|l| l.message.payload.len()).collect());
+            if !more {
+                break;
+            }
+        }
+        let mut listed: Vec<usize> = pages.iter().flatten().copied().collect();
+        listed.sort();
+        let mut pushed = sizes.to_vec();
+        pushed.sort();
+        assert_eq!(listed, pushed);
+        for page in &pages {
+            if page.len() > 1 {
+                assert!(
+                    page.iter().sum::<usize>() <= DEAD_LETTER_PAGE_BYTES_MAX,
+                    "{page:?}"
+                );
+            }
+        }
+        assert!(pages.contains(&vec![big]), "{pages:?}");
+        assert!(pages.len() >= 3, "{pages:?}");
+    }
+
+    /// Goal: a queue record whose write fails leaves the in-memory limits as
+    /// the store has them. Method: put a record with new limits into a batch
+    /// that also holds a merge the merge operator refuses, and commit it.
+    #[tokio::test]
+    async fn test_failed_queue_record_write_keeps_the_limits() {
+        let storage = create_temp_storage().await;
+        let queue = "limits-fail";
+        storage.create_queue(queue, 0, None).await.unwrap();
+        let mut batch = WriteBatch::new();
+        let mut landing = Landing::default();
+        storage
+            .put_queue_record(&mut batch, &mut landing, queue, 5, Some(7))
+            .await
+            .unwrap();
+        batch.merge(keys::queue(queue), format::encode_total(1));
+        let failed = storage.commit(batch, Wait::Durable, landing).await;
+        assert!(failed.is_err());
+        assert!(storage.limits.max_pending.get(queue).is_none());
+        assert!(storage.limits.max_deliveries.get(queue).is_none());
+        storage.create_queue(queue, 5, Some(7)).await.unwrap();
+        assert_eq!(*storage.limits.max_pending.get(queue).unwrap(), 5);
+        assert_eq!(*storage.limits.max_deliveries.get(queue).unwrap(), 7);
     }
 
     #[tokio::test]

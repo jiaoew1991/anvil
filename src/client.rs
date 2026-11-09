@@ -48,6 +48,14 @@ pyo3::create_exception!(
      retrying cannot succeed. A RuntimeError, so older handlers still catch it."
 );
 
+pyo3::create_exception!(
+    anvil_py,
+    QueueFinishedError,
+    pyo3::exceptions::PyRuntimeError,
+    "A redrive was refused because the queue is marked finished: its \
+     consumers may already have been told it drained and exited."
+);
+
 fn status_to_pyerr(status: tonic::Status) -> PyErr {
     let msg = format!("{}: {}", status.code(), status.message());
     match status.code() {
@@ -127,7 +135,7 @@ pub struct DeadLetter {
     /// Deliveries it had, the last one included.
     #[pyo3(get)]
     pub delivery_count: u32,
-    /// "nack_limit", "reclaim_limit" or "rejected".
+    /// Why it died, as `DeadLetter.cause` in anvil.proto names it.
     #[pyo3(get)]
     pub cause: String,
     /// The last nack's reason; empty for a reclaim.
@@ -900,7 +908,7 @@ impl AnvilRustClient {
     }
 
     // ========================================================================
-    // Admin API (unchanged)
+    // Admin API
     // ========================================================================
 
     /// Creates `queue`, or updates its bound and delivery limit. A
@@ -1036,7 +1044,8 @@ impl AnvilRustClient {
 
     /// Returns dead letters to their queue with a fresh delivery count.
     /// Returns `{"redriven": [...], "missing": [...]}`; a msg_id that holds
-    /// no dead letter is missing, so a retry is safe.
+    /// no dead letter is missing, so a retry is safe. Raises
+    /// `QueueFinishedError` for a queue marked finished.
     fn redrive_dead_letters(
         &self,
         py: Python<'_>,
@@ -1048,10 +1057,16 @@ impl AnvilRustClient {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::RedriveDeadLettersRequest { queue, msg_ids };
+                // The only claim-free FAILED_PRECONDITION: no ClaimLostError.
                 client
                     .redrive_dead_letters(request)
                     .await
-                    .map_err(status_to_pyerr)
+                    .map_err(|status| match status.code() {
+                        tonic::Code::FailedPrecondition => {
+                            QueueFinishedError::new_err(status.message().to_string())
+                        }
+                        _ => status_to_pyerr(status),
+                    })
                     .map(|r| r.into_inner())
             })
         })?;
