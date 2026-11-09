@@ -11,13 +11,13 @@ cd "$(dirname "$0")/.."
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-# One target directory for every source tree, so the dependencies the
-# releases share build once.
-export CARGO_TARGET_DIR=$PWD/target
-
-# Runs format-compat test <test> of the source tree <dir> on store <store>.
+# Runs format-compat test $2 of source tree $1, built into target directory
+# $4, on store $3. Each release builds into a directory of its own: cargo
+# names a package's test binary by its name and version, not its path, so a
+# shared directory would run one tree's binary for another's when the
+# versions match, as they do for this code until its release bumps them.
 run() {
-  (cd "$1" && ANVIL_FORMAT_COMPAT_DIR=$3 cargo test --locked --lib \
+  (cd "$1" && CARGO_TARGET_DIR=$4 ANVIL_FORMAT_COMPAT_DIR=$3 cargo test --locked --lib \
     "format_compat::tests::$2" -- --ignored --exact)
 }
 
@@ -28,18 +28,18 @@ for tag in $(git tag --list 'v*' --sort=version:refname); do
   mkdir -p "$work/src/$tag"
   git archive "$tag" | tar -x -C "$work/src/$tag"
   echo "::group::writer of $tag"
-  run "$work/src/$tag" format_compat_write "$work/store/$tag"
+  run "$work/src/$tag" format_compat_write "$work/store/$tag" "$PWD/target/compat/$tag"
   echo "::endgroup::"
   stores+=("$tag")
 done
 echo "::group::writer of this code"
-run . format_compat_write "$work/store/current"
+run . format_compat_write "$work/store/current" "$PWD/target"
 echo "::endgroup::"
 stores+=(current)
 
 for store in "${stores[@]}"; do
   echo "::group::verifier on the store of $store"
-  run . format_compat_verify "$work/store/$store"
+  run . format_compat_verify "$work/store/$store" "$PWD/target"
   echo "::endgroup::"
 done
 echo "this code reads the stores of: ${stores[*]}"
