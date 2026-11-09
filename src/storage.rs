@@ -50,6 +50,8 @@ pub(crate) const GC_PASS_KEYS_MAX: usize = 1_000_000;
 /// Width of the zero-padded seq in a pending key, enough for any u64, so
 /// keys sort in seq order.
 const PENDING_SEQ_DIGITS: usize = 20;
+/// Width of the zero-padded timestamp in an acked key.
+const ACKED_TIMESTAMP_DIGITS: usize = 20;
 
 /// On-disk form of a message body. Protobuf rather than JSON because JSON
 /// encodes the payload bytes as a number array, inflating it about 3.5x, and
@@ -501,7 +503,36 @@ impl AnvilStorage {
     }
 
     fn acked_key(queue: &str, timestamp_ns: u64, msg_id: &str) -> Vec<u8> {
-        format!("acked:{}:{:020}:{}", queue, timestamp_ns, msg_id).into_bytes()
+        format!(
+            "acked:{queue}:{timestamp_ns:0width$}:{msg_id}",
+            width = ACKED_TIMESTAMP_DIGITS
+        )
+        .into_bytes()
+    }
+
+    /// Queue and msg_id of a `claimed:{queue}:{msg_id}` key. A queue name may
+    /// contain ':' but a msg_id (a UUID) never does, so the key splits at its
+    /// last ':'. A prefix scan for queue `q` also returns the keys of a queue
+    /// named `q:...`; callers compare the parsed queue to tell them apart.
+    fn parse_claimed_key(key: &[u8]) -> Option<(&str, &str)> {
+        std::str::from_utf8(key)
+            .ok()?
+            .strip_prefix("claimed:")?
+            .rsplit_once(':')
+    }
+
+    /// Queue, timestamp and msg_id of an `acked:{queue}:{timestamp}:{msg_id}`
+    /// key, split from the right for the reason `parse_claimed_key` gives.
+    fn parse_acked_key(key: &[u8]) -> Option<(&str, u64, &str)> {
+        let rest = std::str::from_utf8(key).ok()?.strip_prefix("acked:")?;
+        let (rest, msg_id) = rest.rsplit_once(':')?;
+        let (queue, timestamp) = rest.rsplit_once(':')?;
+        if timestamp.len() != ACKED_TIMESTAMP_DIGITS
+            || !timestamp.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        Some((queue, timestamp.parse().ok()?, msg_id))
     }
 
     fn state_key(namespace: &str, key: &str) -> Vec<u8> {
@@ -1633,13 +1664,14 @@ impl AnvilStorage {
         let mut iter = self.db.scan_prefix(&prefix, ..).await?;
 
         while let Some(kv) = iter.next().await? {
-            let key_str = String::from_utf8_lossy(&kv.key);
-            let parts: Vec<&str> = key_str.split(':').collect();
-
-            if parts.len() >= 3 {
-                if let Ok(claim_info) = serde_json::from_slice::<ClaimInfo>(&kv.value) {
-                    results.push((parts[1].to_string(), parts[2].to_string(), claim_info));
-                }
+            let Some((key_queue, msg_id)) = Self::parse_claimed_key(&kv.key) else {
+                continue;
+            };
+            if queue.is_some_and(|queue| queue != key_queue) {
+                continue;
+            }
+            if let Ok(claim_info) = serde_json::from_slice::<ClaimInfo>(&kv.value) {
+                results.push((key_queue.to_string(), msg_id.to_string(), claim_info));
             }
         }
 
@@ -1660,14 +1692,13 @@ impl AnvilStorage {
         let mut iter = self.db.scan_prefix(&prefix, ..).await?;
 
         while let Some(kv) = iter.next().await? {
-            let key_str = String::from_utf8_lossy(&kv.key);
-            let parts: Vec<&str> = key_str.split(':').collect();
-
-            if parts.len() >= 4 {
-                if let Ok(timestamp_ns) = parts[2].parse::<u64>() {
-                    results.push((parts[1].to_string(), timestamp_ns, parts[3].to_string()));
-                }
+            let Some((key_queue, timestamp_ns, msg_id)) = Self::parse_acked_key(&kv.key) else {
+                continue;
+            };
+            if queue.is_some_and(|queue| queue != key_queue) {
+                continue;
             }
+            results.push((key_queue.to_string(), timestamp_ns, msg_id.to_string()));
         }
 
         Ok(results)
@@ -1749,6 +1780,8 @@ impl AnvilStorage {
         // Acked keys sort by timestamp within a queue, so each queue's
         // expired entries are one contiguous range ending at the cutoff:
         // the pass never touches live entries, unlike a full prefix scan.
+        // The range can also hold entries of a queue named `{queue}:...`, of
+        // any age; those are skipped here and expire in their own queue's pass.
         for queue in self.list_queues().await? {
             let start = format!("acked:{}:", queue).into_bytes();
             let end = Self::acked_key(&queue, cutoff_ns, "");
@@ -1759,6 +1792,13 @@ impl AnvilStorage {
                 let Some(kv) = iter.next().await? else {
                     break;
                 };
+                let Some((key_queue, timestamp_ns, _)) = Self::parse_acked_key(&kv.key) else {
+                    continue;
+                };
+                if key_queue != queue {
+                    continue;
+                }
+                assert!(timestamp_ns < cutoff_ns);
                 batch.delete(&kv.key);
                 batch_keys += 1;
                 deleted += 1;
@@ -2623,6 +2663,59 @@ pub(crate) mod tests {
 
         let acked = storage.scan_acked(Some(queue)).await.unwrap();
         assert_eq!(acked.len(), 1);
+    }
+
+    /// Goal: a queue whose name extends another's with ':' is parsed whole,
+    /// so scans, recovery and the other queue's operations each see only
+    /// their own entries. Method: claim one message in `colon` and one in
+    /// `colon:00`, recover both with every lease dead, then ack one of them
+    /// and check each scan by queue and across all queues.
+    #[tokio::test]
+    async fn test_queue_name_containing_colon_is_parsed_whole() {
+        let storage = AnvilStorage::new("memory://").await.unwrap();
+        let queues = ["colon", "colon:00"];
+        for queue in queues {
+            storage.create_queue(queue, 0).await.unwrap();
+            let msg = Message::new(queue.to_string(), b"hello".to_vec());
+            storage.push_message(queue, &msg).await.unwrap();
+            storage
+                .claim_messages(queue, 1, "worker-1", "lease-1")
+                .await
+                .unwrap();
+        }
+        for queue in queues {
+            let claimed = storage.scan_claimed(Some(queue)).await.unwrap();
+            assert_eq!(claimed.len(), 1, "claims of {queue}");
+            assert_eq!(claimed[0].0, queue);
+        }
+
+        let reclaimed = storage
+            .recover_expired_claims(30.0, 60.0, None)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed, 2, "a claim in `colon:00` was not reclaimed");
+        assert!(storage.scan_claimed(None).await.unwrap().is_empty());
+
+        let (extended, base) = (queues[1], queues[0]);
+        let claimed = storage
+            .claim_messages(extended, 1, "worker-1", "lease-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.len(),
+            1,
+            "the reclaimed message was not redelivered"
+        );
+        let (msg_ids, claim_tokens) = split_claims(&claimed);
+        storage
+            .ack_messages(extended, &msg_ids, &claim_tokens, "worker-1", "lease-1")
+            .await
+            .unwrap();
+        assert!(storage.scan_acked(Some(base)).await.unwrap().is_empty());
+        let acked = storage.scan_acked(None).await.unwrap();
+        assert_eq!(acked.len(), 1);
+        assert_eq!(acked[0].0, extended);
+        assert_eq!(acked[0].2, msg_ids[0]);
     }
 
     /// A claim is not awaited for durability, so a crash right after it may
