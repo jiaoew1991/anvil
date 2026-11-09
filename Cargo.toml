@@ -1,6 +1,6 @@
 [package]
 name = "anvil-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Single-queue multi-consumer work queue with gRPC interface"
 license = "Apache-2.0"
