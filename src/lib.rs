@@ -37,6 +37,8 @@ mod chaos_api;
 #[cfg(test)]
 mod chaos_model;
 #[cfg(test)]
+mod chaos_network;
+#[cfg(test)]
 mod chaos_worker;
 #[cfg(test)]
 mod dst;
