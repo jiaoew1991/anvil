@@ -44,9 +44,7 @@ mod tests {
     /// Pushes, claims and acks `count` messages at the current sim time and
     /// returns their acked entries.
     async fn ack_new(storage: &AnvilStorage, queue: &str, count: usize) -> Vec<AckedEntry> {
-        let messages: Vec<Message> = (0..count)
-            .map(|_| Message::new(queue.to_string(), b"done".to_vec()))
-            .collect();
+        let messages: Vec<Message> = (0..count).map(|_| Message::new(b"done".to_vec())).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage
             .claim_messages(queue, count, "worker", "lease")
@@ -74,9 +72,7 @@ mod tests {
     }
 
     async fn add_live(storage: &AnvilStorage, queue: &str) -> Live {
-        let held: Vec<Message> = (0..HELD)
-            .map(|_| Message::new(queue.to_string(), b"held".to_vec()))
-            .collect();
+        let held: Vec<Message> = (0..HELD).map(|_| Message::new(b"held".to_vec())).collect();
         storage.push_messages(queue, &held).await.unwrap();
         let held = storage
             .claim_messages(queue, HELD, "holder", "holder-lease")
@@ -84,7 +80,7 @@ mod tests {
             .unwrap();
         assert_eq!(held.len(), HELD);
         let pending: Vec<Message> = (0..PENDING)
-            .map(|_| Message::new(queue.to_string(), b"pending".to_vec()))
+            .map(|_| Message::new(b"pending".to_vec()))
             .collect();
         storage.push_messages(queue, &pending).await.unwrap();
         Live {

@@ -515,7 +515,7 @@ mod tests {
             .await
             .unwrap();
 
-        let output = Message::new(downstream.to_string(), b"late".to_vec());
+        let output = Message::new(b"late".to_vec());
         assert_storage_fenced(
             storage
                 .ack_and_forward(
@@ -801,10 +801,7 @@ mod tests {
     }
 
     async fn push_batch(storage: &AnvilStorage, queue: &str, count: usize) -> Vec<String> {
-        let messages: Vec<Message> = payloads(count)
-            .into_iter()
-            .map(|p| Message::new(queue.to_string(), p))
-            .collect();
+        let messages: Vec<Message> = payloads(count).into_iter().map(Message::new).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         messages.into_iter().map(|m| m.msg_id).collect()
     }
@@ -890,7 +887,7 @@ mod tests {
                 }
                 if let Some(poison) = park {
                     let (ids, tokens) = split_claims(std::slice::from_ref(&poison));
-                    let letter = Message::new(dlq.to_string(), poison.message.payload);
+                    let letter = Message::new(poison.message.payload);
                     storage
                         .ack_and_forward(queue, &ids, &tokens, "worker", &lease, dlq, &[letter])
                         .await
@@ -1341,7 +1338,7 @@ mod tests {
         let _guard = SIM_TIME_LOCK.lock().unwrap();
         let (dir, db_path) = crash_test_db_path("chaos_bounded");
         let queue = "bounded";
-        let over = || Message::new(queue.to_string(), b"over".to_vec());
+        let over = || Message::new(b"over".to_vec());
 
         let runtime = Runtime::new().unwrap();
         let storage = runtime.block_on(async {
@@ -1405,7 +1402,7 @@ mod tests {
                 .unwrap();
             let (ids, tokens) = split_claims(&claimed);
             let forward = || {
-                let output = Message::new(downstream.clone(), b"out".to_vec());
+                let output = Message::new(b"out".to_vec());
                 let (storage, queue, ids, tokens) = (&storage, &queue, &ids, &tokens);
                 let downstream = &downstream;
                 async move {

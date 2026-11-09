@@ -16,6 +16,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true) // Rust tonic client exposed via PyO3
-        .compile_protos(&["proto/anvil.proto"], &["proto/"])?;
+        .compile_protos(&["proto/anvil.proto", "proto/storage.proto"], &["proto/"])?;
     Ok(())
 }

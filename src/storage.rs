@@ -14,19 +14,8 @@
 
 // SlateDB storage layer for Anvil — atomic counter model
 //
-// Key Schema:
-//   seq_push:{queue}                -> u64 LE  (next push sequence)
-//   seq_claim:{queue}               -> u64 LE  (next claim sequence)
-//   cnt_total_pushed:{queue}        -> u64 LE  (lifetime push count)
-//   cnt_total_claimed:{queue}       -> u64 LE  (monotonic claimed count)
-//   cnt_total_unclaimed:{queue}     -> u64 LE  (monotonic unclaim count: ack + nack)
-//   cnt_total_acked:{queue}         -> u64 LE  (lifetime ack count)
-//   pending:{queue}:{seq:020d}      -> msg_id
-//   msg:{queue}:{msg_id}            -> Message JSON
-//   claimed:{queue}:{msg_id}        -> ClaimInfo JSON
-//   acked:{queue}:{ts:020d}:{msg_id} -> ""
-//   state:{namespace}:{key}         -> value bytes (namespace has no ':')
-//   max_pending:{queue}             -> u64 LE  (bound of a bounded queue)
+// The keys and values it stores are the storage format, specified in
+// docs/storage-format.md and built by `keys` and `format` alone.
 //
 // Hot paths (push, claim, ack, nack) use in-memory atomic counters
 // with CAS loops instead of SlateDB SerializableSnapshot transactions.
@@ -38,8 +27,10 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
-use slatedb::{Db, DbReadOps, Error as SlateError, MergeOperator, MergeOperatorError, WriteBatch};
+use slatedb::{Db, Error as SlateError, MergeOperator, MergeOperatorError, WriteBatch};
 
+use crate::format::{self, FormatError, FORMAT_VERSION};
+use crate::keys;
 use crate::state::lease_expired;
 use crate::types::{mono_now, now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta};
 
@@ -49,72 +40,6 @@ pub(crate) const GC_BATCH_KEYS_MAX: usize = 10_000;
 
 /// Upper bound on keys one GC pass deletes; the next pass resumes the rest.
 pub(crate) const GC_PASS_KEYS_MAX: usize = 1_000_000;
-
-/// Width of the zero-padded seq in a pending key, enough for any u64, so
-/// keys sort in seq order.
-const PENDING_SEQ_DIGITS: usize = 20;
-/// Width of the zero-padded timestamp in an acked key.
-const ACKED_TIMESTAMP_DIGITS: usize = 20;
-
-/// On-disk form of a message body. Protobuf rather than JSON because JSON
-/// encodes the payload bytes as a number array, inflating it about 3.5x, and
-/// the body is the bulk of what the queue writes.
-#[derive(Clone, PartialEq, prost::Message)]
-struct StoredMessage {
-    #[prost(string, tag = "1")]
-    msg_id: String,
-    #[prost(bytes = "vec", tag = "2")]
-    payload: Vec<u8>,
-    #[prost(double, tag = "3")]
-    created_at: f64,
-    #[prost(map = "string, string", tag = "4")]
-    metadata: HashMap<String, String>,
-}
-
-/// Value of a `pending` key: which message waits at this seq, and how often
-/// it has been delivered before, so redeliveries keep counting.
-#[derive(Clone, PartialEq, prost::Message)]
-struct PendingEntry {
-    #[prost(string, tag = "1")]
-    msg_id: String,
-    #[prost(uint32, tag = "2")]
-    delivery_count: u32,
-}
-
-fn encode_pending(msg_id: &str, delivery_count: u32) -> Vec<u8> {
-    prost::Message::encode_to_vec(&PendingEntry {
-        msg_id: msg_id.to_string(),
-        delivery_count,
-    })
-}
-
-fn decode_pending(bytes: &[u8]) -> Result<PendingEntry, StorageError> {
-    let entry: PendingEntry = prost::Message::decode(bytes)
-        .map_err(|e| SlateError::invalid(format!("corrupt pending entry: {e}")))?;
-    assert!(!entry.msg_id.is_empty());
-    Ok(entry)
-}
-
-fn encode_message(msg: &Message) -> Vec<u8> {
-    prost::Message::encode_to_vec(&StoredMessage {
-        msg_id: msg.msg_id.clone(),
-        payload: msg.payload.clone(),
-        created_at: msg.created_at,
-        metadata: msg.metadata.clone(),
-    })
-}
-
-fn decode_message(queue: &str, bytes: &[u8]) -> Result<Message, StorageError> {
-    let stored: StoredMessage = prost::Message::decode(bytes)
-        .map_err(|e| SlateError::invalid(format!("corrupt message body: {e}")))?;
-    Ok(Message {
-        msg_id: stored.msg_id,
-        queue: queue.to_string(),
-        payload: stored.payload,
-        created_at: stored.created_at,
-        metadata: stored.metadata,
-    })
-}
 
 pub type StorageError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -159,20 +84,13 @@ pub fn is_closed(error: &StorageError) -> bool {
         .is_some_and(|e| matches!(e.kind(), slatedb::ErrorKind::Closed(_)))
 }
 
-/// Refuses a state namespace that cannot be stored unambiguously. A
-/// namespace with ':' would make `state_key` read `job:a`/`k` and
-/// `job`/`a:k` as one key; refusing it keeps every existing key where it is,
-/// where escaping would move them.
+/// Refuses a state request without a namespace. Any other namespace,
+/// ':' and NUL included, is stored apart from every other (see `keys`).
 pub fn check_state_namespace(namespace: &str) -> Result<(), Rejection> {
     if namespace.is_empty() {
         return Err(Rejection::InvalidArgument(
             "state without namespace".to_string(),
         ));
-    }
-    if namespace.contains(':') {
-        return Err(Rejection::InvalidArgument(format!(
-            "state namespace {namespace:?} contains ':'"
-        )));
     }
     Ok(())
 }
@@ -466,20 +384,17 @@ enum Wait {
 }
 
 /// Queue metadata for O(1) operations (return type for get_queue_stats)
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct QueueMeta {
     /// The claim cursor less the seqs returned behind it, so that
     /// `push_seq - claim_seq` counts every claimable message.
     pub claim_seq: u64,
     pub push_seq: u64,
     /// Number of currently claimed messages (O(1) stats)
-    #[serde(default)]
     pub claimed_count: u64,
     /// Total messages ever pushed (lifetime counter)
-    #[serde(default)]
     pub total_pushed: u64,
     /// Total messages ever acked (lifetime counter)
-    #[serde(default)]
     pub total_acked: u64,
 }
 
@@ -497,28 +412,11 @@ pub struct AckOptions<'a> {
 }
 
 /// Sums the u64 increments merged into a queue's lifetime totals
-/// (`cnt_total_pushed`, `cnt_total_acked`). Each operation merges its own
+/// (`keys::total_pushed`, `keys::total_acked`). Each operation merges its own
 /// increment in its own batch, so the durable total is exactly the sum of
 /// the durable operations, whatever order concurrent writers reach the WAL
 /// in; a written absolute value would let an older one land last.
 struct TotalSumMergeOperator;
-
-impl TotalSumMergeOperator {
-    fn decode(key: &Bytes, value: &Bytes) -> Result<u64, MergeOperatorError> {
-        let bytes: [u8; 8] =
-            value
-                .as_ref()
-                .try_into()
-                .map_err(|_| MergeOperatorError::Callback {
-                    message: format!(
-                        "total {} holds {} bytes, not a u64",
-                        String::from_utf8_lossy(key),
-                        value.len()
-                    ),
-                })?;
-        Ok(u64::from_le_bytes(bytes))
-    }
-}
 
 impl MergeOperator for TotalSumMergeOperator {
     fn merge(
@@ -536,24 +434,40 @@ impl MergeOperator for TotalSumMergeOperator {
         existing_value: Option<Bytes>,
         operands: &[Bytes],
     ) -> Result<Bytes, MergeOperatorError> {
-        if !key.starts_with(b"cnt_total_") {
+        // Any other value is no u64 to sum: a merge on one is a bug that
+        // must fail the write rather than corrupt the value.
+        if !keys::is_total(key) {
             return Err(MergeOperatorError::Callback {
-                message: format!(
-                    "merge on {}, which is not a total",
-                    String::from_utf8_lossy(key)
-                ),
+                message: format!("merge on {:02x?}, which is not a total", key.as_ref()),
             });
         }
+        let decode = |value: &Bytes| {
+            format::decode_total(value).map_err(|e| MergeOperatorError::Callback {
+                message: format!("total {:02x?}: {e}", key.as_ref()),
+            })
+        };
         let mut total = match &existing_value {
-            Some(value) => Self::decode(key, value)?,
+            Some(value) => decode(value)?,
             None => 0,
         };
         for operand in operands {
-            total += Self::decode(key, operand)?;
+            total += decode(operand)?;
         }
-        Ok(Bytes::copy_from_slice(&total.to_le_bytes()))
+        Ok(Bytes::copy_from_slice(&format::encode_total(total)))
     }
 }
+
+/// A migration of the store from one format to the next. It must be
+/// idempotent and resumable after a crash at any point, and write the marker
+/// of its target format as its last durable write; docs/storage-format.md
+/// lays out the procedure.
+type Migration =
+    for<'a> fn(&'a AnvilStorage) -> futures::future::BoxFuture<'a, Result<(), StorageError>>;
+
+/// `MIGRATIONS[i]` migrates format `i + 1` to format `i + 2`. Its length is
+/// what makes the chain cover every version: bumping `FORMAT_VERSION`
+/// without adding the migration to it does not compile.
+const MIGRATIONS: [Migration; FORMAT_VERSION as usize - 1] = [];
 
 /// Anvil storage backed by SlateDB with in-memory atomic counters
 pub struct AnvilStorage {
@@ -655,8 +569,9 @@ impl AnvilStorage {
         Self::open(db_root, object_store).await
     }
 
-    /// Opens the database at `db_root` inside `object_store`. Tests reach the
-    /// store through this to put a fault-injecting one under the broker.
+    /// Opens the database at `db_root` inside `object_store`, refusing or
+    /// migrating it as its format requires (see `open_format`). Tests reach
+    /// the store through this to put a fault-injecting one under the broker.
     pub(crate) async fn open(
         db_root: String,
         object_store: Arc<dyn slatedb::object_store::ObjectStore>,
@@ -665,7 +580,7 @@ impl AnvilStorage {
             .with_merge_operator(Arc::new(TotalSumMergeOperator))
             .build()
             .await?;
-        Ok(Self {
+        let storage = Self {
             db,
             counters: DashMap::new(),
             counters_loading: Arc::new(tokio::sync::Mutex::new(())),
@@ -674,7 +589,53 @@ impl AnvilStorage {
             settling: Arc::new(DashSet::new()),
             taken_at: DashMap::new(),
             renewed_at: DashMap::new(),
-        })
+        };
+        if let Err(e) = storage.open_format().await {
+            // A refused store is left as it was found, and closed, so the
+            // caller can open it again with a release that reads it.
+            if let Err(close) = storage.db.close().await {
+                tracing::warn!("closing a store refused at open: {close}");
+            }
+            return Err(e);
+        }
+        Ok(storage)
+    }
+
+    /// Brings the store to `FORMAT_VERSION` before anything else reads it:
+    /// stamps an empty store, migrates an older one, and refuses one written
+    /// by a newer release or by an unversioned one. The marker is the
+    /// smallest key there is, so the first key of the store tells all three
+    /// apart.
+    async fn open_format(&self) -> Result<(), StorageError> {
+        let first = self.db.scan(..).await?.next().await?;
+        let mut version = match first {
+            None => {
+                // One put, so a crash leaves the store empty or stamped.
+                let mut batch = WriteBatch::new();
+                batch.put(keys::FORMAT, format::encode_format(FORMAT_VERSION));
+                return self.commit(batch, Wait::Durable, Landing::default()).await;
+            }
+            Some(kv) if kv.key == keys::FORMAT => format::decode_format(&kv.value)?,
+            Some(_) => return Err(Box::new(FormatError::Unversioned)),
+        };
+        if version > FORMAT_VERSION {
+            return Err(Box::new(FormatError::Newer { version }));
+        }
+        while version < FORMAT_VERSION {
+            MIGRATIONS[version as usize - 1](self).await?;
+            let migrated = match self.db.get(keys::FORMAT).await? {
+                Some(marker) => format::decode_format(&marker)?,
+                None => 0,
+            };
+            assert_eq!(
+                migrated,
+                version + 1,
+                "the migration from format {version} must leave the marker at {}",
+                version + 1
+            );
+            version = migrated;
+        }
+        Ok(())
     }
 
     /// Writes `batch` and then waits as `wait` says. SlateDB's `write`
@@ -740,123 +701,6 @@ impl AnvilStorage {
         Ok(())
     }
 
-    // === Key Generation ===
-
-    /// Legacy meta key (used for migration from old format)
-    fn meta_key(queue: &str) -> Vec<u8> {
-        format!("meta:{}", queue).into_bytes()
-    }
-
-    fn seq_push_key(queue: &str) -> Vec<u8> {
-        format!("seq_push:{}", queue).into_bytes()
-    }
-
-    /// Legacy: the claim cursor is derived from the pending keys on load.
-    fn seq_claim_key(queue: &str) -> Vec<u8> {
-        format!("seq_claim:{}", queue).into_bytes()
-    }
-
-    fn cnt_total_pushed_key(queue: &str) -> Vec<u8> {
-        format!("cnt_total_pushed:{}", queue).into_bytes()
-    }
-
-    /// Legacy: the in-flight count is derived from the claimed keys on load.
-    fn cnt_total_claimed_key(queue: &str) -> Vec<u8> {
-        format!("cnt_total_claimed:{}", queue).into_bytes()
-    }
-
-    /// Legacy, like `cnt_total_claimed_key`.
-    fn cnt_total_unclaimed_key(queue: &str) -> Vec<u8> {
-        format!("cnt_total_unclaimed:{}", queue).into_bytes()
-    }
-
-    fn cnt_total_acked_key(queue: &str) -> Vec<u8> {
-        format!("cnt_total_acked:{}", queue).into_bytes()
-    }
-
-    fn pending_key(queue: &str, seq: u64) -> Vec<u8> {
-        format!("pending:{queue}:{seq:0width$}", width = PENDING_SEQ_DIGITS).into_bytes()
-    }
-
-    fn msg_key(queue: &str, msg_id: &str) -> Vec<u8> {
-        format!("msg:{}:{}", queue, msg_id).into_bytes()
-    }
-
-    fn claimed_key(queue: &str, msg_id: &str) -> Vec<u8> {
-        format!("claimed:{}:{}", queue, msg_id).into_bytes()
-    }
-
-    fn acked_key(queue: &str, timestamp_ns: u64, msg_id: &str) -> Vec<u8> {
-        format!(
-            "acked:{queue}:{timestamp_ns:0width$}:{msg_id}",
-            width = ACKED_TIMESTAMP_DIGITS
-        )
-        .into_bytes()
-    }
-
-    /// Queue and msg_id of a `claimed:{queue}:{msg_id}` key. A queue name may
-    /// contain ':' but a msg_id (a UUID) never does, so the key splits at its
-    /// last ':'. A prefix scan for queue `q` also returns the keys of a queue
-    /// named `q:...`; callers compare the parsed queue to tell them apart.
-    fn parse_claimed_key(key: &[u8]) -> Option<(&str, &str)> {
-        std::str::from_utf8(key)
-            .ok()?
-            .strip_prefix("claimed:")?
-            .rsplit_once(':')
-    }
-
-    /// Queue, timestamp and msg_id of an `acked:{queue}:{timestamp}:{msg_id}`
-    /// key, split from the right for the reason `parse_claimed_key` gives.
-    fn parse_acked_key(key: &[u8]) -> Option<(&str, u64, &str)> {
-        let rest = std::str::from_utf8(key).ok()?.strip_prefix("acked:")?;
-        let (rest, msg_id) = rest.rsplit_once(':')?;
-        let (queue, timestamp) = rest.rsplit_once(':')?;
-        if timestamp.len() != ACKED_TIMESTAMP_DIGITS
-            || !timestamp.bytes().all(|b| b.is_ascii_digit())
-        {
-            return None;
-        }
-        Some((queue, timestamp.parse().ok()?, msg_id))
-    }
-
-    fn state_key(namespace: &str, key: &str) -> Vec<u8> {
-        assert!(
-            check_state_namespace(namespace).is_ok(),
-            "unchecked state namespace {namespace:?}"
-        );
-        format!("state:{}:{}", namespace, key).into_bytes()
-    }
-
-    fn max_pending_key(queue: &str) -> Vec<u8> {
-        format!("max_pending:{}", queue).into_bytes()
-    }
-
-    fn finished_key(queue: &str) -> Vec<u8> {
-        format!("finished:{}", queue).into_bytes()
-    }
-
-    fn group_meta_key(group_name: &str) -> Vec<u8> {
-        format!("group_meta:{}", group_name).into_bytes()
-    }
-
-    // === Counter helpers ===
-
-    fn read_u64_le(data: &[u8]) -> u64 {
-        if data.len() >= 8 {
-            u64::from_le_bytes(data[..8].try_into().unwrap())
-        } else {
-            0
-        }
-    }
-
-    /// Write the zero counter keys of a new queue into a WriteBatch.
-    fn write_zero_counters(batch: &mut WriteBatch, queue: &str) {
-        let zero = 0u64.to_le_bytes();
-        batch.put(Self::seq_push_key(queue), zero);
-        batch.put(Self::cnt_total_pushed_key(queue), zero);
-        batch.put(Self::cnt_total_acked_key(queue), zero);
-    }
-
     /// Admits a write to `queue`, creating the queue on first use. A write
     /// that finds the queue being deleted retries: `delete_queue` removed
     /// the counters it found before closing them, so the retry waits for
@@ -905,7 +749,7 @@ impl AnvilStorage {
         let mut hold = SettlementHold::new(self.settling.clone());
         let mut claims = Vec::with_capacity(msg_ids.len());
         for (msg_id, token) in msg_ids.iter().zip(claim_tokens.iter()) {
-            if !hold.take(Self::claimed_key(queue, msg_id), token) {
+            if !hold.take(keys::claim(queue, msg_id), token) {
                 return Err(Box::new(Rejection::Fenced(format!(
                     "claim_settling: queue={queue}, msg_id={msg_id} is being settled concurrently"
                 ))));
@@ -977,14 +821,14 @@ impl AnvilStorage {
     ) -> Result<ClaimInfo, StorageError> {
         let claim_data = self
             .db
-            .get(&Self::claimed_key(queue, msg_id))
+            .get(keys::claim(queue, msg_id))
             .await?
             .ok_or_else(|| {
                 Rejection::Fenced(format!(
                     "message_not_claimed: queue={queue}, msg_id={msg_id}"
                 ))
             })?;
-        let claim_info: ClaimInfo = serde_json::from_slice(&claim_data)?;
+        let claim_info = format::decode_claim(msg_id, &claim_data)?;
 
         if claim_info.claim_token != token {
             return Err(Box::new(Rejection::Fenced(format!(
@@ -1058,71 +902,48 @@ impl AnvilStorage {
         Ok(())
     }
 
-    /// Seq of a pending key of `queue`, or `None` for a key of another queue
-    /// that shares the prefix (a queue named `{queue}:...`).
-    fn pending_seq(queue: &str, key: &[u8]) -> Option<u64> {
-        let seq = key.strip_prefix(format!("pending:{queue}:").as_bytes())?;
-        if seq.len() != PENDING_SEQ_DIGITS || !seq.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        std::str::from_utf8(seq).ok()?.parse().ok()
-    }
-
-    /// The claim and push cursors the pending keys of `queue` imply: claiming
-    /// resumes at the oldest pending entry, and pushing continues past both
-    /// the newest one and the persisted push cursor. Reads only the oldest
-    /// entry and the entries at or past the persisted cursor.
-    async fn derive_seq_range(
-        &self,
-        queue: &str,
-        push_seq_persisted: u64,
-    ) -> Result<(u64, u64), StorageError> {
-        let end = format!("pending:{queue};").into_bytes();
-
-        let mut push_seq = push_seq_persisted;
-        let mut iter = self
+    /// The claim and push cursors the pending keys of `queue` imply:
+    /// claiming resumes at the oldest pending entry, and pushing continues
+    /// past the newest one. Reads only those two entries.
+    async fn derive_seq_range(&self, queue: &str) -> Result<(u64, u64), StorageError> {
+        let newest = self
             .db
-            .scan(Self::pending_key(queue, push_seq_persisted)..end.clone())
+            .scan_with_options(
+                keys::pending_of(queue),
+                &slatedb::config::ScanOptions::default()
+                    .with_order(slatedb::IterationOrder::Descending),
+            )
+            .await?
+            .next()
             .await?;
-        while let Some(kv) = iter.next().await? {
-            if let Some(seq) = Self::pending_seq(queue, &kv.key) {
-                push_seq = push_seq.max(seq + 1);
-            }
-        }
-
-        let mut claim_seq = push_seq;
-        let mut iter = self.db.scan(Self::pending_key(queue, 0)..end).await?;
-        while let Some(kv) = iter.next().await? {
-            if let Some(seq) = Self::pending_seq(queue, &kv.key) {
-                claim_seq = seq;
-                break;
-            }
-        }
-        assert!(claim_seq <= push_seq);
-        Ok((claim_seq, push_seq))
+        let Some(newest) = newest else {
+            return Ok((0, 0));
+        };
+        let oldest = self
+            .db
+            .scan(keys::pending_of(queue))
+            .await?
+            .next()
+            .await?
+            .expect("the newest pending entry is there to scan");
+        let (_, claim_seq) = keys::parse_pending(&oldest.key)?;
+        let (_, newest_seq) = keys::parse_pending(&newest.key)?;
+        assert!(claim_seq <= newest_seq);
+        Ok((claim_seq, newest_seq + 1))
     }
 
     /// Number of messages of `queue` claimed and not yet settled.
     async fn count_claimed(&self, queue: &str) -> Result<u64, StorageError> {
-        let prefix = format!("claimed:{queue}:");
-        let mut iter = self.db.scan_prefix(prefix.as_bytes(), ..).await?;
+        let mut iter = self.db.scan(keys::claims(Some(queue))).await?;
         let mut count = 0;
-        while let Some(kv) = iter.next().await? {
-            // A msg_id has no ':'; a key with one belongs to a queue named
-            // `{queue}:...`.
-            if !kv.key[prefix.len()..].contains(&b':') {
-                count += 1;
-            }
+        while iter.next().await?.is_some() {
+            count += 1;
         }
         Ok(count)
     }
 
     /// Counters of a created queue, or `None` for a queue that does not
     /// exist, which this never creates.
-    /// 1. Check DashMap (fast path)
-    /// 2. If missing, try to load from new counter keys
-    /// 3. If new keys don't exist, fall back to old meta:{queue} JSON (migration)
-    /// 4. Write new counter keys if migrating
     async fn load_counters(&self, queue: &str) -> Result<Option<Arc<QueueCounters>>, StorageError> {
         // Fast path: already in cache
         if let Some(c) = self.counters.get(queue) {
@@ -1144,93 +965,42 @@ impl AnvilStorage {
             return Ok(Some(c.clone()));
         }
 
-        let counters = if let Some(push_seq_data) = self.db.get(&Self::seq_push_key(queue)).await? {
-            // Only the totals are taken as persisted. Cursors and the
-            // in-flight count come from the keys, which every durable batch
-            // keeps exact, so no cursor can lag behind its keys and hide a
-            // pending message.
-            let (claim_seq, push_seq) = self
-                .derive_seq_range(queue, Self::read_u64_le(&push_seq_data))
-                .await?;
-            let claimed_count = self.count_claimed(queue).await?;
-            let total_pushed = self
-                .db
-                .get(&Self::cnt_total_pushed_key(queue))
-                .await?
-                .map(|d| Self::read_u64_le(&d))
-                .unwrap_or(0);
-            let total_acked = self
-                .db
-                .get(&Self::cnt_total_acked_key(queue))
-                .await?
-                .map(|d| Self::read_u64_le(&d))
-                .unwrap_or(0);
-
-            Arc::new(QueueCounters {
-                state: std::sync::Mutex::new(QueueState {
-                    push_seq_committed: push_seq,
-                    push_seq_alloc: push_seq,
-                    claim_seq,
-                    total_pushed,
-                    total_claimed: claimed_count,
-                    total_unclaimed: 0,
-                    total_acked,
-                    ..QueueState::default()
-                }),
-                ..QueueCounters::default()
-            })
-        } else {
-            // Try old meta:{queue} JSON (migration path)
-            let Some(old_meta_data) = self.db.get(&Self::meta_key(queue)).await? else {
-                return Ok(None);
-            };
-            let old_meta: QueueMeta = serde_json::from_slice(&old_meta_data)?;
-
-            // Compute total_claimed and total_unclaimed from old format:
-            // claimed_count = total_claimed - total_unclaimed
-            // Set total_unclaimed = total_acked, total_claimed = claimed_count + total_acked
-            // Then claimed_count = (claimed_count + total_acked) - total_acked = claimed_count. Correct.
-            let migrated_total_claimed = old_meta.claimed_count + old_meta.total_acked;
-            let migrated_total_unclaimed = old_meta.total_acked;
-
-            let c = Arc::new(QueueCounters {
-                state: std::sync::Mutex::new(QueueState {
-                    push_seq_committed: old_meta.push_seq,
-                    push_seq_alloc: old_meta.push_seq,
-                    claim_seq: old_meta.claim_seq,
-                    total_pushed: old_meta.total_pushed,
-                    total_claimed: migrated_total_claimed,
-                    total_unclaimed: migrated_total_unclaimed,
-                    total_acked: old_meta.total_acked,
-                    ..QueueState::default()
-                }),
-                ..QueueCounters::default()
-            });
-
-            // Persist new counter keys
-            let mut batch = WriteBatch::new();
-            batch.put(Self::seq_push_key(queue), old_meta.push_seq.to_le_bytes());
-            batch.put(
-                Self::cnt_total_pushed_key(queue),
-                old_meta.total_pushed.to_le_bytes(),
-            );
-            batch.put(
-                Self::cnt_total_acked_key(queue),
-                old_meta.total_acked.to_le_bytes(),
-            );
-            self.commit(batch, Wait::Durable, Landing::default())
-                .await?;
-
-            c
+        let Some(record) = self.db.get(keys::queue(queue)).await? else {
+            return Ok(None);
         };
-
-        if let Some(limit) = self.db.get(&Self::max_pending_key(queue)).await? {
-            self.max_pending_limits
-                .insert(queue.to_string(), Self::read_u64_le(&limit));
-        }
+        let max_pending = format::decode_queue(&record)?;
+        // Only the totals are taken as persisted. Cursors and the in-flight
+        // count come from the keys, which every durable batch keeps exact,
+        // so no cursor can lag behind its keys and hide a pending message.
+        let (claim_seq, push_seq) = self.derive_seq_range(queue).await?;
+        let claimed_count = self.count_claimed(queue).await?;
+        let total_pushed = self.read_total(keys::total_pushed(queue)).await?;
+        let total_acked = self.read_total(keys::total_acked(queue)).await?;
+        let counters = Arc::new(QueueCounters {
+            state: std::sync::Mutex::new(QueueState {
+                push_seq_committed: push_seq,
+                push_seq_alloc: push_seq,
+                claim_seq,
+                total_pushed,
+                total_claimed: claimed_count,
+                total_unclaimed: 0,
+                total_acked,
+                ..QueueState::default()
+            }),
+            ..QueueCounters::default()
+        });
+        self.set_max_pending(queue, max_pending);
         let previous = self.counters.insert(queue.to_string(), counters.clone());
         assert!(previous.is_none(), "counters of {queue} loaded twice");
         Ok(Some(counters))
+    }
+
+    /// The total at `key`; one never merged into is absent and reads as 0.
+    async fn read_total(&self, key: Vec<u8>) -> Result<u64, StorageError> {
+        match self.db.get(key).await? {
+            Some(value) => Ok(format::decode_total(&value)?),
+            None => Ok(0),
+        }
     }
 
     /// Counters of `queue`, creating the queue if it does not exist: push,
@@ -1243,8 +1013,9 @@ impl AnvilStorage {
         if let Some(counters) = self.load_counters_locked(queue, &loading).await? {
             return Ok(counters);
         }
+        // A queue's totals start absent, which reads as 0.
         let mut batch = WriteBatch::new();
-        Self::write_zero_counters(&mut batch, queue);
+        batch.put(keys::queue(queue), format::encode_queue(0));
         self.commit(batch, Wait::Durable, Landing::default())
             .await?;
         let counters = Arc::new(QueueCounters::default());
@@ -1253,20 +1024,7 @@ impl AnvilStorage {
         Ok(counters)
     }
 
-    // === Queue Metadata (legacy + new) ===
-
-    /// Read QueueMeta from legacy meta:{queue} key.
-    /// Kept for backward compat and migration path.
-    #[allow(dead_code)]
-    async fn get_meta_from_reader<R: DbReadOps + Sync + ?Sized>(
-        reader: &R,
-        queue: &str,
-    ) -> Result<QueueMeta, StorageError> {
-        match reader.get(Self::meta_key(queue)).await? {
-            Some(data) => Ok(serde_json::from_slice(&data)?),
-            None => Ok(QueueMeta::default()),
-        }
-    }
+    // === Queue Metadata ===
 
     /// Get queue metadata — single locked snapshot of in-memory state. A
     /// read must not create the queue it reads, so an unknown queue is
@@ -1307,17 +1065,13 @@ impl AnvilStorage {
         // `counters_loading`. It also orders this bound against a loader
         // reading the persisted one.
         let loading = self.counters_loading.clone().lock_owned().await;
-        let exists = self.db.get(&Self::seq_push_key(queue)).await?.is_some()
-            || self.db.get(&Self::meta_key(queue)).await?.is_some();
+        let exists = self.db.get(keys::queue(queue)).await?.is_some();
         if exists && max_pending == 0 {
             return Ok(());
         }
 
         let mut batch = WriteBatch::new();
-        if !exists {
-            Self::write_zero_counters(&mut batch, queue);
-        }
-        Self::write_max_pending(&mut batch, queue, max_pending);
+        batch.put(keys::queue(queue), format::encode_queue(max_pending));
         self.set_max_pending(queue, max_pending);
         self.commit(
             batch,
@@ -1334,15 +1088,7 @@ impl AnvilStorage {
         Ok(())
     }
 
-    /// Persists the bound of a bounded queue in `batch`, so it survives a
-    /// restart; 0 (unbounded) writes nothing.
-    fn write_max_pending(batch: &mut WriteBatch, queue: &str, max_pending: u64) {
-        if max_pending > 0 {
-            batch.put(Self::max_pending_key(queue), max_pending.to_le_bytes());
-        }
-    }
-
-    /// Applies a bound `write_max_pending` puts in a batch about to be
+    /// Applies the bound of a queue record that is loaded, or about to be
     /// committed. The caller holds `counters_loading` until that batch is
     /// applied, so no loader overwrites it with the bound it read before.
     fn set_max_pending(&self, queue: &str, max_pending: u64) {
@@ -1387,14 +1133,17 @@ impl AnvilStorage {
     /// from `base_seq` on, with the increment of its lifetime push total.
     fn put_new_messages(batch: &mut WriteBatch, queue: &str, base_seq: u64, messages: &[Message]) {
         batch.merge(
-            Self::cnt_total_pushed_key(queue),
-            (messages.len() as u64).to_le_bytes(),
+            keys::total_pushed(queue),
+            format::encode_total(messages.len() as u64),
         );
         for (i, msg) in messages.iter().enumerate() {
-            batch.put(Self::msg_key(queue, &msg.msg_id), encode_message(msg));
             batch.put(
-                Self::pending_key(queue, base_seq + i as u64),
-                encode_pending(&msg.msg_id, 0),
+                keys::message(queue, &msg.msg_id),
+                format::encode_message(msg),
+            );
+            batch.put(
+                keys::pending(queue, base_seq + i as u64),
+                format::encode_pending(&msg.msg_id, 0),
             );
         }
     }
@@ -1414,15 +1163,15 @@ impl AnvilStorage {
         assert_eq!(hold.claims.len(), msg_ids.len());
         let ack_count = msg_ids.len() as u64;
         write.ack(ack_count);
-        batch.merge(Self::cnt_total_acked_key(queue), ack_count.to_le_bytes());
+        batch.merge(keys::total_acked(queue), format::encode_total(ack_count));
         // The body is dead once acked: no reader of acked entries needs the
         // payload, and keeping it until GC multiplies the live data every
         // point read has to search.
         let now_ns = now_nanos();
         for msg_id in msg_ids {
-            batch.delete(Self::claimed_key(queue, msg_id));
-            batch.delete(Self::msg_key(queue, msg_id));
-            batch.put(Self::acked_key(queue, now_ns, msg_id), []);
+            batch.delete(keys::claim(queue, msg_id));
+            batch.delete(keys::message(queue, msg_id));
+            batch.put(keys::acked(queue, now_ns, msg_id), []);
         }
         landing.writes.push(write);
         landing.settlement = Some(hold);
@@ -1436,10 +1185,10 @@ impl AnvilStorage {
         deletes: Option<&[String]>,
     ) {
         for (key, value) in puts.into_iter().flatten() {
-            batch.put(Self::state_key(namespace, key), value);
+            batch.put(keys::state(namespace, key), value);
         }
         for key in deletes.into_iter().flatten() {
-            batch.delete(Self::state_key(namespace, key));
+            batch.delete(keys::state(namespace, key));
         }
     }
 
@@ -1501,16 +1250,16 @@ impl AnvilStorage {
         let mut batch = WriteBatch::new();
         let mut claimed = Vec::with_capacity(seqs.len());
         for seq in seqs {
-            let pending_key = Self::pending_key(queue, seq);
+            let pending_key = keys::pending(queue, seq);
             let Some(pending_bytes) = self.db.get(&pending_key).await? else {
-                tracing::warn!("claim: pending_key missing: queue={queue}, seq={seq}");
+                tracing::warn!("claim: pending key missing: queue={queue}, seq={seq}");
                 continue;
             };
-            let pending = decode_pending(&pending_bytes)?;
-            let Some(msg_data) = self.db.get(&Self::msg_key(queue, &pending.msg_id)).await? else {
+            let pending = format::decode_pending(&pending_bytes)?;
+            let Some(msg_data) = self.db.get(keys::message(queue, &pending.msg_id)).await? else {
                 continue;
             };
-            let message = decode_message(queue, &msg_data)?;
+            let message = format::decode_message(&pending.msg_id, &msg_data)?;
             let claim_info = ClaimInfo::new(
                 pending.msg_id,
                 worker_id.to_string(),
@@ -1519,8 +1268,8 @@ impl AnvilStorage {
             );
             batch.delete(&pending_key);
             batch.put(
-                Self::claimed_key(queue, &claim_info.msg_id),
-                serde_json::to_vec(&claim_info)?,
+                keys::claim(queue, &claim_info.msg_id),
+                format::encode_claim(&claim_info),
             );
             claimed.push(ClaimedMessage {
                 message,
@@ -1819,23 +1568,20 @@ impl AnvilStorage {
         let mut hold = SettlementHold::new(self.settling.clone());
         let mut reclaimed = Vec::with_capacity(claims.len());
         for claim in claims {
-            let claim_key = Self::claimed_key(queue, &claim.msg_id);
+            let claim_key = keys::claim(queue, &claim.msg_id);
             if !hold.take(claim_key.clone(), &claim.claim_token) {
                 continue;
             }
             let Some(data) = self.db.get(&claim_key).await? else {
                 continue;
             };
-            let current: ClaimInfo = serde_json::from_slice(&data)?;
+            let current = format::decode_claim(&claim.msg_id, &data)?;
             let renewed_since_read = self
                 .renewed_at
                 .get(&current.claim_token)
                 .is_some_and(|renewed_at| *renewed_at >= read_at);
             if current.claim_token == claim.claim_token && !renewed_since_read {
-                reclaimed.push(ClaimInfo {
-                    msg_id: claim.msg_id.clone(),
-                    ..current
-                });
+                reclaimed.push(current);
             }
         }
         assert!(reclaimed.len() <= claims.len());
@@ -1919,10 +1665,10 @@ impl AnvilStorage {
         let base_seq = write.reserve(msg_ids.len() as u64, Tail::Requeued);
         let mut batch = WriteBatch::new();
         for (i, (msg_id, claim)) in msg_ids.iter().zip(&claims).enumerate() {
-            batch.delete(Self::claimed_key(queue, msg_id));
+            batch.delete(keys::claim(queue, msg_id));
             batch.put(
-                Self::pending_key(queue, base_seq + i as u64),
-                encode_pending(msg_id, claim.delivery_count),
+                keys::pending(queue, base_seq + i as u64),
+                format::encode_pending(msg_id, claim.delivery_count),
             );
         }
         if let Some(namespace) = state_namespace {
@@ -1947,26 +1693,14 @@ impl AnvilStorage {
         &self,
         queue: Option<&str>,
     ) -> Result<Vec<(String, String, ClaimInfo)>, StorageError> {
-        let prefix = match queue {
-            Some(q) => format!("claimed:{}:", q).into_bytes(),
-            None => b"claimed:".to_vec(),
-        };
-
         let mut results = Vec::new();
-        let mut iter = self.db.scan_prefix(&prefix, ..).await?;
-
+        let mut iter = self.db.scan(keys::claims(queue)).await?;
         while let Some(kv) = iter.next().await? {
-            let Some((key_queue, msg_id)) = Self::parse_claimed_key(&kv.key) else {
-                continue;
-            };
-            if queue.is_some_and(|queue| queue != key_queue) {
-                continue;
-            }
-            if let Ok(claim_info) = serde_json::from_slice::<ClaimInfo>(&kv.value) {
-                results.push((key_queue.to_string(), msg_id.to_string(), claim_info));
-            }
+            let (key_queue, msg_id) = keys::parse_claim(&kv.key)?;
+            assert!(queue.is_none_or(|queue| queue == key_queue));
+            let claim_info = format::decode_claim(&msg_id, &kv.value)?;
+            results.push((key_queue, msg_id, claim_info));
         }
-
         Ok(results)
     }
 
@@ -1975,24 +1709,13 @@ impl AnvilStorage {
         &self,
         queue: Option<&str>,
     ) -> Result<Vec<(String, u64, String)>, StorageError> {
-        let prefix = match queue {
-            Some(q) => format!("acked:{}:", q).into_bytes(),
-            None => b"acked:".to_vec(),
-        };
-
         let mut results = Vec::new();
-        let mut iter = self.db.scan_prefix(&prefix, ..).await?;
-
+        let mut iter = self.db.scan(keys::acked_all(queue)).await?;
         while let Some(kv) = iter.next().await? {
-            let Some((key_queue, timestamp_ns, msg_id)) = Self::parse_acked_key(&kv.key) else {
-                continue;
-            };
-            if queue.is_some_and(|queue| queue != key_queue) {
-                continue;
-            }
-            results.push((key_queue.to_string(), timestamp_ns, msg_id.to_string()));
+            let acked = keys::parse_acked(&kv.key)?;
+            assert!(queue.is_none_or(|queue| queue == acked.0));
+            results.push(acked);
         }
-
         Ok(results)
     }
 
@@ -2031,46 +1754,33 @@ impl AnvilStorage {
         let mut batch = WriteBatch::new();
         let mut deleted = 0;
 
-        // Delete new counter keys
-        batch.delete(Self::seq_push_key(queue));
-        batch.delete(Self::seq_claim_key(queue));
-        batch.delete(Self::cnt_total_pushed_key(queue));
-        batch.delete(Self::cnt_total_claimed_key(queue));
-        batch.delete(Self::cnt_total_unclaimed_key(queue));
-        batch.delete(Self::cnt_total_acked_key(queue));
-        batch.delete(Self::max_pending_key(queue));
-        // Also delete old meta key (migration cleanup)
-        batch.delete(Self::meta_key(queue));
+        batch.delete(keys::queue(queue));
+        batch.delete(keys::total_pushed(queue));
+        batch.delete(keys::total_acked(queue));
 
         // Every pending key, including those a returned claim left behind
         // the claim cursor.
-        let mut pending = self
-            .db
-            .scan_prefix(format!("pending:{queue}:").as_bytes(), ..)
-            .await?;
+        let mut pending = self.db.scan(keys::pending_of(queue)).await?;
         while let Some(kv) = pending.next().await? {
-            if Self::pending_seq(queue, &kv.key).is_some() {
-                batch.delete(&kv.key);
-                batch.delete(Self::msg_key(queue, &decode_pending(&kv.value)?.msg_id));
-                deleted += 1;
-            }
+            batch.delete(&kv.key);
+            let msg_id = format::decode_pending(&kv.value)?.msg_id;
+            batch.delete(keys::message(queue, &msg_id));
+            deleted += 1;
         }
 
-        // Delete claimed entries and messages
         for (_, msg_id, _) in &claimed {
-            batch.delete(Self::claimed_key(queue, msg_id));
-            batch.delete(Self::msg_key(queue, msg_id));
+            batch.delete(keys::claim(queue, msg_id));
+            batch.delete(keys::message(queue, msg_id));
             deleted += 1;
         }
 
-        // Delete acked entries and messages
+        // An acked message's body went with its ack.
         for (_, ts, msg_id) in &acked {
-            batch.delete(Self::acked_key(queue, *ts, msg_id));
-            batch.delete(Self::msg_key(queue, msg_id));
+            batch.delete(keys::acked(queue, *ts, msg_id));
             deleted += 1;
         }
 
-        // Always written: an empty queue still has its counter keys.
+        // Always written: a queue has its record.
         self.commit(
             batch,
             Wait::Durable,
@@ -2091,25 +1801,16 @@ impl AnvilStorage {
         // Acked keys sort by timestamp within a queue, so each queue's
         // expired entries are one contiguous range ending at the cutoff:
         // the pass never touches live entries, unlike a full prefix scan.
-        // The range can also hold entries of a queue named `{queue}:...`, of
-        // any age; those are skipped here and expire in their own queue's pass.
         for queue in self.list_queues().await? {
-            let start = format!("acked:{}:", queue).into_bytes();
-            let end = Self::acked_key(&queue, cutoff_ns, "");
-            let mut iter = self.db.scan(start..end).await?;
+            let mut iter = self.db.scan(keys::acked_before(&queue, cutoff_ns)).await?;
             let mut batch = WriteBatch::new();
             let mut batch_keys = 0;
             while deleted < GC_PASS_KEYS_MAX {
                 let Some(kv) = iter.next().await? else {
                     break;
                 };
-                let Some((key_queue, timestamp_ns, _)) = Self::parse_acked_key(&kv.key) else {
-                    continue;
-                };
-                if key_queue != queue {
-                    continue;
-                }
-                assert!(timestamp_ns < cutoff_ns);
+                let (key_queue, timestamp_ns, _) = keys::parse_acked(&kv.key)?;
+                assert!(key_queue == queue && timestamp_ns < cutoff_ns);
                 batch.delete(&kv.key);
                 batch_keys += 1;
                 deleted += 1;
@@ -2230,7 +1931,6 @@ impl AnvilStorage {
         }
 
         let mut total = 0;
-        let wall_now = crate::types::now_secs();
         for (queue, expired) in expired_by_queue {
             let claims = self.reclaim_messages(&queue, &expired, now).await?;
             if claims.is_empty() {
@@ -2241,32 +1941,18 @@ impl AnvilStorage {
                 &[opentelemetry::KeyValue::new("queue", queue.clone())],
             );
 
-            let mut puts = HashMap::new();
             let ts_ns = now_nanos();
-            for claim in &claims {
-                let key = format!("timeout:{}:{}:{}", queue, ts_ns, claim.msg_id);
-                let event = serde_json::json!({
-                    "event_type": "timeout",
-                    "timestamp_ns": ts_ns,
-                    "timestamp": wall_now,
-                    "queue": queue,
-                    "msg_id": claim.msg_id,
-                    "worker_id": claim.worker_id,
-                    "lease_id": claim.lease_id,
-                    "claimed_at": claim.claimed_at,
-                    "input_rows": 0,
-                    "input_bytes": 0,
-                    "output_rows": 0,
-                    "output_bytes": 0,
-                    "processing_ms": 0,
-                    "queue_wait_ms": 0,
-                    "reason": "claim_timeout",
-                });
-                puts.insert(key, serde_json::to_vec(&event)?);
-            }
-            if !puts.is_empty() {
-                let _ = self.state_put_batch("wq_events", &puts, &[]).await?;
-            }
+            let events: HashMap<String, Vec<u8>> = claims
+                .iter()
+                .map(|claim| {
+                    (
+                        keys::reclaim_event(&queue, ts_ns, &claim.msg_id),
+                        format::encode_reclaim_event(&queue, claim, ts_ns),
+                    )
+                })
+                .collect();
+            self.state_put_batch(keys::RECLAIM_EVENTS, &events, &[])
+                .await?;
 
             total += claims.len();
         }
@@ -2288,7 +1974,7 @@ impl AnvilStorage {
         check_state_namespace(namespace)?;
         let mut results = HashMap::new();
         for key in keys {
-            if let Some(data) = self.db.get(&Self::state_key(namespace, key)).await? {
+            if let Some(data) = self.db.get(keys::state(namespace, key)).await? {
                 results.insert(key.clone(), data.to_vec());
             }
         }
@@ -2304,12 +1990,7 @@ impl AnvilStorage {
         check_state_namespace(namespace)?;
         let mut batch = WriteBatch::new();
 
-        for (key, value) in puts {
-            batch.put(Self::state_key(namespace, key), value);
-        }
-        for key in deletes {
-            batch.delete(Self::state_key(namespace, key));
-        }
+        Self::put_state(&mut batch, namespace, Some(puts), Some(deletes));
 
         self.commit(batch, Wait::Durable, Landing::default())
             .await?;
@@ -2323,47 +2004,28 @@ impl AnvilStorage {
         limit: usize,
     ) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
         check_state_namespace(namespace)?;
-        let key_prefix = format!("state:{}:{}", namespace, prefix).into_bytes();
-        let mut iter = self.db.scan_prefix(&key_prefix, ..).await?;
+        let mut iter = self
+            .db
+            .scan_prefix(keys::state_prefix(namespace, prefix), ..)
+            .await?;
         let mut results = Vec::new();
-        let namespace_prefix = format!("state:{}:", namespace);
-
         while let Some(kv) = iter.next().await? {
-            let key_str = String::from_utf8_lossy(&kv.key);
-            if let Some(suffix) = key_str.strip_prefix(&namespace_prefix) {
-                results.push((suffix.to_string(), kv.value.to_vec()));
-                if limit > 0 && results.len() >= limit {
-                    break;
-                }
+            let (key_namespace, key) = keys::parse_state(&kv.key)?;
+            assert_eq!(key_namespace, namespace);
+            results.push((key, kv.value.to_vec()));
+            if limit > 0 && results.len() >= limit {
+                break;
             }
         }
-
         Ok(results)
     }
 
     pub async fn list_queues(&self) -> Result<Vec<String>, StorageError> {
-        // Scan new counter key prefix first
         let mut queues = Vec::new();
-        let mut iter = self.db.scan_prefix(b"seq_push:", ..).await?;
+        let mut iter = self.db.scan(keys::queues()).await?;
         while let Some(kv) = iter.next().await? {
-            let key_str = String::from_utf8_lossy(&kv.key);
-            if let Some(queue) = key_str.strip_prefix("seq_push:") {
-                queues.push(queue.to_string());
-            }
+            queues.push(keys::parse_queue(&kv.key)?);
         }
-
-        // Fallback: also scan old meta: prefix for migration
-        let mut iter = self.db.scan_prefix(b"meta:", ..).await?;
-        let existing: std::collections::HashSet<String> = queues.iter().cloned().collect();
-        while let Some(kv) = iter.next().await? {
-            let key_str = String::from_utf8_lossy(&kv.key);
-            if let Some(queue) = key_str.strip_prefix("meta:") {
-                if !existing.contains(queue) {
-                    queues.push(queue.to_string());
-                }
-            }
-        }
-
         Ok(queues)
     }
 
@@ -2372,7 +2034,7 @@ impl AnvilStorage {
     /// Mark a queue as finished (no more messages will be pushed)
     pub async fn mark_queue_finished(&self, queue: &str) -> Result<(), StorageError> {
         let mut batch = WriteBatch::new();
-        batch.put(Self::finished_key(queue), b"1");
+        batch.put(keys::finished(queue), []);
         self.commit(batch, Wait::Durable, Landing::default())
             .await?;
         self.db.flush().await?;
@@ -2382,7 +2044,7 @@ impl AnvilStorage {
 
     /// Check if queue is finished (marked by upstream)
     pub async fn is_queue_finished(&self, queue: &str) -> Result<bool, StorageError> {
-        Ok(self.db.get(&Self::finished_key(queue)).await?.is_some())
+        Ok(self.db.get(keys::finished(queue)).await?.is_some())
     }
 
     /// Check if queue is finished AND drained (safe for worker to exit)
@@ -2412,7 +2074,7 @@ impl AnvilStorage {
     #[allow(dead_code)]
     pub async fn clear_queue_finished(&self, queue: &str) -> Result<(), StorageError> {
         let mut batch = WriteBatch::new();
-        batch.delete(Self::finished_key(queue));
+        batch.delete(keys::finished(queue));
         self.commit(batch, Wait::Durable, Landing::default())
             .await?;
         Ok(())
@@ -2427,8 +2089,8 @@ impl AnvilStorage {
         &self,
         group_name: &str,
     ) -> Result<Option<QueueGroupMeta>, StorageError> {
-        match self.db.get(&Self::group_meta_key(group_name)).await? {
-            Some(data) => Ok(Some(serde_json::from_slice(&data)?)),
+        match self.db.get(keys::group(group_name)).await? {
+            Some(data) => Ok(Some(format::decode_group(group_name, &data)?)),
             None => Ok(None),
         }
     }
@@ -2454,22 +2116,19 @@ impl AnvilStorage {
         let meta = match existing {
             Some(existing) => existing,
             None => {
-                let meta = QueueGroupMeta::new(group_name.to_string(), num_partitions);
-                batch.put(
-                    Self::group_meta_key(group_name),
-                    &serde_json::to_vec(&meta)?,
-                );
-                for queue_name in &meta.partition_queues {
-                    Self::write_zero_counters(&mut batch, queue_name);
-                }
+                let meta = QueueGroupMeta::new(group_name, num_partitions);
+                batch.put(keys::group(group_name), format::encode_group(&meta));
                 meta
             }
         };
-        for queue_name in &meta.partition_queues {
-            Self::write_max_pending(&mut batch, queue_name, max_pending_per_partition);
-        }
-        for queue_name in &meta.partition_queues {
-            self.set_max_pending(queue_name, max_pending_per_partition);
+        if created || max_pending_per_partition > 0 {
+            for queue_name in &meta.partition_queues {
+                batch.put(
+                    keys::queue(queue_name),
+                    format::encode_queue(max_pending_per_partition),
+                );
+                self.set_max_pending(queue_name, max_pending_per_partition);
+            }
         }
         if created || max_pending_per_partition > 0 {
             self.commit(
@@ -2725,7 +2384,7 @@ impl AnvilStorage {
 
         let mut batch = WriteBatch::new();
         for queue_name in &group.partition_queues {
-            batch.put(Self::finished_key(queue_name), b"1");
+            batch.put(keys::finished(queue_name), []);
         }
         self.commit(batch, Wait::Durable, Landing::default())
             .await?;
@@ -2774,7 +2433,7 @@ pub(crate) mod tests {
                     let storage = storage.clone();
                     tokio::spawn(async move {
                         for _ in 0..PUSHES {
-                            let msg = Message::new(queue.to_string(), b"x".to_vec());
+                            let msg = Message::new(b"x".to_vec());
                             storage.push_message(queue, &msg).await.unwrap();
                         }
                     })
@@ -2880,8 +2539,8 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg1 = Message::new(queue.to_string(), b"hello".to_vec());
-        let msg2 = Message::new(queue.to_string(), b"world".to_vec());
+        let msg1 = Message::new(b"hello".to_vec());
+        let msg2 = Message::new(b"world".to_vec());
 
         storage.push_message(queue, &msg1).await.unwrap();
         storage.push_message(queue, &msg2).await.unwrap();
@@ -2911,7 +2570,7 @@ pub(crate) mod tests {
         storage.create_queue(queue, 0).await.unwrap();
 
         let messages: Vec<Message> = (0..5)
-            .map(|i| Message::new(queue.to_string(), format!("msg{}", i).into_bytes()))
+            .map(|i| Message::new(format!("msg{}", i).into_bytes()))
             .collect();
 
         storage.push_messages(queue, &messages).await.unwrap();
@@ -2933,7 +2592,7 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg = Message::new(queue.to_string(), b"hello".to_vec());
+        let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
         let claimed = storage
             .claim_messages(queue, 1, "worker-1", "lease-1")
@@ -2964,7 +2623,7 @@ pub(crate) mod tests {
         let queues = ["colon", "colon:00"];
         for queue in queues {
             storage.create_queue(queue, 0).await.unwrap();
-            let msg = Message::new(queue.to_string(), b"hello".to_vec());
+            let msg = Message::new(b"hello".to_vec());
             storage.push_message(queue, &msg).await.unwrap();
             storage
                 .claim_messages(queue, 1, "worker-1", "lease-1")
@@ -3021,7 +2680,7 @@ pub(crate) mod tests {
         let (storage, msg_id) = crashed.block_on(async {
             let storage = AnvilStorage::new(&db_path).await.unwrap();
             storage.create_queue(queue, 0).await.unwrap();
-            let msg = Message::new(queue.to_string(), b"payload".to_vec());
+            let msg = Message::new(b"payload".to_vec());
             storage.push_message(queue, &msg).await.unwrap();
             let claimed = storage
                 .claim_messages(queue, 1, "worker", "lease")
@@ -3080,9 +2739,7 @@ pub(crate) mod tests {
         let (storage, pushed_ids, acked_id) = crashed.block_on(async {
             let storage = AnvilStorage::new(&db_path).await.unwrap();
             storage.create_queue(queue, 0).await.unwrap();
-            let messages: Vec<Message> = (0u8..3)
-                .map(|i| Message::new(queue.to_string(), vec![i]))
-                .collect();
+            let messages: Vec<Message> = (0u8..3).map(|i| Message::new(vec![i])).collect();
             storage.push_messages(queue, &messages).await.unwrap();
             let claimed = storage
                 .claim_messages(queue, 1, "worker", "lease")
@@ -3133,7 +2790,7 @@ pub(crate) mod tests {
         storage.create_queue(queue, 0).await.unwrap();
         storage.create_queue("count-down", 0).await.unwrap();
         storage
-            .push_message(queue, &Message::new(queue.to_string(), b"x".to_vec()))
+            .push_message(queue, &Message::new(b"x".to_vec()))
             .await
             .unwrap();
 
@@ -3179,7 +2836,7 @@ pub(crate) mod tests {
                 "w3",
                 "lease-3",
                 "count-down",
-                &[Message::new("count-down".to_string(), b"y".to_vec())],
+                &[Message::new(b"y".to_vec())],
             )
             .await
             .unwrap();
@@ -3197,7 +2854,7 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg = Message::new(queue.to_string(), b"hello".to_vec());
+        let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
         let claimed = storage
             .claim_messages(queue, 1, "worker-1", "lease-1")
@@ -3234,7 +2891,7 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg = Message::new(queue.to_string(), b"hello".to_vec());
+        let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
         let claimed = storage
             .claim_messages(queue, 1, "worker-1", "lease-1")
@@ -3261,7 +2918,7 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg = Message::new(queue.to_string(), b"hello".to_vec());
+        let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
         let claimed = storage
             .claim_messages(queue, 1, "worker-1", "lease-1")
@@ -3282,7 +2939,7 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg = Message::new(queue.to_string(), b"hello".to_vec());
+        let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
         let claimed = storage
             .claim_messages(queue, 1, "worker-1", "lease-1")
@@ -3303,7 +2960,7 @@ pub(crate) mod tests {
         storage.create_queue("upstream", 0).await.unwrap();
         storage.create_queue("downstream", 0).await.unwrap();
 
-        let upstream_msg = Message::new("upstream".to_string(), b"input".to_vec());
+        let upstream_msg = Message::new(b"input".to_vec());
         storage
             .push_message("upstream", &upstream_msg)
             .await
@@ -3313,8 +2970,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let downstream_msgs: Vec<Message> =
-            vec![Message::new("downstream".to_string(), b"out".to_vec())];
+        let downstream_msgs: Vec<Message> = vec![Message::new(b"out".to_vec())];
 
         let result = storage
             .ack_and_forward(
@@ -3337,7 +2993,7 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg = Message::new(queue.to_string(), b"hello".to_vec());
+        let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
 
         let claimed = storage
@@ -3366,9 +3022,7 @@ pub(crate) mod tests {
         let storage = Arc::new(create_temp_storage().await);
         let queue = "dup-ack";
         storage.create_queue(queue, 0).await.unwrap();
-        let messages: Vec<Message> = (0..100)
-            .map(|_| Message::new(queue.to_string(), b"x".to_vec()))
-            .collect();
+        let messages: Vec<Message> = (0..100).map(|_| Message::new(b"x".to_vec())).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage
             .claim_messages(queue, messages.len(), "w", "l")
@@ -3419,9 +3073,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "reclaim-race";
         storage.create_queue(queue, 0).await.unwrap();
-        let messages: Vec<Message> = (0..3)
-            .map(|_| Message::new(queue.to_string(), b"x".to_vec()))
-            .collect();
+        let messages: Vec<Message> = (0..3).map(|_| Message::new(b"x".to_vec())).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage.claim_messages(queue, 3, "w", "l").await.unwrap();
         let read_at = crate::types::mono_now();
@@ -3506,7 +3158,7 @@ pub(crate) mod tests {
         let queue = "hold";
         storage.create_queue(queue, 0).await.unwrap();
         storage
-            .push_message(queue, &Message::new(queue.to_string(), b"x".to_vec()))
+            .push_message(queue, &Message::new(b"x".to_vec()))
             .await
             .unwrap();
         let claimed = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
@@ -3522,7 +3174,7 @@ pub(crate) mod tests {
 
         {
             let mut held = SettlementHold::new(storage.settling.clone());
-            assert!(held.take(AnvilStorage::claimed_key(queue, &msg_ids[0]), &tokens[0]));
+            assert!(held.take(keys::claim(queue, &msg_ids[0]), &tokens[0]));
             let err = storage
                 .ack_messages(queue, &msg_ids, &tokens, "w", "l")
                 .await
@@ -3576,9 +3228,11 @@ pub(crate) mod tests {
     }
 
     /// Reopening derives the claim and push cursors and the in-flight count
-    /// from the keys, so a persisted cursor that lags its keys (as one written
-    /// by concurrent writers in the wrong order would) can neither hide
-    /// pending messages nor let a new push overwrite one.
+    /// from the keys, none of which is persisted: one written by concurrent
+    /// writers in the wrong order could lag its keys, hiding pending
+    /// messages or letting a new push overwrite one. A nack leaves a gap
+    /// between the oldest and the newest pending entry, which the cursors
+    /// must span.
     #[tokio::test]
     async fn test_reopen_derives_cursors_from_keys() {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -3589,20 +3243,13 @@ pub(crate) mod tests {
 
         let storage = AnvilStorage::new(&db_path).await.unwrap();
         storage.create_queue(queue, 0).await.unwrap();
-        let messages: Vec<Message> = (0u8..10)
-            .map(|i| Message::new(queue.to_string(), vec![i]))
-            .collect();
+        let messages: Vec<Message> = (0u8..10).map(|i| Message::new(vec![i])).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage.claim_messages(queue, 4, "w", "l").await.unwrap();
         assert_eq!(claimed.len(), 4);
-        // A lagging push cursor and the legacy claim cursor a claim used to
-        // persist, both behind the keys.
-        let lagging = 2u64.to_le_bytes();
-        let mut batch = WriteBatch::new();
-        batch.put(AnvilStorage::seq_push_key(queue), lagging);
-        batch.put(AnvilStorage::seq_claim_key(queue), 9u64.to_le_bytes());
+        let (msg_ids, claim_tokens) = split_claims(&claimed[..1]);
         storage
-            .commit(batch, Wait::Durable, Landing::default())
+            .nack_messages(queue, &msg_ids, &claim_tokens, "w", "l")
             .await
             .unwrap();
         storage.close().await.unwrap();
@@ -3610,17 +3257,150 @@ pub(crate) mod tests {
         let storage = AnvilStorage::new(&db_path).await.unwrap();
         let meta = storage.get_meta(queue).await.unwrap();
         assert_eq!(meta.claim_seq, 4);
-        assert_eq!(meta.push_seq, 10);
-        assert_eq!(meta.claimed_count, 4);
+        assert_eq!(meta.push_seq, 11);
+        assert_eq!(meta.claimed_count, 3);
 
-        let late = Message::new(queue.to_string(), vec![10]);
+        let late = Message::new(vec![10]);
         storage.push_message(queue, &late).await.unwrap();
         let rest = storage.claim_messages(queue, 100, "w", "l").await.unwrap();
         let mut payloads: Vec<u8> = rest.iter().map(|c| c.message.payload[0]).collect();
         payloads.sort();
-        assert_eq!(payloads, (4u8..=10).collect::<Vec<_>>());
+        let mut expected: Vec<u8> = (4u8..=10).collect();
+        expected.push(claimed[0].message.payload[0]);
+        expected.sort();
+        assert_eq!(payloads, expected);
         storage.close().await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn memory_store() -> Arc<dyn slatedb::object_store::ObjectStore> {
+        Arc::new(slatedb::object_store::memory::InMemory::new())
+    }
+
+    fn format_error(result: Result<AnvilStorage, StorageError>) -> FormatError {
+        match result {
+            Ok(_) => panic!("the store opened"),
+            Err(e) => match e.downcast::<FormatError>() {
+                Ok(e) => *e,
+                Err(e) => panic!("not a format error: {e}"),
+            },
+        }
+    }
+
+    /// The marker of the store in `object_store`, read without opening it as
+    /// anvil does, so the read changes nothing.
+    async fn read_marker(object_store: Arc<dyn slatedb::object_store::ObjectStore>) -> Option<u32> {
+        let db = Db::builder("db", object_store).build().await.unwrap();
+        let marker = db.get(keys::FORMAT).await.unwrap();
+        db.close().await.unwrap();
+        marker.map(|marker| format::decode_format(&marker).unwrap())
+    }
+
+    /// Goal: data written by an unversioned release (0.3.0 or earlier) is
+    /// refused, not misread, and left as it was. Method: write a key of the
+    /// old layout with SlateDB alone, open the store, and check the error
+    /// and that no marker was stamped.
+    #[tokio::test]
+    async fn test_open_refuses_unversioned_store() {
+        let object_store = memory_store();
+        let db = Db::builder("db", object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        #[allow(clippy::disallowed_methods)] // writes data no anvil release writes now
+        db.put(b"seq_push:q", 0u64.to_le_bytes()).await.unwrap();
+        db.close().await.unwrap();
+
+        let refused = AnvilStorage::open("db".to_string(), object_store.clone()).await;
+        assert_eq!(format_error(refused), FormatError::Unversioned);
+        assert_eq!(read_marker(object_store).await, None);
+    }
+
+    /// Goal: a store written by a release with a newer format is refused,
+    /// and an empty one is stamped with this release's format. Method: open
+    /// an empty store, move its marker past `FORMAT_VERSION`, and reopen.
+    #[tokio::test]
+    async fn test_open_refuses_newer_format() {
+        let object_store = memory_store();
+        let storage = AnvilStorage::open("db".to_string(), object_store.clone())
+            .await
+            .unwrap();
+        storage.close().await.unwrap();
+        assert_eq!(
+            read_marker(object_store.clone()).await,
+            Some(FORMAT_VERSION)
+        );
+
+        let storage = AnvilStorage::open("db".to_string(), object_store.clone())
+            .await
+            .unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(keys::FORMAT, format::encode_format(FORMAT_VERSION + 1));
+        storage
+            .commit(batch, Wait::Durable, Landing::default())
+            .await
+            .unwrap();
+        storage.close().await.unwrap();
+
+        let refused = AnvilStorage::open("db".to_string(), object_store.clone()).await;
+        assert_eq!(
+            format_error(refused),
+            FormatError::Newer {
+                version: FORMAT_VERSION + 1
+            }
+        );
+        assert_eq!(read_marker(object_store).await, Some(FORMAT_VERSION + 1));
+    }
+
+    /// Goal: a crash while the first open stamps the marker leaves a store
+    /// that opens, stamped once, and serves. Method: open over a store whose
+    /// writes are slow, tear the runtime down at points before, during and
+    /// after the stamp's write, then reopen over the same objects and push
+    /// and claim a message.
+    #[test]
+    fn test_crash_during_format_stamp() {
+        use crate::fault_store::{FaultStore, Faults, OpFaults};
+        let mut stamped_before_reopen = Vec::new();
+        for (seed, cut_ms) in [0u64, 1, 5, 20, 50, 100, 300, 1000].into_iter().enumerate() {
+            let inner = memory_store();
+            let store = FaultStore::new(inner.clone(), seed as u64);
+            store.set_faults(Faults {
+                put: OpFaults {
+                    latency: Duration::from_millis(20),
+                    ..OpFaults::default()
+                },
+                ..Faults::default()
+            });
+            let crashed = tokio::runtime::Runtime::new().unwrap();
+            crashed.spawn(async move {
+                if let Ok(storage) = AnvilStorage::open("db".to_string(), Arc::new(store)).await {
+                    // Never closed: the crash takes it down.
+                    std::mem::forget(storage);
+                }
+            });
+            std::thread::sleep(Duration::from_millis(cut_ms));
+            crashed.shutdown_background();
+
+            let recovered = tokio::runtime::Runtime::new().unwrap();
+            recovered.block_on(async {
+                stamped_before_reopen.push(read_marker(inner.clone()).await.is_some());
+                let storage = AnvilStorage::open("db".to_string(), inner.clone())
+                    .await
+                    .unwrap_or_else(|e| panic!("cut at {cut_ms}ms: {e}"));
+                let msg = Message::new(b"x".to_vec());
+                storage.push_message("q", &msg).await.unwrap();
+                let claimed = storage.claim_messages("q", 1, "w", "l").await.unwrap();
+                assert_eq!(claimed.len(), 1, "cut at {cut_ms}ms");
+                storage.close().await.unwrap();
+                assert_eq!(read_marker(inner).await, Some(FORMAT_VERSION));
+            });
+        }
+        // The cuts must straddle the stamp, or the test proves nothing.
+        assert!(!stamped_before_reopen[0], "{stamped_before_reopen:?}");
+        assert!(
+            stamped_before_reopen.last().unwrap(),
+            "{stamped_before_reopen:?}"
+        );
     }
 
     #[tokio::test]
@@ -3634,7 +3414,7 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg = Message::new(queue.to_string(), b"hello".to_vec());
+        let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
 
         let claimed = storage
@@ -3678,7 +3458,7 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg = Message::new(queue.to_string(), b"hello".to_vec());
+        let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
         let claimed = storage
             .claim_messages(queue, 1, "worker-1", "lease-1")
@@ -3722,9 +3502,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "renew";
         storage.create_queue(queue, 0).await.unwrap();
-        let messages: Vec<Message> = (0..2)
-            .map(|_| Message::new(queue.to_string(), b"x".to_vec()))
-            .collect();
+        let messages: Vec<Message> = (0..2).map(|_| Message::new(b"x".to_vec())).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage.claim_messages(queue, 2, "w", "l").await.unwrap();
         let (renewed, idle) = (&claimed[0], &claimed[1]);
@@ -3789,9 +3567,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "renew-fenced";
         storage.create_queue(queue, 0).await.unwrap();
-        let messages: Vec<Message> = (0..2)
-            .map(|_| Message::new(queue.to_string(), b"x".to_vec()))
-            .collect();
+        let messages: Vec<Message> = (0..2).map(|_| Message::new(b"x".to_vec())).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage.claim_messages(queue, 2, "w", "l").await.unwrap();
         let (msg_ids, tokens) = split_claims(&claimed);
@@ -3827,7 +3603,7 @@ pub(crate) mod tests {
         let queue = "renew-race";
         storage.create_queue(queue, 0).await.unwrap();
         storage
-            .push_message(queue, &Message::new(queue.to_string(), b"x".to_vec()))
+            .push_message(queue, &Message::new(b"x".to_vec()))
             .await
             .unwrap();
         let claimed = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
@@ -3894,7 +3670,7 @@ pub(crate) mod tests {
         storage.create_queue("upstream", 0).await.unwrap();
         storage.create_queue("downstream", 0).await.unwrap();
 
-        let upstream_msg = Message::new("upstream".to_string(), b"input".to_vec());
+        let upstream_msg = Message::new(b"input".to_vec());
         storage
             .push_message("upstream", &upstream_msg)
             .await
@@ -3906,7 +3682,7 @@ pub(crate) mod tests {
         let (upstream_ids, upstream_tokens) = split_claims(&claimed);
 
         let downstream_msgs: Vec<Message> = (0..2)
-            .map(|i| Message::new("downstream".to_string(), format!("out{}", i).into_bytes()))
+            .map(|i| Message::new(format!("out{}", i).into_bytes()))
             .collect();
 
         storage
@@ -3947,7 +3723,7 @@ pub(crate) mod tests {
         storage.create_queue(queue, 0).await.unwrap();
 
         for i in 0..5 {
-            let msg = Message::new(queue.to_string(), format!("msg{}", i).into_bytes());
+            let msg = Message::new(format!("msg{}", i).into_bytes());
             storage.push_message(queue, &msg).await.unwrap();
             let claimed = storage
                 .claim_messages(queue, 1, "worker-1", "lease-1")
@@ -3990,7 +3766,7 @@ pub(crate) mod tests {
         storage.create_queue(queue, 0).await.unwrap();
         // A full pass of expired entries, so the pass is still running long
         // after its first commit.
-        let entry_key = |i: usize| AnvilStorage::acked_key(queue, 1, &format!("{i:012}"));
+        let entry_key = |i: usize| keys::acked(queue, 1, &format!("{i:012}"));
         for first in (0..GC_PASS_KEYS_MAX).step_by(GC_BATCH_KEYS_MAX) {
             let mut batch = WriteBatch::new();
             for i in first..first + GC_BATCH_KEYS_MAX {
@@ -4043,7 +3819,7 @@ pub(crate) mod tests {
         storage.create_queue(queue, 0).await.unwrap();
 
         for i in 0..5 {
-            let msg = Message::new(queue.to_string(), format!("msg{}", i).into_bytes());
+            let msg = Message::new(format!("msg{}", i).into_bytes());
             storage.push_message(queue, &msg).await.unwrap();
         }
 
@@ -4092,7 +3868,7 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg = Message::new(queue.to_string(), b"hello".to_vec());
+        let msg = Message::new(b"hello".to_vec());
 
         storage.push_message(queue, &msg).await.unwrap();
         let claimed = storage
@@ -4133,7 +3909,7 @@ pub(crate) mod tests {
         storage.create_queue(queue, 0).await.unwrap();
 
         for i in 0..5 {
-            let msg = Message::new(queue.to_string(), format!("msg{}", i).into_bytes());
+            let msg = Message::new(format!("msg{}", i).into_bytes());
             storage.push_message(queue, &msg).await.unwrap();
         }
         storage
@@ -4189,7 +3965,7 @@ pub(crate) mod tests {
 
         storage.create_queue(queue, 0).await.unwrap();
 
-        let msg = Message::new(queue.to_string(), b"hello".to_vec());
+        let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
         storage
             .claim_messages(queue, 1, "worker-1", "lease-1")
@@ -4204,6 +3980,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(recovered, 1);
+        let events = storage
+            .state_scan_prefix(keys::RECLAIM_EVENTS, "", 0)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let event = format::decode_reclaim_event(&events[0].1).unwrap();
+        assert_eq!(
+            (event.queue.as_str(), event.msg_id.as_str()),
+            (queue, msg.msg_id.as_str())
+        );
+        assert_eq!(
+            (event.worker_id.as_str(), event.delivery_count),
+            ("worker-1", 1)
+        );
 
         let claimed = storage
             .claim_messages(queue, 1, "worker-2", "lease-2")
@@ -4231,7 +4021,7 @@ pub(crate) mod tests {
         // Push 10 messages
         let mut msg_ids = Vec::new();
         for i in 0..10 {
-            let msg = Message::new(queue.to_string(), format!("msg{}", i).into_bytes());
+            let msg = Message::new(format!("msg{}", i).into_bytes());
             msg_ids.push(msg.msg_id.clone());
             storage.push_message(queue, &msg).await.unwrap();
         }
@@ -4326,7 +4116,7 @@ pub(crate) mod tests {
             let storage = storage.clone();
             push_handles.push(tokio::spawn(async move {
                 let msgs: Vec<Message> = (0..PER_PUSHER)
-                    .map(|i| Message::new(queue.to_string(), format!("p{p}-msg{i}").into_bytes()))
+                    .map(|i| Message::new(format!("p{p}-msg{i}").into_bytes()))
                     .collect();
                 // Chunk a bit so we interleave with claimers rather than one big batch.
                 for chunk in msgs.chunks(16) {
@@ -4431,7 +4221,7 @@ pub(crate) mod tests {
 
         // Push N, claim all as a dead worker (no ack).
         let messages: Vec<Message> = (0..n)
-            .map(|i| Message::new(queue.to_string(), format!("msg{i}").into_bytes()))
+            .map(|i| Message::new(format!("msg{i}").into_bytes()))
             .collect();
         storage.push_messages(queue, &messages).await.unwrap();
 
@@ -4525,9 +4315,7 @@ pub(crate) mod tests {
             let storage = storage.clone();
             producers.push(tokio::spawn(async move {
                 let msgs: Vec<Message> = (0..PER_PRODUCER)
-                    .map(|i| {
-                        Message::new(upstream.to_string(), format!("p{p}-msg{i}").into_bytes())
-                    })
+                    .map(|i| Message::new(format!("p{p}-msg{i}").into_bytes()))
                     .collect();
                 for chunk in msgs.chunks(8) {
                     storage.push_messages(upstream, chunk).await.unwrap();
@@ -4568,7 +4356,7 @@ pub(crate) mod tests {
                     // 1:1 — wrap each upstream msg into a downstream msg.
                     let downstream_msgs: Vec<Message> = batch
                         .iter()
-                        .map(|c| Message::new(downstream.to_string(), c.message.payload.clone()))
+                        .map(|c| Message::new(c.message.payload.clone()))
                         .collect();
 
                     storage
@@ -4699,12 +4487,7 @@ pub(crate) mod tests {
             producer_handles.push(tokio::spawn(async move {
                 for batch_idx in 0..(PER_PRODUCER / 10) {
                     let msgs: Vec<Message> = (0..10)
-                        .map(|i| {
-                            Message::new(
-                                queue.to_string(),
-                                format!("p{p}-b{batch_idx}-m{i}").into_bytes(),
-                            )
-                        })
+                        .map(|i| Message::new(format!("p{p}-b{batch_idx}-m{i}").into_bytes()))
                         .collect();
                     storage.push_messages(queue, &msgs).await.unwrap();
                     tokio::task::yield_now().await;

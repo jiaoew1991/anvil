@@ -507,54 +507,48 @@ pub(crate) mod tests {
         assert_eq!(stats(&service, "q").await.unwrap(), (0, 1, 1, 0));
     }
 
-    /// Goal: a key of one state namespace is invisible in another. Method:
-    /// namespace "job:a" key "k" and namespace "job" key "a:k" would be one
-    /// stored key, since `state_key` joins them with ':'. A namespace with
-    /// ':' is refused, so keys of existing namespaces stay where they are,
-    /// and a key with ':' still round-trips in its own namespace.
+    /// Goal: a key of one state namespace is invisible in another, whatever
+    /// bytes either holds. Method: namespace "job:a" key "k" and namespace
+    /// "job" key "a:k" would be one stored key if the two were joined with
+    /// ':'; put both, the first through a Complete, and read each back
+    /// alone, by key and by a scan of its namespace.
     #[tokio::test]
     async fn test_state_namespaces_do_not_collide() {
-        let (service, _storage) = service().await;
-        let put = |namespace: &str, key: &str| StatePutRequest {
-            namespace: namespace.to_string(),
-            puts: HashMap::from([(key.to_string(), namespace.as_bytes().to_vec())]),
-            deletes: Vec::new(),
-        };
-        let refused = service.state_put(Request::new(put("job:a", "k"))).await;
-        assert_code(&refused, Code::InvalidArgument, "put to job:a");
-        let refused = service
-            .state_get(Request::new(StateGetRequest {
-                namespace: "job:a".to_string(),
-                keys: vec!["k".to_string()],
-            }))
-            .await;
-        assert_code(&refused, Code::InvalidArgument, "get of job:a");
+        let (service, storage) = service().await;
         let message = push_and_claim(&service, "q").await;
         let mut request = complete_request("q", &[message], ack());
         request.state = Some(StateUpdate {
             namespace: "job:a".to_string(),
-            puts: HashMap::from([("k".to_string(), b"1".to_vec())]),
+            puts: HashMap::from([("k".to_string(), b"job:a".to_vec())]),
             deletes: Vec::new(),
         });
-        let refused = complete(&service, request).await;
-        assert_code(&refused, Code::InvalidArgument, "complete into job:a");
-
+        complete(&service, request).await.unwrap();
         service
-            .state_put(Request::new(put("job", "a:k")))
-            .await
-            .unwrap();
-        let read = service
-            .state_get(Request::new(StateGetRequest {
+            .state_put(Request::new(StatePutRequest {
                 namespace: "job".to_string(),
-                keys: vec!["a:k".to_string()],
+                puts: HashMap::from([("a:k".to_string(), b"job".to_vec())]),
+                deletes: Vec::new(),
             }))
             .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            read.values,
-            HashMap::from([("a:k".to_string(), b"job".to_vec())])
-        );
+            .unwrap();
+        for (namespace, key) in [("job:a", "k"), ("job", "a:k")] {
+            let read = service
+                .state_get(Request::new(StateGetRequest {
+                    namespace: namespace.to_string(),
+                    keys: vec![key.to_string(), "k".to_string(), "a:k".to_string()],
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                read.values,
+                HashMap::from([(key.to_string(), namespace.as_bytes().to_vec())]),
+                "{namespace}"
+            );
+            let scanned = storage.state_scan_prefix(namespace, "", 0).await.unwrap();
+            let keys: Vec<&str> = scanned.iter().map(|(key, _)| key.as_str()).collect();
+            assert_eq!(keys, [key], "{namespace}");
+        }
     }
 
     /// Goal: every RPC refuses the empty queue name. MarkQueueFinished and
