@@ -59,14 +59,3 @@ message QueueGroup {
   double created_at = 4;
 }
 
-// Value of a reclaim event, which recovery writes as a state value when it
-// returns a claim to pending.
-message ReclaimEvent {
-  uint64 timestamp_ns = 1;
-  string queue = 2;
-  string msg_id = 3;
-  string worker_id = 4;
-  string lease_id = 5;
-  double claimed_at = 6;
-  uint32 delivery_count = 7;
-}

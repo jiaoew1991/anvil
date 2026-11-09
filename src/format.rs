@@ -204,26 +204,6 @@ pub(crate) fn decode_group(name: &str, bytes: &[u8]) -> Result<QueueGroupMeta, C
     })
 }
 
-/// The event recovery records, at `timestamp_ns`, for reclaiming `claim` of
-/// `queue`.
-pub(crate) fn encode_reclaim_event(queue: &str, claim: &ClaimInfo, timestamp_ns: u64) -> Vec<u8> {
-    proto::ReclaimEvent {
-        timestamp_ns,
-        queue: queue.to_string(),
-        msg_id: claim.msg_id.clone(),
-        worker_id: claim.worker_id.clone(),
-        lease_id: claim.lease_id.clone(),
-        claimed_at: claim.claimed_at,
-        delivery_count: claim.delivery_count,
-    }
-    .encode_to_vec()
-}
-
-#[cfg(test)]
-pub(crate) fn decode_reclaim_event(bytes: &[u8]) -> Result<proto::ReclaimEvent, CorruptValue> {
-    decode("reclaim event", bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,10 +278,6 @@ mod tests {
             ("value message", encode_message(&message)),
             ("value claim", encode_claim(&claim)),
             ("value group", encode_group(&group)),
-            (
-                "value reclaim event",
-                encode_reclaim_event("q:1", &claim, 0x0102_0304_0506_0708),
-            ),
         ];
         let snapshot: &[(&str, &str)] = &[
             ("key format", "00"),
@@ -320,12 +296,14 @@ mod tests {
             ("value queue", "0805"),
             ("value total", "0201000000000000"),
             ("value pending", "0a016d1003"),
-            ("value message", "0a030001ff1100002040fc54d9411a060a016b120176"),
-            ("value claim", "0a017712016c1900005040fc54d9412201742802"),
-            ("value group", "08021a04675f70301a04675f70312100008040fc54d941"),
             (
-                "value reclaim event",
-                "08888e98a8c0e08081011203713a311a2430313930613162322d633364342d376535662d386139622d3063316432653366346135622201772a016c3100005040fc54d9413802",
+                "value message",
+                "0a030001ff1100002040fc54d9411a060a016b120176",
+            ),
+            ("value claim", "0a017712016c1900005040fc54d9412201742802"),
+            (
+                "value group",
+                "08021a04675f70301a04675f70312100008040fc54d941",
             ),
         ];
         assert_eq!(encoded.len(), snapshot.len());

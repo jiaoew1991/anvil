@@ -323,18 +323,6 @@ pub(crate) fn parse_state(key: &[u8]) -> Result<(String, String), MalformedKey> 
     Ok(parsed)
 }
 
-/// The state key, in namespace `RECLAIM_EVENTS`, under which recovery
-/// records that it reclaimed message `msg_id` of `queue` at `timestamp_ns`.
-/// A name, never parsed: the event's value carries every field. The
-/// timestamp is zero-padded so a namespace scan lists a queue's events in
-/// time order.
-pub(crate) fn reclaim_event(queue: &str, timestamp_ns: u64, msg_id: &str) -> String {
-    format!("timeout:{queue}:{timestamp_ns:020}:{msg_id}")
-}
-
-/// The state namespace of the reclaim events.
-pub(crate) const RECLAIM_EVENTS: &str = "wq_events";
-
 #[cfg(test)]
 mod tests {
     use super::*;
