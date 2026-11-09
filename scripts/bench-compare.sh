@@ -41,20 +41,20 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir "$work/$baseline"
 git archive "$baseline" | tar -x -C "$work/$baseline"
-# One target directory for both source trees, so their shared dependencies
-# build once.
-export CARGO_TARGET_DIR=$PWD/target
-for tree in "$work/$baseline" .; do
-  (cd "$tree" && cargo test --release --locked --lib --no-run)
-done
+# The release builds into a target directory of its own: cargo names a
+# package's test binary by its name and version, not its path, so a shared
+# directory would run one tree's binary for both when the versions match.
+baseline_target=$PWD/target/baseline
+(cd "$work/$baseline" && CARGO_TARGET_DIR=$baseline_target cargo test --release --locked --lib --no-run)
+cargo test --release --locked --lib --no-run
 
-# Runs the bench of the source tree $2 once and appends "<keys/s> <ack p99 ms>"
-# to $work/$1.
+# Runs the bench of source tree $2, built into target directory $3, once and
+# appends "<keys/s> <ack p99 ms>" to $work/$1.
 bench() {
   local db_dir
   db_dir=$(mktemp -d "$work/db.XXXXXX")
   echo "=== $1"
-  (cd "$2" && ANVIL_BENCH_DB="file://$db_dir" \
+  (cd "$2" && CARGO_TARGET_DIR=$3 ANVIL_BENCH_DB="file://$db_dir" \
     cargo test --release --locked --lib bench_worker_profile -- --ignored --nocapture) \
     2>&1 | tee "$work/log"
   sed -nE 's/^process: .* = ([0-9]+) keys\/s .* ack\+ledger p50=[0-9]+ms p99=([0-9]+)ms .*/\1 \2/p' \
@@ -63,8 +63,8 @@ bench() {
 }
 
 for round in $(seq "$rounds"); do
-  bench "$baseline" "$work/$baseline"
-  bench current .
+  bench "$baseline" "$work/$baseline" "$baseline_target"
+  bench current . "$PWD/target"
 done
 
 # Prints the median of column $2 of file $1.
