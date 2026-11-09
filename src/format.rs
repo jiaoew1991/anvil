@@ -17,7 +17,7 @@
 
 use prost::Message as _;
 
-use crate::types::{ClaimInfo, Message, QueueGroupMeta};
+use crate::types::{ClaimInfo, DeadLetter, DeadLetterCause, Message, QueueGroupMeta};
 
 pub(crate) mod proto {
     tonic::include_proto!("anvil.storage");
@@ -59,7 +59,7 @@ impl std::error::Error for FormatError {}
 
 /// A value that does not decode as the schema of its key: a corrupt store.
 #[derive(Debug)]
-pub struct CorruptValue(String);
+pub struct CorruptValue(pub(crate) String);
 
 impl std::fmt::Display for CorruptValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -86,13 +86,16 @@ pub(crate) fn decode_format(bytes: &[u8]) -> Result<u32, CorruptValue> {
     Ok(format.version)
 }
 
-pub(crate) fn encode_queue(max_pending: u64) -> Vec<u8> {
-    proto::QueueRecord { max_pending }.encode_to_vec()
+pub(crate) fn encode_queue(max_pending: u64, max_deliveries: Option<u32>) -> Vec<u8> {
+    proto::QueueRecord {
+        max_pending,
+        max_deliveries,
+    }
+    .encode_to_vec()
 }
 
-/// The bound of a queue record; 0 is unbounded.
-pub(crate) fn decode_queue(bytes: &[u8]) -> Result<u64, CorruptValue> {
-    Ok(decode::<proto::QueueRecord>("queue record", bytes)?.max_pending)
+pub(crate) fn decode_queue(bytes: &[u8]) -> Result<proto::QueueRecord, CorruptValue> {
+    decode("queue record", bytes)
 }
 
 /// A total, or an increment merged into one: 8 bytes little-endian, the
@@ -125,24 +128,32 @@ pub(crate) fn decode_pending(bytes: &[u8]) -> Result<proto::PendingEntry, Corrup
     Ok(entry)
 }
 
-pub(crate) fn encode_message(msg: &Message) -> Vec<u8> {
+/// The body of `msg`, as a message key and a dead letter both store it.
+fn stored_message(msg: &Message) -> proto::StoredMessage {
     proto::StoredMessage {
         payload: msg.payload.clone(),
         created_at: msg.created_at,
         metadata: msg.metadata.clone(),
     }
-    .encode_to_vec()
 }
 
-/// The message `msg_id` whose body is `bytes`.
-pub(crate) fn decode_message(msg_id: &str, bytes: &[u8]) -> Result<Message, CorruptValue> {
-    let stored: proto::StoredMessage = decode("message body", bytes)?;
-    Ok(Message {
+/// The message `msg_id` whose body is `stored`.
+fn message_of(msg_id: &str, stored: proto::StoredMessage) -> Message {
+    Message {
         msg_id: msg_id.to_string(),
         payload: stored.payload,
         created_at: stored.created_at,
         metadata: stored.metadata,
-    })
+    }
+}
+
+pub(crate) fn encode_message(msg: &Message) -> Vec<u8> {
+    stored_message(msg).encode_to_vec()
+}
+
+/// The message `msg_id` whose body is `bytes`.
+pub(crate) fn decode_message(msg_id: &str, bytes: &[u8]) -> Result<Message, CorruptValue> {
+    Ok(message_of(msg_id, decode("message body", bytes)?))
 }
 
 pub(crate) fn encode_claim(claim: &ClaimInfo) -> Vec<u8> {
@@ -172,6 +183,53 @@ pub(crate) fn decode_claim(msg_id: &str, bytes: &[u8]) -> Result<ClaimInfo, Corr
         claimed_at: record.claimed_at,
         claim_token: record.claim_token,
         delivery_count: record.delivery_count,
+    })
+}
+
+pub(crate) fn encode_dead_letter(letter: &DeadLetter) -> Vec<u8> {
+    assert!(letter.delivery_count >= 1);
+    let cause = match letter.cause {
+        DeadLetterCause::NackLimit => proto::DeadLetterCause::NackLimit,
+        DeadLetterCause::ReclaimLimit => proto::DeadLetterCause::ReclaimLimit,
+        DeadLetterCause::Rejected => proto::DeadLetterCause::Rejected,
+    };
+    proto::DeadLetter {
+        message: Some(stored_message(&letter.message)),
+        delivery_count: letter.delivery_count,
+        cause: cause.into(),
+        reason: letter.reason.clone(),
+        worker_id: letter.worker_id.clone(),
+        dead_at_ms: letter.dead_at_ms,
+    }
+    .encode_to_vec()
+}
+
+/// The dead letter of message `msg_id` whose value is `bytes`.
+pub(crate) fn decode_dead_letter(msg_id: &str, bytes: &[u8]) -> Result<DeadLetter, CorruptValue> {
+    let record: proto::DeadLetter = decode("dead letter", bytes)?;
+    let cause = match proto::DeadLetterCause::try_from(record.cause) {
+        Ok(proto::DeadLetterCause::NackLimit) => DeadLetterCause::NackLimit,
+        Ok(proto::DeadLetterCause::ReclaimLimit) => DeadLetterCause::ReclaimLimit,
+        Ok(proto::DeadLetterCause::Rejected) => DeadLetterCause::Rejected,
+        Ok(proto::DeadLetterCause::Unspecified) | Err(_) => {
+            return Err(CorruptValue(format!(
+                "dead letter {msg_id} with cause {}",
+                record.cause
+            )))
+        }
+    };
+    let (Some(stored), 1..) = (record.message, record.delivery_count) else {
+        return Err(CorruptValue(format!(
+            "dead letter {msg_id} without a body or a delivery"
+        )));
+    };
+    Ok(DeadLetter {
+        message: message_of(msg_id, stored),
+        delivery_count: record.delivery_count,
+        cause,
+        reason: record.reason,
+        worker_id: record.worker_id,
+        dead_at_ms: record.dead_at_ms,
     })
 }
 
@@ -226,6 +284,17 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    fn sample_dead_letter() -> DeadLetter {
+        DeadLetter {
+            message: sample_message(),
+            delivery_count: 3,
+            cause: DeadLetterCause::Rejected,
+            reason: "r".to_string(),
+            worker_id: "w".to_string(),
+            dead_at_ms: 1_700_000_003_000,
+        }
+    }
+
     fn sample_claim() -> ClaimInfo {
         ClaimInfo {
             msg_id: sample_message().msg_id,
@@ -271,13 +340,19 @@ mod tests {
             ("key finished", keys::finished("q:1")),
             ("key group", keys::group("g")),
             ("key state", keys::state("ns:x", "k\0")),
+            ("key dead_letter", keys::dead_letter("q:1", "m")),
             ("value format", encode_format(1)),
-            ("value queue", encode_queue(5)),
+            ("value queue", encode_queue(5, None)),
+            ("value queue max_deliveries", encode_queue(5, Some(0))),
             ("value total", encode_total(258).to_vec()),
             ("value pending", encode_pending("m", 3)),
             ("value message", encode_message(&message)),
             ("value claim", encode_claim(&claim)),
             ("value group", encode_group(&group)),
+            (
+                "value dead_letter",
+                encode_dead_letter(&sample_dead_letter()),
+            ),
         ];
         let snapshot: &[(&str, &str)] = &[
             ("key format", "00"),
@@ -292,8 +367,10 @@ mod tests {
             ("key finished", "08713a310001"),
             ("key group", "09670001"),
             ("key state", "0a6e733a7800016b00ff0001"),
+            ("key dead_letter", "0b713a3100016d0001"),
             ("value format", "0801"),
             ("value queue", "0805"),
+            ("value queue max_deliveries", "08051000"),
             ("value total", "0201000000000000"),
             ("value pending", "0a016d1003"),
             (
@@ -304,6 +381,10 @@ mod tests {
             (
                 "value group",
                 "08021a04675f70301a04675f70312100008040fc54d941",
+            ),
+            (
+                "value dead_letter",
+                "0a160a030001ff1100002040fc54d9411a060a016b120176100318032201722a017730b8e795ffbc31",
             ),
         ];
         assert_eq!(encoded.len(), snapshot.len());
@@ -340,8 +421,30 @@ mod tests {
         assert_eq!(decoded.delivery_count, 2);
         let pending = decode_pending(&encode_pending("m", 3)).unwrap();
         assert_eq!((pending.msg_id.as_str(), pending.delivery_count), ("m", 3));
-        assert_eq!(decode_queue(&encode_queue(5)).unwrap(), 5);
-        assert_eq!(decode_queue(&encode_queue(0)).unwrap(), 0);
+        let queue = decode_queue(&encode_queue(5, None)).unwrap();
+        assert_eq!((queue.max_pending, queue.max_deliveries), (5, None));
+        let queue = decode_queue(&encode_queue(0, Some(0))).unwrap();
+        assert_eq!((queue.max_pending, queue.max_deliveries), (0, Some(0)));
+        let letter = sample_dead_letter();
+        let decoded =
+            decode_dead_letter(&letter.message.msg_id, &encode_dead_letter(&letter)).unwrap();
+        assert_eq!(decoded.message.msg_id, letter.message.msg_id);
+        assert_eq!(decoded.message.payload, letter.message.payload);
+        assert_eq!(decoded.message.metadata, letter.message.metadata);
+        assert_eq!(
+            (decoded.delivery_count, decoded.cause, decoded.dead_at_ms),
+            (3, DeadLetterCause::Rejected, letter.dead_at_ms)
+        );
+        assert_eq!(
+            (decoded.reason, decoded.worker_id),
+            (letter.reason, letter.worker_id)
+        );
+        let without_cause = proto::DeadLetter {
+            message: Some(proto::StoredMessage::default()),
+            delivery_count: 1,
+            ..proto::DeadLetter::default()
+        };
+        assert!(decode_dead_letter("m", &without_cause.encode_to_vec()).is_err());
         assert_eq!(decode_total(&encode_total(258)).unwrap(), 258);
         assert_eq!(
             decode_format(&encode_format(FORMAT_VERSION)).unwrap(),

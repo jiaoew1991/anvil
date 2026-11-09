@@ -68,15 +68,24 @@ impl AnvilBrokerInner {
             config.acked_retention_secs
         );
 
-        let storage = Arc::new(AnvilStorage::new(&config.db_path).await?);
+        let storage = Arc::new(
+            AnvilStorage::new(&config.db_path)
+                .await?
+                .with_default_max_deliveries(config.default_max_deliveries),
+        );
         Self::new_with_storage(config, storage).await
     }
 
-    /// Create a new broker instance using existing storage
+    /// Create a new broker instance using existing storage, built with the
+    /// config's `default_max_deliveries`: the storage applies it.
     pub async fn new_with_storage(
         config: AnvilConfig,
         storage: Arc<AnvilStorage>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        assert_eq!(
+            storage.default_max_deliveries, config.default_max_deliveries,
+            "storage built with another default_max_deliveries than the config's"
+        );
         let state = Arc::new(AnvilState::new());
 
         // Recovery and GC tasks now only use storage (no memory state to recover)

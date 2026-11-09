@@ -240,7 +240,7 @@ mod tests {
                 .push_message(up, &Message::new(b"in".to_vec()))
                 .await
                 .unwrap();
-            storage.create_queue(down, 0).await.unwrap();
+            storage.create_queue(down, 0, None).await.unwrap();
             let claimed = storage.claim_messages(up, 1, "w", "l").await.unwrap();
             let (ids, tokens) = split_claims(&claimed);
             let output = [Message::new(b"out".to_vec())];
@@ -288,7 +288,7 @@ mod tests {
         let store = FaultStore::new(memory(), 4);
         let queue = "q";
         let storage = open(&store).await;
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         store.set_faults(slow_puts(Duration::from_millis(400)));
         let message = Message::new(b"x".to_vec());

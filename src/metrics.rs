@@ -23,8 +23,8 @@
 //!
 //! Queue depth and totals are observed from the in-memory queue counters at
 //! export time, so they add no work to push, claim or ack. Only events with
-//! no standing counter (redeliveries, reclaimed leases, GC deletions, RPC
-//! latency) are recorded where they happen.
+//! no standing counter (redeliveries, reclaimed leases, dead-lettered
+//! messages, GC deletions, RPC latency) are recorded where they happen.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -85,9 +85,12 @@ fn provider() -> Option<&'static SdkMeterProvider> {
 pub struct Events {
     /// Claims of a message that had been delivered before.
     pub redelivered: Counter<u64>,
-    /// Claims returned to pending because their lease died or they were held
-    /// past `claim_age_timeout_secs`.
+    /// Claims taken back because their lease died or they were held past
+    /// `claim_age_timeout_secs`: returned to pending, or dead-lettered at the
+    /// delivery limit.
     pub reclaimed: Counter<u64>,
+    /// Messages dead-lettered, by queue and cause.
+    pub dead_lettered: Counter<u64>,
     /// Expired acked entries deleted by GC.
     pub gc_deleted: Counter<u64>,
     /// Server-side RPC latency, per the OpenTelemetry RPC conventions.
@@ -112,7 +115,12 @@ pub fn events() -> &'static Events {
             reclaimed: meter
                 .u64_counter("anvil.claims.reclaimed")
                 .with_unit("{message}")
-                .with_description("Claims returned to pending after their lease died or aged out")
+                .with_description("Claims taken back after their lease died or aged out")
+                .build(),
+            dead_lettered: meter
+                .u64_counter("anvil.messages.dead_lettered")
+                .with_unit("{message}")
+                .with_description("Messages taken out of circulation as dead letters")
                 .build(),
             gc_deleted: meter
                 .u64_counter("anvil.gc.deleted")
@@ -133,6 +141,7 @@ pub fn events() -> &'static Events {
 pub struct BrokerGauges {
     _pending: ObservableGauge<u64>,
     _claimed: ObservableGauge<u64>,
+    _dead: ObservableGauge<u64>,
     _pushed: ObservableCounter<u64>,
     _acked: ObservableCounter<u64>,
     _leases: ObservableGauge<u64>,
@@ -174,6 +183,11 @@ impl BrokerGauges {
                 "anvil.queue.claimed",
                 "Messages claimed and not yet acked or returned",
                 |meta| meta.claimed_count,
+            ),
+            _dead: gauge(
+                "anvil.queue.dead",
+                "Dead letters waiting for a redrive or a purge",
+                |meta| meta.dead_count,
             ),
             _pushed: total(
                 "anvil.queue.pushed",

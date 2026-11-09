@@ -13,9 +13,13 @@ message StoreFormat {
 
 // Value of a queue record. The queue exists while its record does.
 message QueueRecord {
-  // Bound on the queue's in-flight messages (pushed, not yet acked); 0 is
-  // unbounded.
+  // Bound on the queue's in-flight messages (pushed, neither acked nor
+  // dead-lettered); 0 is unbounded.
   uint64 max_pending = 1;
+  // Deliveries a message gets before a failed one is dead-lettered; 0 is
+  // unlimited. Absent means the queue never set a limit, and the broker's
+  // configured default applies.
+  optional uint32 max_deliveries = 2;
 }
 
 // Value of a pending key: the message waiting at that seq.
@@ -59,3 +63,33 @@ message QueueGroup {
   double created_at = 4;
 }
 
+
+// Value of a dead letter key: a message taken out of circulation, which only
+// a redrive returns to pending or a purge deletes. It carries the body whole,
+// so a redrive restores the message exactly. Its queue and msg_id are the
+// key's.
+message DeadLetter {
+  StoredMessage message = 1;
+  // Deliveries the message had, the last one included, so at least 1.
+  uint32 delivery_count = 2;
+  DeadLetterCause cause = 3;
+  // The reason of the nack that settled the last delivery; empty for a
+  // reclaim.
+  string reason = 4;
+  // The worker that held the last claim.
+  string worker_id = 5;
+  // Wall-clock time the message was dead-lettered, milliseconds since the
+  // Unix epoch.
+  uint64 dead_at_ms = 6;
+}
+
+// Why a message was dead-lettered. Never unspecified in a stored value.
+enum DeadLetterCause {
+  DEAD_LETTER_CAUSE_UNSPECIFIED = 0;
+  // A nack settled its last allowed delivery.
+  DEAD_LETTER_CAUSE_NACK_LIMIT = 1;
+  // A reclaim settled its last allowed delivery.
+  DEAD_LETTER_CAUSE_RECLAIM_LIMIT = 2;
+  // A nack asked for it, whatever the delivery count.
+  DEAD_LETTER_CAUSE_REJECTED = 3;
+}

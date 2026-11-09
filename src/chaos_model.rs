@@ -89,6 +89,7 @@ mod tests {
                     .create_queue(Request::new(CreateQueueRequest {
                         queue: queue.to_string(),
                         max_pending: 0,
+                        max_deliveries: None,
                     }))
                     .await
                     .unwrap();

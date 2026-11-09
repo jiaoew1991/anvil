@@ -31,7 +31,9 @@ use tonic::{Request, Response, Status, Streaming};
 
 #[allow(unused_imports)]
 use crate::state::AnvilState;
-use crate::storage::{self, AnvilStorage, Rejection, StorageError};
+use crate::storage::{
+    self, AnvilStorage, NackOptions, Rejection, StorageError, DEAD_LETTERS_PER_CALL_MAX,
+};
 use crate::types::{ClaimedMessage, Message};
 
 // Generated protobuf types. Generated code is not ours to lint: each Rust
@@ -63,6 +65,7 @@ fn storage_status(rpc: &str, error: StorageError) -> Status {
         Rejection::NotFound(message) => Status::not_found(message.as_str()),
         Rejection::InvalidArgument(message) => Status::invalid_argument(message.as_str()),
         Rejection::QueueFull(message) => Status::resource_exhausted(message.as_str()),
+        Rejection::QueueFinished(message) => Status::failed_precondition(message.as_str()),
     }
 }
 
@@ -88,6 +91,10 @@ fn check_claims(msg_ids: &[String], claim_tokens: &[String]) -> Result<(), Statu
             claim_tokens.len()
         )));
     }
+    check_distinct(msg_ids)
+}
+
+fn check_distinct(msg_ids: &[String]) -> Result<(), Status> {
     let mut seen = HashSet::with_capacity(msg_ids.len());
     if let Some(repeated) = msg_ids.iter().find(|id| !seen.insert(id.as_str())) {
         return Err(Status::invalid_argument(format!(
@@ -95,6 +102,18 @@ fn check_claims(msg_ids: &[String], claim_tokens: &[String]) -> Result<(), Statu
         )));
     }
     Ok(())
+}
+
+/// Refuses a redrive or purge naming no dead letter, more than one call may
+/// handle, or one msg_id twice, which would count one dead letter twice.
+fn check_dead_letter_ids(msg_ids: &[String]) -> Result<(), Status> {
+    if msg_ids.is_empty() || msg_ids.len() > DEAD_LETTERS_PER_CALL_MAX {
+        return Err(Status::invalid_argument(format!(
+            "msg_ids must name 1 to {DEAD_LETTERS_PER_CALL_MAX} dead letters, got {}",
+            msg_ids.len()
+        )));
+    }
+    check_distinct(msg_ids)
 }
 
 /// Anvil gRPC service implementation
@@ -202,7 +221,11 @@ impl AnvilService {
             }
 
             // --- Nack: return messages to queue ---
-            Some(complete_request::Action::Nack(_)) => {
+            Some(complete_request::Action::Nack(nack)) => {
+                let nack = NackOptions {
+                    dead_letter: nack.dead_letter,
+                    reason: &nack.reason,
+                };
                 let result = if has_state {
                     self.storage
                         .nack_messages_with_state(
@@ -211,6 +234,7 @@ impl AnvilService {
                             &req.claim_tokens,
                             &req.worker_id,
                             &req.lease_id,
+                            nack,
                             state_ns,
                             &state_puts,
                             &state_deletes,
@@ -224,6 +248,7 @@ impl AnvilService {
                             &req.claim_tokens,
                             &req.worker_id,
                             &req.lease_id,
+                            nack,
                         )
                         .await
                 };
@@ -683,7 +708,11 @@ impl Anvil for AnvilService {
     ) -> Result<Response<CreateQueueResponse>, Status> {
         let req = request.into_inner();
         check_queue_name(&req.queue, "queue")?;
-        match self.storage.create_queue(&req.queue, req.max_pending).await {
+        match self
+            .storage
+            .create_queue(&req.queue, req.max_pending, req.max_deliveries)
+            .await
+        {
             Ok(()) => {
                 self.state.get_or_create_queue(&req.queue);
                 Ok(Response::new(CreateQueueResponse { created: true }))
@@ -734,6 +763,7 @@ impl Anvil for AnvilService {
                             claimed_count: meta.claimed_count as i64,
                             total_pushed: meta.total_pushed as i64,
                             total_acked: meta.total_acked as i64,
+                            dead_count: meta.dead_count as i64,
                         },
                     );
                 }
@@ -754,6 +784,85 @@ impl Anvil for AnvilService {
             total_workers: 0,
             uptime_secs: 0,
         }))
+    }
+
+    // =========================================================================
+    // Dead Letter API
+    // =========================================================================
+
+    async fn list_dead_letters(
+        &self,
+        request: Request<ListDeadLettersRequest>,
+    ) -> Result<Response<ListDeadLettersResponse>, Status> {
+        let req = request.into_inner();
+        check_queue_name(&req.queue, "queue")?;
+        let limit = req.limit as usize;
+        if !(1..=DEAD_LETTERS_PER_CALL_MAX).contains(&limit) {
+            return Err(Status::invalid_argument(format!(
+                "limit must be 1 to {DEAD_LETTERS_PER_CALL_MAX}, got {limit}"
+            )));
+        }
+        let start_after = Some(req.start_after.as_str()).filter(|id| !id.is_empty());
+        let letters = self
+            .storage
+            .list_dead_letters(&req.queue, start_after, limit)
+            .await
+            .map_err(|e| storage_status("ListDeadLetters", e))?;
+        // A full page may be followed by more; a short one is the last.
+        let next_start_after = match letters.last() {
+            Some(last) if letters.len() == limit => last.message.msg_id.clone(),
+            _ => String::new(),
+        };
+        let dead_letters = letters
+            .into_iter()
+            .map(|letter| DeadLetter {
+                msg_id: letter.message.msg_id,
+                payload: letter.message.payload,
+                metadata: letter.message.metadata,
+                delivery_count: letter.delivery_count,
+                cause: letter.cause.as_str().to_string(),
+                reason: letter.reason,
+                worker_id: letter.worker_id,
+                dead_at_ms: letter.dead_at_ms,
+            })
+            .collect();
+        Ok(Response::new(ListDeadLettersResponse {
+            dead_letters,
+            next_start_after,
+        }))
+    }
+
+    async fn redrive_dead_letters(
+        &self,
+        request: Request<RedriveDeadLettersRequest>,
+    ) -> Result<Response<RedriveDeadLettersResponse>, Status> {
+        let req = request.into_inner();
+        check_queue_name(&req.queue, "queue")?;
+        check_dead_letter_ids(&req.msg_ids)?;
+        let (redriven, missing) = self
+            .storage
+            .redrive_dead_letters(&req.queue, &req.msg_ids)
+            .await
+            .map_err(|e| storage_status("RedriveDeadLetters", e))?;
+        Ok(Response::new(RedriveDeadLettersResponse {
+            redriven,
+            missing,
+        }))
+    }
+
+    async fn purge_dead_letters(
+        &self,
+        request: Request<PurgeDeadLettersRequest>,
+    ) -> Result<Response<PurgeDeadLettersResponse>, Status> {
+        let req = request.into_inner();
+        check_queue_name(&req.queue, "queue")?;
+        check_dead_letter_ids(&req.msg_ids)?;
+        let (purged, missing) = self
+            .storage
+            .purge_dead_letters(&req.queue, &req.msg_ids)
+            .await
+            .map_err(|e| storage_status("PurgeDeadLetters", e))?;
+        Ok(Response::new(PurgeDeadLettersResponse { purged, missing }))
     }
 
     // =========================================================================
@@ -818,6 +927,7 @@ impl Anvil for AnvilService {
                 &req.group_name,
                 req.num_partitions as u32,
                 req.max_pending_per_partition,
+                req.max_deliveries,
             )
             .await
         {
@@ -899,6 +1009,7 @@ impl Anvil for AnvilService {
                             claimed_count: claimed,
                             total_pushed: meta.total_pushed as i64,
                             total_acked: meta.total_acked as i64,
+                            dead_count: meta.dead_count as i64,
                         }
                     })
                     .collect();
@@ -1021,6 +1132,7 @@ mod tests {
                 group_name: "group".to_string(),
                 num_partitions: 2,
                 max_pending_per_partition: 0,
+                max_deliveries: None,
             }))
             .await
             .unwrap();
@@ -1066,7 +1178,7 @@ mod tests {
                 "worker_id mismatch",
                 CompleteRequest {
                     worker_id: "other".to_string(),
-                    action: Some(complete_request::Action::Nack(NackAction {})),
+                    action: Some(complete_request::Action::Nack(NackAction::default())),
                     ..ack.clone()
                 },
             ),
@@ -1161,6 +1273,7 @@ mod tests {
             .create_queue(Request::new(CreateQueueRequest {
                 queue: "bounded".to_string(),
                 max_pending: 1,
+                max_deliveries: None,
             }))
             .await
             .unwrap();
@@ -1201,6 +1314,7 @@ mod tests {
             .create_queue(Request::new(CreateQueueRequest {
                 queue: "known".to_string(),
                 max_pending: 0,
+                max_deliveries: None,
             }))
             .await
             .unwrap();

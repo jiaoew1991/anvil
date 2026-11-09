@@ -117,6 +117,7 @@ mod tests {
             .create_queue(CreateQueueRequest {
                 queue: queue.to_string(),
                 max_pending: 0,
+                max_deliveries: None,
             })
             .await
             .unwrap();
@@ -229,6 +230,191 @@ mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("[{queue}] stats did not settle within {WAIT_DEADLINE:?}"))
+    }
+
+    /// Goal: a poison message reaches the dead letters over the wire, is
+    /// listed with why it died, and is redriven, rejected again and purged;
+    /// malformed dead letter requests are refused. Method: on a queue that
+    /// allows two deliveries, nack one message twice while acking another,
+    /// then drive the dead letter RPCs and check the stats after each.
+    #[tokio::test]
+    async fn test_grpc_poison_message_is_dead_lettered_and_redriven() {
+        let _clock = SimClock::acquire();
+        let (_broker, client) = start_broker(LONG_TIMEOUT_SECS, LONG_TIMEOUT_SECS).await;
+        let queue = "poison";
+        client
+            .clone()
+            .create_queue(CreateQueueRequest {
+                queue: queue.to_string(),
+                max_pending: 0,
+                max_deliveries: Some(2),
+            })
+            .await
+            .unwrap();
+        let pushed = push(&client, queue, &[b"poison", b"good"]).await;
+        let lease = Heartbeat::open(&client, "worker").await;
+        let failing = complete_request::Action::Nack(NackAction {
+            dead_letter: false,
+            reason: "parse error".to_string(),
+        });
+
+        let claimed = claim(&client, queue, "worker", &lease.lease_id, 2).await;
+        let (poison, good) = (&claimed[0], &claimed[1]);
+        assert_eq!(poison.msg_id, pushed[0]);
+        complete(
+            &client,
+            queue,
+            &[poison],
+            "worker",
+            &lease.lease_id,
+            failing.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        ack(&client, queue, &[good], "worker", &lease.lease_id)
+            .await
+            .unwrap();
+        let again = claim(&client, queue, "worker", &lease.lease_id, 2).await;
+        assert_eq!((again.len(), again[0].delivery_count), (1, 2));
+        complete(
+            &client,
+            queue,
+            &[&again[0]],
+            "worker",
+            &lease.lease_id,
+            failing,
+            None,
+        )
+        .await
+        .unwrap();
+        let s = stats(&client, queue).await;
+        assert_eq!(
+            (
+                s.pending_count,
+                s.claimed_count,
+                s.total_acked,
+                s.dead_count
+            ),
+            (0, 0, 1, 1)
+        );
+
+        let listed = client
+            .clone()
+            .list_dead_letters(ListDeadLettersRequest {
+                queue: queue.to_string(),
+                start_after: String::new(),
+                limit: 10,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.next_start_after, "");
+        let letter = &listed.dead_letters[0];
+        assert_eq!(listed.dead_letters.len(), 1);
+        assert_eq!(
+            (letter.msg_id.as_str(), letter.payload.as_slice()),
+            (pushed[0].as_str(), b"poison".as_slice())
+        );
+        assert_eq!(
+            (
+                letter.cause.as_str(),
+                letter.reason.as_str(),
+                letter.delivery_count
+            ),
+            ("nack_limit", "parse error", 2)
+        );
+        assert_eq!(letter.worker_id, "worker");
+
+        let malformed = [
+            (queue, vec![]),
+            (queue, vec![pushed[0].clone(), pushed[0].clone()]),
+            ("", vec![pushed[0].clone()]),
+        ];
+        for (queue, msg_ids) in malformed {
+            let request = RedriveDeadLettersRequest {
+                queue: queue.to_string(),
+                msg_ids,
+            };
+            let refused = client.clone().redrive_dead_letters(request).await;
+            assert_eq!(refused.unwrap_err().code(), tonic::Code::InvalidArgument);
+        }
+        let bad_limit = client
+            .clone()
+            .list_dead_letters(ListDeadLettersRequest {
+                queue: queue.to_string(),
+                start_after: String::new(),
+                limit: 1001,
+            })
+            .await;
+        assert_eq!(bad_limit.unwrap_err().code(), tonic::Code::InvalidArgument);
+        let unknown = client
+            .clone()
+            .purge_dead_letters(PurgeDeadLettersRequest {
+                queue: "no-such-queue".to_string(),
+                msg_ids: vec![pushed[0].clone()],
+            })
+            .await;
+        assert_eq!(unknown.unwrap_err().code(), tonic::Code::NotFound);
+
+        let redriven = client
+            .clone()
+            .redrive_dead_letters(RedriveDeadLettersRequest {
+                queue: queue.to_string(),
+                msg_ids: vec![pushed[0].clone()],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(redriven.redriven, [pushed[0].clone()]);
+        let redelivered = claim(&client, queue, "worker", &lease.lease_id, 2).await;
+        assert_eq!(redelivered[0].delivery_count, 1);
+        let reject = complete_request::Action::Nack(NackAction {
+            dead_letter: true,
+            reason: "unfixable".to_string(),
+        });
+        complete(
+            &client,
+            queue,
+            &[&redelivered[0]],
+            "worker",
+            &lease.lease_id,
+            reject,
+            None,
+        )
+        .await
+        .unwrap();
+
+        client
+            .clone()
+            .mark_queue_finished(MarkQueueFinishedRequest {
+                queue: queue.to_string(),
+            })
+            .await
+            .unwrap();
+        let refused = client
+            .clone()
+            .redrive_dead_letters(RedriveDeadLettersRequest {
+                queue: queue.to_string(),
+                msg_ids: vec![pushed[0].clone()],
+            })
+            .await;
+        assert_eq!(refused.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        let purged = client
+            .clone()
+            .purge_dead_letters(PurgeDeadLettersRequest {
+                queue: queue.to_string(),
+                msg_ids: vec![pushed[0].clone(), "unknown".to_string()],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            (purged.purged, purged.missing),
+            (vec![pushed[0].clone()], vec!["unknown".to_string()])
+        );
+        let s = stats(&client, queue).await;
+        assert_eq!((s.total_pushed, s.total_acked, s.dead_count), (2, 2, 0));
     }
 
     /// Goal: the basic worker cycle works over the wire. Method: push three
@@ -419,6 +605,7 @@ mod tests {
                 group_name: group.to_string(),
                 num_partitions: 3,
                 max_pending_per_partition: 0,
+                max_deliveries: None,
             })
             .await
             .unwrap()

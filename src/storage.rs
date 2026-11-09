@@ -21,7 +21,7 @@
 // with CAS loops instead of SlateDB SerializableSnapshot transactions.
 // This eliminates transaction conflicts at high concurrency.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -32,7 +32,10 @@ use slatedb::{Db, Error as SlateError, MergeOperator, MergeOperatorError, WriteB
 use crate::format::{self, FormatError, FORMAT_VERSION};
 use crate::keys;
 use crate::state::lease_expired;
-use crate::types::{mono_now, now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta};
+use crate::types::{
+    mono_now, now_nanos, ClaimInfo, ClaimedMessage, DeadLetter, DeadLetterCause, Message,
+    QueueGroupMeta, DEFAULT_MAX_DELIVERIES,
+};
 
 /// Upper bound on keys one GC write deletes, so a large expired backlog is
 /// retired in many small commits instead of one batch that stalls writers.
@@ -40,6 +43,11 @@ pub(crate) const GC_BATCH_KEYS_MAX: usize = 10_000;
 
 /// Upper bound on keys one GC pass deletes; the next pass resumes the rest.
 pub(crate) const GC_PASS_KEYS_MAX: usize = 1_000_000;
+
+/// Upper bound on the dead letters one list, redrive or purge handles, so an
+/// admin call reads and writes a bounded batch however many letters a queue
+/// holds.
+pub const DEAD_LETTERS_PER_CALL_MAX: usize = 1_000;
 
 pub type StorageError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -60,6 +68,9 @@ pub enum Rejection {
     InvalidArgument(String),
     /// A bounded queue has no room for the messages pushed.
     QueueFull(String),
+    /// The queue is marked finished, and a consumer may already have been
+    /// told it drained, so it takes no work back.
+    QueueFinished(String),
 }
 
 impl std::fmt::Display for Rejection {
@@ -68,7 +79,8 @@ impl std::fmt::Display for Rejection {
             Rejection::Fenced(message)
             | Rejection::NotFound(message)
             | Rejection::InvalidArgument(message)
-            | Rejection::QueueFull(message) => f.write_str(message),
+            | Rejection::QueueFull(message)
+            | Rejection::QueueFinished(message) => f.write_str(message),
         }
     }
 }
@@ -143,8 +155,11 @@ pub struct QueueState {
     pub total_claimed: u64,
     /// Monotonic count of msgs that left claimed state (ack OR nack).
     pub total_unclaimed: u64,
-    /// Total messages ever acked.
+    /// Total messages ever acked, dead letters purged included.
     pub total_acked: u64,
+    /// Dead letters the queue holds, derived from their keys on load. Every
+    /// message pushed is pending, claimed, acked or dead.
+    pub dead_letters: u64,
     /// In-flight reservations keyed by `base_seq`. Each entry's `done`
     /// flips when the matching `QueueWrite` is dropped (after its write,
     /// landed or not). The committer walks the front of the map and
@@ -176,6 +191,11 @@ pub struct QueueCounters {
     pub state: std::sync::Mutex<QueueState>,
     /// Notified when the last write admitted to a deleted queue finishes.
     idle: tokio::sync::Notify,
+    /// Held by a redrive or purge from its first read of a dead letter until
+    /// its batch has landed, so two of them never act on one dead letter.
+    /// Settlements write dead letters but never read one, so they do not
+    /// take it.
+    dead_letter_admin: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl QueueCounters {
@@ -214,17 +234,23 @@ pub struct PushReservation {
 /// path: an `Ok` return, a `?` error, a panic, or the request future
 /// being cancelled. It closes its push reservation (the watermark must not
 /// wedge behind it), returns a claim abandoned before its write, and, only if
-/// the batch landed, retires the claims it settled.
+/// the batch landed, retires the claims and dead letters it settled.
 struct QueueWrite {
     counters: Arc<QueueCounters>,
     /// Base seq of the range this write fills at the tail of pending.
     push_base: Option<u64>,
     /// Seqs this claim reserved and has not yet handed to its write.
     claimed: Vec<u64>,
-    /// Claims this write acks, retired once it lands.
+    /// Claims this write acks and dead letters it purges, counted acked
+    /// once it lands.
     acked: u64,
-    /// Claims this write acks or requeues, retired once it lands.
+    /// Claims this write acks, requeues or dead-letters, retired once it
+    /// lands.
     unclaimed: u64,
+    /// Claims this write dead-letters, counted dead once it lands.
+    dead_added: u64,
+    /// Dead letters this write redrives or purges, retired once it lands.
+    dead_removed: u64,
     /// Set by `commit` once the batch is applied.
     landed: bool,
 }
@@ -246,6 +272,8 @@ impl QueueWrite {
             claimed: Vec::new(),
             acked: 0,
             unclaimed: 0,
+            dead_added: 0,
+            dead_removed: 0,
             landed: false,
         })
     }
@@ -260,6 +288,7 @@ impl QueueWrite {
         match tail {
             Tail::Pushed => s.total_pushed += count,
             Tail::Requeued => self.unclaimed += count,
+            Tail::Redriven => self.dead_removed += count,
         }
         let base = s.push_seq_alloc;
         s.push_seq_alloc += count;
@@ -273,6 +302,20 @@ impl QueueWrite {
     fn ack(&mut self, count: u64) {
         self.acked += count;
         self.unclaimed += count;
+    }
+
+    /// Records `count` claims this write dead-letters. They reserve no seq:
+    /// a dead letter waits outside pending.
+    fn dead_letter(&mut self, count: u64) {
+        self.dead_added += count;
+        self.unclaimed += count;
+    }
+
+    /// Records `count` dead letters this write purges. They count acked, so
+    /// that every message pushed stays pending, claimed, acked or dead.
+    fn purge(&mut self, count: u64) {
+        self.acked += count;
+        self.dead_removed += count;
     }
 
     /// Reserves up to `batch_size` pending seqs, abandoned ones first. They
@@ -323,6 +366,9 @@ impl Drop for QueueWrite {
         if self.landed {
             s.total_acked += self.acked;
             s.total_unclaimed += self.unclaimed;
+            s.dead_letters += self.dead_added;
+            assert!(s.dead_letters >= self.dead_removed);
+            s.dead_letters -= self.dead_removed;
         }
         let abandoned = self.claimed.len() as u64;
         assert!(s.claimed_count() >= abandoned);
@@ -363,6 +409,8 @@ struct Landing {
     settlement: Option<SettlementHold>,
     /// `delete_queue`'s hold on `counters_loading`.
     loading: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// A redrive's or purge's hold on `QueueCounters::dead_letter_admin`.
+    dead_letter_admin: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// What a push reservation puts at the tail of pending.
@@ -372,6 +420,16 @@ enum Tail {
     Pushed,
     /// Claims the write returns to pending.
     Requeued,
+    /// Dead letters the write returns to pending. They were pushed once
+    /// already, so they add to no total.
+    Redriven,
+}
+
+/// What returns the claims `requeue_claims` settles.
+#[derive(Clone, Copy)]
+enum Requeue<'a> {
+    Nack(NackOptions<'a>),
+    Reclaim,
 }
 
 /// How far `commit` waits for a batch.
@@ -394,8 +452,21 @@ pub struct QueueMeta {
     pub claimed_count: u64,
     /// Total messages ever pushed (lifetime counter)
     pub total_pushed: u64,
-    /// Total messages ever acked (lifetime counter)
+    /// Total messages ever acked, dead letters purged included (lifetime
+    /// counter)
     pub total_acked: u64,
+    /// Dead letters the queue holds
+    pub dead_count: u64,
+}
+
+/// What a nack asks for beyond returning its messages.
+#[derive(Clone, Copy, Default)]
+pub struct NackOptions<'a> {
+    /// Dead-letter the messages now, whatever their delivery count: the
+    /// worker knows a retry cannot succeed.
+    pub dead_letter: bool,
+    /// Why the worker failed them, kept with any message dead-lettered.
+    pub reason: &'a str,
 }
 
 /// Options for ack operations
@@ -484,8 +555,16 @@ pub struct AnvilStorage {
     /// Per-group round-robin counters for O(1) steal path in claim_from_group
     steal_rr: std::sync::Mutex<HashMap<String, u64>>,
     /// Bounds of bounded queues; an unbounded queue has no entry. Mirrors the
-    /// persisted `max_pending:{queue}` keys of the queues loaded so far.
+    /// `max_pending` of the queue records loaded so far.
     max_pending_limits: DashMap<String, u64>,
+    /// Delivery limits of the queues that set one, 0 included; a queue
+    /// without an entry takes `default_max_deliveries`. Mirrors the
+    /// `max_deliveries` of the queue records loaded so far.
+    max_deliveries_limits: DashMap<String, u32>,
+    /// The delivery limit of a queue that sets none (see
+    /// `AnvilConfig::default_max_deliveries`). It is broker policy, not
+    /// data: a queue record stores only whether the queue set its own.
+    pub(crate) default_max_deliveries: u32,
     /// Claims, as claim key and the token presented for it, whose
     /// settlement (ack, nack or reclaim) is between its check and its
     /// write. Without the hold, two settlements of one message both
@@ -586,6 +665,8 @@ impl AnvilStorage {
             counters_loading: Arc::new(tokio::sync::Mutex::new(())),
             steal_rr: std::sync::Mutex::new(HashMap::new()),
             max_pending_limits: DashMap::new(),
+            max_deliveries_limits: DashMap::new(),
+            default_max_deliveries: DEFAULT_MAX_DELIVERIES,
             settling: Arc::new(DashSet::new()),
             taken_at: DashMap::new(),
             renewed_at: DashMap::new(),
@@ -599,6 +680,13 @@ impl AnvilStorage {
             return Err(e);
         }
         Ok(storage)
+    }
+
+    /// Sets the delivery limit of every queue that sets none. Set before
+    /// the storage serves, since the limit is read at every settlement.
+    pub fn with_default_max_deliveries(mut self, default_max_deliveries: u32) -> Self {
+        self.default_max_deliveries = default_max_deliveries;
+        self
     }
 
     /// Brings the store to `FORMAT_VERSION` before anything else reads it:
@@ -671,6 +759,7 @@ impl AnvilStorage {
                 mut writes,
                 settlement,
                 loading,
+                dead_letter_admin,
             } = landing;
             #[allow(clippy::disallowed_methods)] // the one sanctioned write path
             let written = db.write(batch).await;
@@ -684,6 +773,7 @@ impl AnvilStorage {
             drop(writes);
             drop(settlement);
             drop(loading);
+            drop(dead_letter_admin);
             written
         })
         .await??;
@@ -932,9 +1022,9 @@ impl AnvilStorage {
         Ok((claim_seq, newest_seq + 1))
     }
 
-    /// Number of messages of `queue` claimed and not yet settled.
-    async fn count_claimed(&self, queue: &str) -> Result<u64, StorageError> {
-        let mut iter = self.db.scan(keys::claims(Some(queue))).await?;
+    /// Number of keys in `range`, for the counts a queue derives on load.
+    async fn count_keys(&self, range: std::ops::Range<Vec<u8>>) -> Result<u64, StorageError> {
+        let mut iter = self.db.scan(range).await?;
         let mut count = 0;
         while iter.next().await?.is_some() {
             count += 1;
@@ -968,12 +1058,16 @@ impl AnvilStorage {
         let Some(record) = self.db.get(keys::queue(queue)).await? else {
             return Ok(None);
         };
-        let max_pending = format::decode_queue(&record)?;
+        let record = format::decode_queue(&record)?;
         // Only the totals are taken as persisted. Cursors and the in-flight
-        // count come from the keys, which every durable batch keeps exact,
-        // so no cursor can lag behind its keys and hide a pending message.
+        // and dead counts come from the keys, which every durable batch keeps
+        // exact, so no cursor can lag behind its keys and hide a pending
+        // message. Dead letters are counted one by one, O(dead) per load,
+        // which a queue whose poison messages are redriven or purged keeps
+        // small.
         let (claim_seq, push_seq) = self.derive_seq_range(queue).await?;
-        let claimed_count = self.count_claimed(queue).await?;
+        let claimed_count = self.count_keys(keys::claims(Some(queue))).await?;
+        let dead_letters = self.count_keys(keys::dead_letters(queue, None)).await?;
         let total_pushed = self.read_total(keys::total_pushed(queue)).await?;
         let total_acked = self.read_total(keys::total_acked(queue)).await?;
         let counters = Arc::new(QueueCounters {
@@ -985,11 +1079,12 @@ impl AnvilStorage {
                 total_claimed: claimed_count,
                 total_unclaimed: 0,
                 total_acked,
+                dead_letters,
                 ..QueueState::default()
             }),
             ..QueueCounters::default()
         });
-        self.set_max_pending(queue, max_pending);
+        self.set_limits(queue, &record);
         let previous = self.counters.insert(queue.to_string(), counters.clone());
         assert!(previous.is_none(), "counters of {queue} loaded twice");
         Ok(Some(counters))
@@ -1015,7 +1110,7 @@ impl AnvilStorage {
         }
         // A queue's totals start absent, which reads as 0.
         let mut batch = WriteBatch::new();
-        batch.put(keys::queue(queue), format::encode_queue(0));
+        batch.put(keys::queue(queue), format::encode_queue(0, None));
         self.commit(batch, Wait::Durable, Landing::default())
             .await?;
         let counters = Arc::new(QueueCounters::default());
@@ -1054,25 +1149,32 @@ impl AnvilStorage {
             claimed_count: s.claimed_count(),
             total_pushed: s.total_pushed,
             total_acked: s.total_acked,
+            dead_count: s.dead_letters,
         }
     }
 
-    /// Create a queue: write its zero counter keys.
-    /// `max_pending`: 0 = unlimited (default), >0 = bounded queue. Creating
-    /// an existing queue with a bound replaces its bound; with 0 it keeps it.
-    pub async fn create_queue(&self, queue: &str, max_pending: u64) -> Result<(), StorageError> {
+    /// Create a queue: write its record.
+    /// `max_pending`: 0 = unlimited (default), >0 = bounded queue.
+    /// `max_deliveries`: the queue's delivery limit, 0 = unlimited; `None`
+    /// leaves the broker's default to apply. Creating an existing queue with
+    /// a bound or a limit replaces it; with 0 or `None` it keeps it.
+    pub async fn create_queue(
+        &self,
+        queue: &str,
+        max_pending: u64,
+        max_deliveries: Option<u32>,
+    ) -> Result<(), StorageError> {
         // Held from the check until the write is applied: see
-        // `counters_loading`. It also orders this bound against a loader
-        // reading the persisted one.
+        // `counters_loading`. It also orders these limits against a loader
+        // reading the persisted ones.
         let loading = self.counters_loading.clone().lock_owned().await;
-        let exists = self.db.get(keys::queue(queue)).await?.is_some();
-        if exists && max_pending == 0 {
+        let mut batch = WriteBatch::new();
+        let (exists, changed) = self
+            .put_queue_record(&mut batch, queue, max_pending, max_deliveries)
+            .await?;
+        if !changed {
             return Ok(());
         }
-
-        let mut batch = WriteBatch::new();
-        batch.put(keys::queue(queue), format::encode_queue(max_pending));
-        self.set_max_pending(queue, max_pending);
         self.commit(
             batch,
             Wait::Durable,
@@ -1088,13 +1190,53 @@ impl AnvilStorage {
         Ok(())
     }
 
-    /// Applies the bound of a queue record that is loaded, or about to be
-    /// committed. The caller holds `counters_loading` until that batch is
-    /// applied, so no loader overwrites it with the bound it read before.
-    fn set_max_pending(&self, queue: &str, max_pending: u64) {
+    /// Puts into `batch` the record of `queue` with `max_pending` and
+    /// `max_deliveries` over what it holds, a bound of 0 and a `None` limit
+    /// keeping the record's, and applies it. Returns whether the queue
+    /// existed and whether its record changed; an unchanged one is not put.
+    /// The caller holds `counters_loading` until the batch is applied.
+    async fn put_queue_record(
+        &self,
+        batch: &mut WriteBatch,
+        queue: &str,
+        max_pending: u64,
+        max_deliveries: Option<u32>,
+    ) -> Result<(bool, bool), StorageError> {
+        let existing = match self.db.get(keys::queue(queue)).await? {
+            Some(bytes) => Some(format::decode_queue(&bytes)?),
+            None => None,
+        };
+        let mut record = existing.unwrap_or_default();
         if max_pending > 0 {
+            record.max_pending = max_pending;
+        }
+        if max_deliveries.is_some() {
+            record.max_deliveries = max_deliveries;
+        }
+        if existing.as_ref() == Some(&record) {
+            return Ok((true, false));
+        }
+        batch.put(
+            keys::queue(queue),
+            format::encode_queue(record.max_pending, record.max_deliveries),
+        );
+        self.set_limits(queue, &record);
+        Ok((existing.is_some(), true))
+    }
+
+    /// Applies the limits of a queue record that is loaded, or about to be
+    /// committed. The caller holds `counters_loading` until that batch is
+    /// applied, so no loader overwrites them with the limits it read before.
+    /// A record never drops a bound or a limit once set, so neither is
+    /// removed here.
+    fn set_limits(&self, queue: &str, record: &format::proto::QueueRecord) {
+        if record.max_pending > 0 {
             self.max_pending_limits
-                .insert(queue.to_string(), max_pending);
+                .insert(queue.to_string(), record.max_pending);
+        }
+        if let Some(max_deliveries) = record.max_deliveries {
+            self.max_deliveries_limits
+                .insert(queue.to_string(), max_deliveries);
         }
     }
 
@@ -1117,7 +1259,8 @@ impl AnvilStorage {
         assert!(max > 0, "unbounded queue {queue} has a bound");
         let in_flight = {
             let s = counters.state.lock().expect("queue state poisoned");
-            s.total_pushed.saturating_sub(s.total_acked)
+            s.total_pushed
+                .saturating_sub(s.total_acked + s.dead_letters)
         };
         if in_flight + additional as u64 > max {
             return Err(Box::new(Rejection::QueueFull(format!(
@@ -1502,7 +1645,8 @@ impl AnvilStorage {
 
     // === Nack Operations (NO TRANSACTION) ===
 
-    /// Return messages to pending queue (at tail)
+    /// Return messages to pending queue (at tail), or dead-letter them (see
+    /// `requeue_claims`).
     pub async fn nack_messages(
         &self,
         queue: &str,
@@ -1510,6 +1654,7 @@ impl AnvilStorage {
         claim_tokens: &[String],
         worker_id: &str,
         lease_id: &str,
+        nack: NackOptions<'_>,
     ) -> Result<(), StorageError> {
         self.nack_messages_internal(
             queue,
@@ -1517,6 +1662,7 @@ impl AnvilStorage {
             claim_tokens,
             worker_id,
             lease_id,
+            nack,
             None,
             None,
             None,
@@ -1532,6 +1678,7 @@ impl AnvilStorage {
         claim_tokens: &[String],
         worker_id: &str,
         lease_id: &str,
+        nack: NackOptions<'_>,
         state_namespace: &str,
         state_puts: &HashMap<String, Vec<u8>>,
         state_deletes: &[String],
@@ -1542,6 +1689,7 @@ impl AnvilStorage {
             claim_tokens,
             worker_id,
             lease_id,
+            nack,
             Some(state_namespace),
             Some(state_puts),
             Some(state_deletes),
@@ -1549,12 +1697,12 @@ impl AnvilStorage {
         .await
     }
 
-    /// Returns claims to pending after their worker died or stopped renewing
-    /// them. It races the claimants' own acks, nacks and renewals, so each
-    /// claim is settled only if it is not being settled already, still
-    /// carries the token the caller read at `read_at` (from `mono_now`), and
-    /// was not renewed since; the rest are skipped. Returns the claims
-    /// requeued.
+    /// Returns claims to pending, or dead-letters them (see
+    /// `requeue_claims`), after their worker died or stopped renewing them.
+    /// It races the claimants' own acks, nacks and renewals, so each claim is
+    /// settled only if it is not being settled already, still carries the
+    /// token the caller read at `read_at` (from `mono_now`), and was not
+    /// renewed since; the rest are skipped. Returns the claims settled.
     pub async fn reclaim_messages(
         &self,
         queue: &str,
@@ -1588,13 +1736,12 @@ impl AnvilStorage {
         if reclaimed.is_empty() {
             return Ok(reclaimed);
         }
-        let msg_ids: Vec<String> = reclaimed.iter().map(|c| c.msg_id.clone()).collect();
         let settlement = Settlement {
             write,
             hold,
             claims: reclaimed.clone(),
         };
-        self.requeue_claims(queue, &msg_ids, settlement, None, None, None)
+        self.requeue_claims(queue, settlement, Requeue::Reclaim, None, None, None)
             .await?;
         Ok(reclaimed)
     }
@@ -1607,6 +1754,7 @@ impl AnvilStorage {
         claim_tokens: &[String],
         worker_id: &str,
         lease_id: &str,
+        nack: NackOptions<'_>,
         state_namespace: Option<&str>,
         state_puts: Option<&HashMap<String, Vec<u8>>>,
         state_deletes: Option<&[String]>,
@@ -1633,8 +1781,8 @@ impl AnvilStorage {
             .await?;
         self.requeue_claims(
             queue,
-            msg_ids,
             settlement,
+            Requeue::Nack(nack),
             state_namespace,
             state_puts,
             state_deletes,
@@ -1642,14 +1790,17 @@ impl AnvilStorage {
         .await
     }
 
-    /// Moves the claims `settlement` holds back to the tail of pending, each
-    /// keeping the delivery count its claim carried, with any state updates
-    /// in the same batch.
+    /// Settles the claims `settlement` holds, with any state updates, in one
+    /// batch. A claim is dead-lettered when a nack asks for it, or when it
+    /// was the last delivery its queue allows: `delivery_count` counts this
+    /// one, so a limit of N gives N deliveries, and a limit lowered since
+    /// the claim applies to it. The others go back to the tail of pending,
+    /// each keeping the delivery count its claim carried.
     async fn requeue_claims(
         &self,
         queue: &str,
-        msg_ids: &[String],
         settlement: Settlement,
+        requeue: Requeue<'_>,
         state_namespace: Option<&str>,
         state_puts: Option<&HashMap<String, Vec<u8>>>,
         state_deletes: Option<&[String]>,
@@ -1659,17 +1810,68 @@ impl AnvilStorage {
             hold,
             claims,
         } = settlement;
-        assert!(!msg_ids.is_empty());
-        assert_eq!(claims.len(), msg_ids.len());
+        assert!(!claims.is_empty());
+        assert_eq!(claims.len(), hold.claims.len());
 
-        let base_seq = write.reserve(msg_ids.len() as u64, Tail::Requeued);
+        let max_deliveries = self
+            .max_deliveries_limits
+            .get(queue)
+            .map_or(self.default_max_deliveries, |limit| *limit);
+        let (reason, limit_cause) = match requeue {
+            Requeue::Nack(nack) => (nack.reason, DeadLetterCause::NackLimit),
+            Requeue::Reclaim => ("", DeadLetterCause::ReclaimLimit),
+        };
+        let mut requeued = Vec::with_capacity(claims.len());
+        let mut dead = Vec::new();
+        for claim in &claims {
+            if matches!(requeue, Requeue::Nack(nack) if nack.dead_letter) {
+                dead.push((claim, DeadLetterCause::Rejected));
+            } else if max_deliveries > 0 && claim.delivery_count >= max_deliveries {
+                dead.push((claim, limit_cause));
+            } else {
+                requeued.push(claim);
+            }
+        }
+        assert_eq!(requeued.len() + dead.len(), claims.len());
+
         let mut batch = WriteBatch::new();
-        for (i, (msg_id, claim)) in msg_ids.iter().zip(&claims).enumerate() {
-            batch.delete(keys::claim(queue, msg_id));
-            batch.put(
-                keys::pending(queue, base_seq + i as u64),
-                format::encode_pending(msg_id, claim.delivery_count),
-            );
+        if !requeued.is_empty() {
+            let base_seq = write.reserve(requeued.len() as u64, Tail::Requeued);
+            for (i, claim) in requeued.iter().enumerate() {
+                batch.delete(keys::claim(queue, &claim.msg_id));
+                batch.put(
+                    keys::pending(queue, base_seq + i as u64),
+                    format::encode_pending(&claim.msg_id, claim.delivery_count),
+                );
+            }
+        }
+        if !dead.is_empty() {
+            write.dead_letter(dead.len() as u64);
+            let dead_at_ms = now_nanos() / 1_000_000;
+            for (claim, cause) in &dead {
+                let body_key = keys::message(queue, &claim.msg_id);
+                // A claimed message keeps its body until it is settled.
+                let body = self.db.get(&body_key).await?.ok_or_else(|| {
+                    format::CorruptValue(format!(
+                        "claimed message {queue}/{} without a body",
+                        claim.msg_id
+                    ))
+                })?;
+                let letter = DeadLetter {
+                    message: format::decode_message(&claim.msg_id, &body)?,
+                    delivery_count: claim.delivery_count,
+                    cause: *cause,
+                    reason: reason.to_string(),
+                    worker_id: claim.worker_id.clone(),
+                    dead_at_ms,
+                };
+                batch.delete(keys::claim(queue, &claim.msg_id));
+                batch.delete(body_key);
+                batch.put(
+                    keys::dead_letter(queue, &claim.msg_id),
+                    format::encode_dead_letter(&letter),
+                );
+            }
         }
         if let Some(namespace) = state_namespace {
             Self::put_state(&mut batch, namespace, state_puts, state_deletes);
@@ -1683,7 +1885,17 @@ impl AnvilStorage {
                 ..Landing::default()
             },
         )
-        .await
+        .await?;
+        for (_, cause) in &dead {
+            crate::metrics::events().dead_lettered.add(
+                1,
+                &[
+                    opentelemetry::KeyValue::new("queue", queue.to_string()),
+                    opentelemetry::KeyValue::new("cause", cause.as_str()),
+                ],
+            );
+        }
+        Ok(())
     }
 
     // === Scan Operations ===
@@ -1726,6 +1938,167 @@ impl AnvilStorage {
         self.get_meta(queue).await
     }
 
+    // === Dead Letter Operations ===
+
+    /// Up to `limit` dead letters of `queue` in msg_id order, those after
+    /// `start_after` only when it is given, so a caller pages through them
+    /// with the last msg_id it saw. An unknown queue is
+    /// `Rejection::NotFound`.
+    pub async fn list_dead_letters(
+        &self,
+        queue: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DeadLetter>, StorageError> {
+        assert!(limit > 0);
+        assert!(limit <= DEAD_LETTERS_PER_CALL_MAX);
+        if self.load_counters(queue).await?.is_none() {
+            return Err(Box::new(Rejection::NotFound(format!(
+                "queue not found: {queue}"
+            ))));
+        }
+        let mut iter = self.db.scan(keys::dead_letters(queue, start_after)).await?;
+        let mut letters = Vec::new();
+        while letters.len() < limit {
+            let Some(kv) = iter.next().await? else {
+                break;
+            };
+            let (key_queue, msg_id) = keys::parse_dead_letter(&kv.key)?;
+            assert_eq!(key_queue, queue);
+            letters.push(format::decode_dead_letter(&msg_id, &kv.value)?);
+        }
+        Ok(letters)
+    }
+
+    /// Returns the dead letters `msg_ids` of `queue` to the tail of pending,
+    /// as messages delivered no time before, so one that fails again gets a
+    /// full set of deliveries. Returns the msg_ids redriven and those that
+    /// held no dead letter, so a retried redrive succeeds. A finished queue
+    /// refuses it with `Rejection::QueueFinished`. A redrive is no push: it
+    /// is not refused by a bound, since its messages counted against it
+    /// before they died.
+    pub async fn redrive_dead_letters(
+        &self,
+        queue: &str,
+        msg_ids: &[String],
+    ) -> Result<(Vec<String>, Vec<String>), StorageError> {
+        let (mut write, admin) = self.admit_dead_letter_write(queue).await?;
+        if self.is_queue_finished(queue).await? {
+            return Err(Box::new(Rejection::QueueFinished(format!(
+                "queue {queue} is finished: its consumers may have been told it drained"
+            ))));
+        }
+        let (letters, missing) = self.read_dead_letters(queue, msg_ids).await?;
+        if letters.is_empty() {
+            return Ok((Vec::new(), missing));
+        }
+        let base_seq = write.reserve(letters.len() as u64, Tail::Redriven);
+        let mut batch = WriteBatch::new();
+        for (i, letter) in letters.iter().enumerate() {
+            let msg_id = &letter.message.msg_id;
+            batch.delete(keys::dead_letter(queue, msg_id));
+            batch.put(
+                keys::message(queue, msg_id),
+                format::encode_message(&letter.message),
+            );
+            batch.put(
+                keys::pending(queue, base_seq + i as u64),
+                format::encode_pending(msg_id, 0),
+            );
+        }
+        self.commit(
+            batch,
+            Wait::Durable,
+            Landing {
+                writes: vec![write],
+                dead_letter_admin: Some(admin),
+                ..Landing::default()
+            },
+        )
+        .await?;
+        let redriven = letters.into_iter().map(|l| l.message.msg_id).collect();
+        Ok((redriven, missing))
+    }
+
+    /// Deletes the dead letters `msg_ids` of `queue`, counting them acked.
+    /// Returns the msg_ids purged and those that held no dead letter, so a
+    /// retried purge succeeds.
+    pub async fn purge_dead_letters(
+        &self,
+        queue: &str,
+        msg_ids: &[String],
+    ) -> Result<(Vec<String>, Vec<String>), StorageError> {
+        let (mut write, admin) = self.admit_dead_letter_write(queue).await?;
+        let (letters, missing) = self.read_dead_letters(queue, msg_ids).await?;
+        if letters.is_empty() {
+            return Ok((Vec::new(), missing));
+        }
+        let count = letters.len() as u64;
+        write.purge(count);
+        let mut batch = WriteBatch::new();
+        batch.merge(keys::total_acked(queue), format::encode_total(count));
+        for letter in &letters {
+            batch.delete(keys::dead_letter(queue, &letter.message.msg_id));
+        }
+        self.commit(
+            batch,
+            Wait::Durable,
+            Landing {
+                writes: vec![write],
+                dead_letter_admin: Some(admin),
+                ..Landing::default()
+            },
+        )
+        .await?;
+        let purged = letters.into_iter().map(|l| l.message.msg_id).collect();
+        Ok((purged, missing))
+    }
+
+    /// Takes the `dead_letter_admin` of `queue` and admits a redrive's or
+    /// purge's write to it, or refuses an unknown queue as
+    /// `Rejection::NotFound`. The lock comes first: an admitted write must
+    /// not wait for one, since `delete_queue` waits for admitted writes.
+    async fn admit_dead_letter_write(
+        &self,
+        queue: &str,
+    ) -> Result<(QueueWrite, tokio::sync::OwnedMutexGuard<()>), StorageError> {
+        loop {
+            let Some(counters) = self.load_counters(queue).await? else {
+                return Err(Box::new(Rejection::NotFound(format!(
+                    "queue not found: {queue}"
+                ))));
+            };
+            let admin = counters.dead_letter_admin.clone().lock_owned().await;
+            // A queue deleted meanwhile is loaded anew, or found gone.
+            if let Some(write) = QueueWrite::admit(counters) {
+                return Ok((write, admin));
+            }
+        }
+    }
+
+    /// The dead letters `msg_ids` of `queue`, and the msg_ids that hold none.
+    /// The msg_ids are distinct: a repeated one would be counted twice.
+    async fn read_dead_letters(
+        &self,
+        queue: &str,
+        msg_ids: &[String],
+    ) -> Result<(Vec<DeadLetter>, Vec<String>), StorageError> {
+        assert!(!msg_ids.is_empty());
+        assert!(msg_ids.len() <= DEAD_LETTERS_PER_CALL_MAX);
+        let distinct: HashSet<&String> = msg_ids.iter().collect();
+        assert_eq!(distinct.len(), msg_ids.len(), "repeated msg_ids");
+        let mut letters = Vec::with_capacity(msg_ids.len());
+        let mut missing = Vec::new();
+        for msg_id in msg_ids {
+            match self.db.get(keys::dead_letter(queue, msg_id)).await? {
+                Some(bytes) => letters.push(format::decode_dead_letter(msg_id, &bytes)?),
+                None => missing.push(msg_id.clone()),
+            }
+        }
+        assert_eq!(letters.len() + missing.len(), msg_ids.len());
+        Ok((letters, missing))
+    }
+
     // === Delete Operations ===
 
     /// Deletes a queue and every message in it. Deleting a queue that does
@@ -1747,6 +2120,7 @@ impl AnvilStorage {
         // its bound, under `counters_loading`.
         self.counters.remove(queue);
         self.max_pending_limits.remove(queue);
+        self.max_deliveries_limits.remove(queue);
         counters.close().await;
         let claimed = self.scan_claimed(Some(queue)).await?;
         let acked = self.scan_acked(Some(queue)).await?;
@@ -1779,6 +2153,13 @@ impl AnvilStorage {
         // An acked message's body went with its ack.
         for (_, ts, msg_id) in &acked {
             batch.delete(keys::acked(queue, *ts, msg_id));
+            deleted += 1;
+        }
+
+        // A dead letter holds its body in its own value.
+        let mut dead_letters = self.db.scan(keys::dead_letters(queue, None)).await?;
+        while let Some(kv) = dead_letters.next().await? {
+            batch.delete(&kv.key);
             deleted += 1;
         }
 
@@ -2086,13 +2467,14 @@ impl AnvilStorage {
     /// Create a queue group with N partition queues atomically, and report
     /// whether this call created it. Idempotent: returns the existing group
     /// if it already exists, with `false`.
-    /// `max_pending_per_partition`: 0 = unlimited (default), >0 = bounded
-    /// partitions, replacing their bounds if the group exists.
+    /// `max_pending_per_partition` and `max_deliveries` apply to every
+    /// partition as `create_queue` applies them to a queue.
     pub async fn create_queue_group(
         &self,
         group_name: &str,
         num_partitions: u32,
         max_pending_per_partition: u64,
+        max_deliveries: Option<u32>,
     ) -> Result<(QueueGroupMeta, bool), StorageError> {
         // Held from the check until the write is applied: see
         // `counters_loading`. Of concurrent creates of one group, the first
@@ -2109,16 +2491,21 @@ impl AnvilStorage {
                 meta
             }
         };
-        if created || max_pending_per_partition > 0 {
+        let mut changed = created;
+        if created || max_pending_per_partition > 0 || max_deliveries.is_some() {
             for queue_name in &meta.partition_queues {
-                batch.put(
-                    keys::queue(queue_name),
-                    format::encode_queue(max_pending_per_partition),
-                );
-                self.set_max_pending(queue_name, max_pending_per_partition);
+                let (_, partition_changed) = self
+                    .put_queue_record(
+                        &mut batch,
+                        queue_name,
+                        max_pending_per_partition,
+                        max_deliveries,
+                    )
+                    .await?;
+                changed |= partition_changed;
             }
         }
-        if created || max_pending_per_partition > 0 {
+        if changed {
             self.commit(
                 batch,
                 Wait::Durable,
@@ -2414,7 +2801,7 @@ pub(crate) mod tests {
         for _ in 0..ROUNDS {
             let storage = Arc::new(AnvilStorage::new("memory://").await.unwrap());
             let queue = "first_access";
-            storage.create_queue(queue, 0).await.unwrap();
+            storage.create_queue(queue, 0, None).await.unwrap();
             let pushers: Vec<_> = (0..PUSHERS)
                 .map(|_| {
                     let storage = storage.clone();
@@ -2524,7 +2911,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg1 = Message::new(b"hello".to_vec());
         let msg2 = Message::new(b"world".to_vec());
@@ -2554,7 +2941,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let messages: Vec<Message> = (0..5)
             .map(|i| Message::new(format!("msg{}", i).into_bytes()))
@@ -2577,7 +2964,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
@@ -2609,7 +2996,7 @@ pub(crate) mod tests {
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let queues = ["colon", "colon:00"];
         for queue in queues {
-            storage.create_queue(queue, 0).await.unwrap();
+            storage.create_queue(queue, 0, None).await.unwrap();
             let msg = Message::new(b"hello".to_vec());
             storage.push_message(queue, &msg).await.unwrap();
             storage
@@ -2666,7 +3053,7 @@ pub(crate) mod tests {
         let crashed = tokio::runtime::Runtime::new().unwrap();
         let (storage, msg_id) = crashed.block_on(async {
             let storage = AnvilStorage::new(&db_path).await.unwrap();
-            storage.create_queue(queue, 0).await.unwrap();
+            storage.create_queue(queue, 0, None).await.unwrap();
             let msg = Message::new(b"payload".to_vec());
             storage.push_message(queue, &msg).await.unwrap();
             let claimed = storage
@@ -2725,7 +3112,7 @@ pub(crate) mod tests {
         let crashed = tokio::runtime::Runtime::new().unwrap();
         let (storage, pushed_ids, acked_id) = crashed.block_on(async {
             let storage = AnvilStorage::new(&db_path).await.unwrap();
-            storage.create_queue(queue, 0).await.unwrap();
+            storage.create_queue(queue, 0, None).await.unwrap();
             let messages: Vec<Message> = (0u8..3).map(|i| Message::new(vec![i])).collect();
             storage.push_messages(queue, &messages).await.unwrap();
             let claimed = storage
@@ -2774,8 +3161,8 @@ pub(crate) mod tests {
     async fn test_delivery_count_across_redeliveries() {
         let storage = create_temp_storage().await;
         let queue = "count";
-        storage.create_queue(queue, 0).await.unwrap();
-        storage.create_queue("count-down", 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
+        storage.create_queue("count-down", 0, None).await.unwrap();
         storage
             .push_message(queue, &Message::new(b"x".to_vec()))
             .await
@@ -2788,7 +3175,14 @@ pub(crate) mod tests {
         assert_eq!(first[0].delivery_count, 1);
         let (msg_ids, claim_tokens) = split_claims(&first);
         storage
-            .nack_messages(queue, &msg_ids, &claim_tokens, "w1", "lease-1")
+            .nack_messages(
+                queue,
+                &msg_ids,
+                &claim_tokens,
+                "w1",
+                "lease-1",
+                NackOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -2839,7 +3233,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
@@ -2855,7 +3249,14 @@ pub(crate) mod tests {
         assert_eq!(meta.push_seq, 1);
 
         storage
-            .nack_messages(queue, &msg_ids, &claim_tokens, "worker-1", "lease-1")
+            .nack_messages(
+                queue,
+                &msg_ids,
+                &claim_tokens,
+                "worker-1",
+                "lease-1",
+                NackOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -2876,7 +3277,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
@@ -2903,7 +3304,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
@@ -2924,7 +3325,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
@@ -2935,7 +3336,14 @@ pub(crate) mod tests {
         let (msg_ids, claim_tokens) = split_claims(&claimed);
 
         let result = storage
-            .nack_messages(queue, &msg_ids, &claim_tokens, "worker-2", "lease-1")
+            .nack_messages(
+                queue,
+                &msg_ids,
+                &claim_tokens,
+                "worker-2",
+                "lease-1",
+                NackOptions::default(),
+            )
             .await;
         assert!(result.is_err());
     }
@@ -2944,8 +3352,8 @@ pub(crate) mod tests {
     async fn test_ack_and_forward_rejects_wrong_claim_token() {
         let storage = create_temp_storage().await;
 
-        storage.create_queue("upstream", 0).await.unwrap();
-        storage.create_queue("downstream", 0).await.unwrap();
+        storage.create_queue("upstream", 0, None).await.unwrap();
+        storage.create_queue("downstream", 0, None).await.unwrap();
 
         let upstream_msg = Message::new(b"input".to_vec());
         storage
@@ -2978,7 +3386,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
@@ -2990,7 +3398,14 @@ pub(crate) mod tests {
         let (msg_ids, claim_tokens) = split_claims(&claimed);
 
         storage
-            .nack_messages(queue, &msg_ids, &claim_tokens, "worker-1", "lease-1")
+            .nack_messages(
+                queue,
+                &msg_ids,
+                &claim_tokens,
+                "worker-1",
+                "lease-1",
+                NackOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -3008,7 +3423,7 @@ pub(crate) mod tests {
     async fn test_concurrent_duplicate_ack_settles_once() {
         let storage = Arc::new(create_temp_storage().await);
         let queue = "dup-ack";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
         let messages: Vec<Message> = (0..100).map(|_| Message::new(b"x".to_vec())).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage
@@ -3059,7 +3474,7 @@ pub(crate) mod tests {
     async fn test_reclaim_skips_claims_settled_since_read() {
         let storage = create_temp_storage().await;
         let queue = "reclaim-race";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
         let messages: Vec<Message> = (0..3).map(|_| Message::new(b"x".to_vec())).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage.claim_messages(queue, 3, "w", "l").await.unwrap();
@@ -3102,6 +3517,7 @@ pub(crate) mod tests {
                 &[token_of(&renewed_id)],
                 "w",
                 "l",
+                NackOptions::default(),
             )
             .await
             .unwrap();
@@ -3143,7 +3559,7 @@ pub(crate) mod tests {
     async fn test_settlement_hold_excludes_other_settlements() {
         let storage = create_temp_storage().await;
         let queue = "hold";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
         storage
             .push_message(queue, &Message::new(b"x".to_vec()))
             .await
@@ -3168,7 +3584,7 @@ pub(crate) mod tests {
                 .unwrap_err();
             assert_fenced(&err, "claim_settling");
             let err = storage
-                .nack_messages(queue, &msg_ids, &tokens, "w", "l")
+                .nack_messages(queue, &msg_ids, &tokens, "w", "l", NackOptions::default())
                 .await
                 .unwrap_err();
             assert_fenced(&err, "claim_settling");
@@ -3229,14 +3645,21 @@ pub(crate) mod tests {
         let queue = "reopen";
 
         let storage = AnvilStorage::new(&db_path).await.unwrap();
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
         let messages: Vec<Message> = (0u8..10).map(|i| Message::new(vec![i])).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage.claim_messages(queue, 4, "w", "l").await.unwrap();
         assert_eq!(claimed.len(), 4);
         let (msg_ids, claim_tokens) = split_claims(&claimed[..1]);
         storage
-            .nack_messages(queue, &msg_ids, &claim_tokens, "w", "l")
+            .nack_messages(
+                queue,
+                &msg_ids,
+                &claim_tokens,
+                "w",
+                "l",
+                NackOptions::default(),
+            )
             .await
             .unwrap();
         storage.close().await.unwrap();
@@ -3399,7 +3822,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
@@ -3441,7 +3864,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
@@ -3484,7 +3907,7 @@ pub(crate) mod tests {
 
         let storage = create_temp_storage().await;
         let queue = "renew";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
         let messages: Vec<Message> = (0..2).map(|_| Message::new(b"x".to_vec())).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage.claim_messages(queue, 2, "w", "l").await.unwrap();
@@ -3547,7 +3970,7 @@ pub(crate) mod tests {
     async fn test_renewal_rejects_claims_not_held() {
         let storage = create_temp_storage().await;
         let queue = "renew-fenced";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
         let messages: Vec<Message> = (0..2).map(|_| Message::new(b"x".to_vec())).collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage.claim_messages(queue, 2, "w", "l").await.unwrap();
@@ -3582,7 +4005,7 @@ pub(crate) mod tests {
     async fn test_reclaim_skips_claim_renewed_since_read() {
         let storage = create_temp_storage().await;
         let queue = "renew-race";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
         storage
             .push_message(queue, &Message::new(b"x".to_vec()))
             .await
@@ -3633,7 +4056,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
         storage.mark_queue_finished(queue).await.unwrap();
 
         let (finished, drained, pending, claimed) =
@@ -3648,8 +4071,8 @@ pub(crate) mod tests {
     async fn test_ack_and_forward() {
         let storage = create_temp_storage().await;
 
-        storage.create_queue("upstream", 0).await.unwrap();
-        storage.create_queue("downstream", 0).await.unwrap();
+        storage.create_queue("upstream", 0, None).await.unwrap();
+        storage.create_queue("downstream", 0, None).await.unwrap();
 
         let upstream_msg = Message::new(b"input".to_vec());
         storage
@@ -3701,7 +4124,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         for i in 0..5 {
             let msg = Message::new(format!("msg{}", i).into_bytes());
@@ -3742,7 +4165,7 @@ pub(crate) mod tests {
         const STOP_DEADLINE: Duration = Duration::from_secs(1);
         let storage = Arc::new(create_temp_storage().await);
         let queue = "gc-stop";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
         // A full pass of expired entries, so the pass is still running long
         // after its first commit.
         let entry_key = |i: usize| keys::acked(queue, 1, &format!("{i:012}"));
@@ -3795,7 +4218,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         for i in 0..5 {
             let msg = Message::new(format!("msg{}", i).into_bytes());
@@ -3845,7 +4268,7 @@ pub(crate) mod tests {
         let queue = "test-queue";
         let namespace = "job1/stage1";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg = Message::new(b"hello".to_vec());
 
@@ -3885,7 +4308,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         for i in 0..5 {
             let msg = Message::new(format!("msg{}", i).into_bytes());
@@ -3927,13 +4350,474 @@ pub(crate) mod tests {
         assert!(storage.get_meta(queue).await.is_err());
 
         // A queue that never held a message is deleted too.
-        storage.create_queue("empty", 0).await.unwrap();
+        storage.create_queue("empty", 0, None).await.unwrap();
         assert_eq!(storage.delete_queue("empty").await.unwrap(), 0);
         assert!(!storage
             .list_queues()
             .await
             .unwrap()
             .contains(&"empty".to_string()));
+    }
+
+    /// Pushes `count` messages to `queue` and claims them all as worker `w`.
+    async fn push_and_claim(
+        storage: &AnvilStorage,
+        queue: &str,
+        count: usize,
+    ) -> Vec<ClaimedMessage> {
+        let messages: Vec<Message> = (0..count)
+            .map(|i| {
+                Message::with_metadata(
+                    format!("{queue}-{i}").into_bytes(),
+                    HashMap::from([("i".to_string(), i.to_string())]),
+                )
+            })
+            .collect();
+        storage.push_messages(queue, &messages).await.unwrap();
+        let claimed = storage
+            .claim_messages(queue, count, "w", "l")
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), count);
+        claimed
+    }
+
+    async fn nack(
+        storage: &AnvilStorage,
+        queue: &str,
+        claimed: &[ClaimedMessage],
+        nack: NackOptions<'_>,
+    ) {
+        let (msg_ids, tokens) = split_claims(claimed);
+        storage
+            .nack_messages(queue, &msg_ids, &tokens, "w", "l", nack)
+            .await
+            .unwrap();
+    }
+
+    /// Every dead letter of `queue`, paging as a caller would.
+    async fn all_dead_letters(storage: &AnvilStorage, queue: &str) -> Vec<DeadLetter> {
+        let mut letters: Vec<DeadLetter> = Vec::new();
+        loop {
+            let start_after = letters.last().map(|l| l.message.msg_id.clone());
+            let page = storage
+                .list_dead_letters(queue, start_after.as_deref(), 2)
+                .await
+                .unwrap();
+            let done = page.len() < 2;
+            letters.extend(page);
+            if done {
+                return letters;
+            }
+        }
+    }
+
+    /// (pending, claimed, acked, dead) of `queue`, which with `pushed`
+    /// account for every message.
+    async fn dead_counts(storage: &AnvilStorage, queue: &str) -> (u64, u64, u64, u64) {
+        let meta = storage.get_meta(queue).await.unwrap();
+        let counts = (
+            meta.push_seq - meta.claim_seq,
+            meta.claimed_count,
+            meta.total_acked,
+            meta.dead_count,
+        );
+        assert_eq!(
+            meta.dead_count,
+            all_dead_letters(storage, queue).await.len() as u64,
+            "the dead count matches the dead letter keys"
+        );
+        counts
+    }
+
+    fn assert_rejection(error: &StorageError, expected: fn(&Rejection) -> bool) {
+        assert!(
+            error.downcast_ref::<Rejection>().is_some_and(expected),
+            "{error}"
+        );
+    }
+
+    /// Goal: a nack settling the last delivery a queue allows dead-letters
+    /// the message with its body, and one below the limit requeues it.
+    /// Method: with a limit of 2, nack two messages at their first delivery
+    /// and one of them again at its second, then check the counts, the dead
+    /// letter and that only the other message is claimable.
+    #[tokio::test]
+    async fn test_nack_dead_letters_at_the_limit() {
+        let storage = create_temp_storage().await;
+        let queue = "nack-limit";
+        storage.create_queue(queue, 0, Some(2)).await.unwrap();
+        let claimed = push_and_claim(&storage, queue, 2).await;
+        nack(&storage, queue, &claimed, NackOptions::default()).await;
+        assert_eq!(dead_counts(&storage, queue).await, (2, 0, 0, 0));
+
+        let claimed = storage.claim_messages(queue, 2, "w", "l").await.unwrap();
+        assert!(claimed.iter().all(|c| c.delivery_count == 2));
+        let poison = NackOptions {
+            dead_letter: false,
+            reason: "boom",
+        };
+        nack(&storage, queue, &claimed[..1], poison).await;
+        assert_eq!(dead_counts(&storage, queue).await, (0, 1, 0, 1));
+
+        let letters = all_dead_letters(&storage, queue).await;
+        assert_eq!(letters.len(), 1);
+        let letter = &letters[0];
+        assert_eq!(letter.message.msg_id, claimed[0].message.msg_id);
+        assert_eq!(letter.message.payload, claimed[0].message.payload);
+        assert_eq!(letter.message.metadata, claimed[0].message.metadata);
+        assert_eq!(
+            (letter.cause, letter.delivery_count, letter.reason.as_str()),
+            (DeadLetterCause::NackLimit, 2, "boom")
+        );
+        assert_eq!(letter.worker_id, "w");
+        assert!(letter.dead_at_ms > 0);
+        let body = keys::message(queue, &letter.message.msg_id);
+        assert!(storage.db.get(&body).await.unwrap().is_none());
+
+        nack(&storage, queue, &claimed[1..], NackOptions::default()).await;
+        let rest = storage.claim_messages(queue, 10, "w", "l").await.unwrap();
+        assert!(
+            rest.is_empty(),
+            "the other message died at its second nack too"
+        );
+        assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 2));
+    }
+
+    /// Goal: a reclaim settling the last delivery dead-letters the message,
+    /// and still counts as a reclaim. Method: with a limit of 1, let
+    /// recovery reclaim a claim whose lease died.
+    #[tokio::test]
+    async fn test_reclaim_dead_letters_at_the_limit() {
+        let storage = create_temp_storage().await;
+        let queue = "reclaim-limit";
+        storage.create_queue(queue, 0, Some(1)).await.unwrap();
+        let claimed = push_and_claim(&storage, queue, 1).await;
+        let recovered = storage
+            .recover_expired_claims(
+                LEASE_TIMEOUT_SECS_TEST_FAST,
+                CLAIM_AGE_TIMEOUT_SECS_TEST_LIVE_SAFE,
+                Some(&HashMap::new()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered, 1);
+        assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 1));
+        let letter = &all_dead_letters(&storage, queue).await[0];
+        assert_eq!(letter.message.msg_id, claimed[0].message.msg_id);
+        assert_eq!(
+            (letter.cause, letter.delivery_count, letter.reason.as_str()),
+            (DeadLetterCause::ReclaimLimit, 1, "")
+        );
+        assert_eq!(letter.worker_id, "w");
+    }
+
+    /// Goal: the broker's default governs a queue that sets no limit, a
+    /// limit of 0 is unlimited, and a nack asking for a dead letter gets one
+    /// whatever the limit. Method: with a default of 3, nack a message of a
+    /// queue without a limit three times and one of a queue limited to 0
+    /// five times, then reject the latter.
+    #[tokio::test]
+    async fn test_default_and_unlimited_and_rejected() {
+        let storage = create_temp_storage().await.with_default_max_deliveries(3);
+        storage.create_queue("default", 0, None).await.unwrap();
+        storage.create_queue("unlimited", 0, Some(0)).await.unwrap();
+        push_and_claim(&storage, "default", 1).await;
+        push_and_claim(&storage, "unlimited", 1).await;
+        storage
+            .recover_expired_claims(1.0, 1.0, Some(&HashMap::new()))
+            .await
+            .unwrap();
+        for round in 2..=5 {
+            for queue in ["default", "unlimited"] {
+                let claimed = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
+                if queue == "default" && round > 3 {
+                    assert!(claimed.is_empty(), "dead at its third delivery");
+                    continue;
+                }
+                assert_eq!(claimed[0].delivery_count, round);
+                nack(&storage, queue, &claimed, NackOptions::default()).await;
+            }
+        }
+        assert_eq!(dead_counts(&storage, "default").await, (0, 0, 0, 1));
+        assert_eq!(dead_counts(&storage, "unlimited").await, (1, 0, 0, 0));
+
+        let claimed = storage
+            .claim_messages("unlimited", 1, "w", "l")
+            .await
+            .unwrap();
+        let reject = NackOptions {
+            dead_letter: true,
+            reason: "malformed",
+        };
+        nack(&storage, "unlimited", &claimed, reject).await;
+        let letter = &all_dead_letters(&storage, "unlimited").await[0];
+        assert_eq!(
+            (letter.cause, letter.delivery_count, letter.reason.as_str()),
+            (DeadLetterCause::Rejected, 6, "malformed")
+        );
+    }
+
+    /// Goal: creating a queue sets, keeps or replaces its delivery limit as
+    /// documented, beside its bound. Method: create, re-create with and
+    /// without each setting, and read the stored record and the cache.
+    #[tokio::test]
+    async fn test_create_queue_keeps_or_replaces_the_limit() {
+        let storage = create_temp_storage().await;
+        let queue = "limits";
+        let record = |storage: &AnvilStorage| {
+            let storage = storage.db.clone();
+            async move {
+                let bytes = storage.get(keys::queue(queue)).await.unwrap().unwrap();
+                let record = format::decode_queue(&bytes).unwrap();
+                (record.max_pending, record.max_deliveries)
+            }
+        };
+        storage.create_queue(queue, 0, None).await.unwrap();
+        assert_eq!(record(&storage).await, (0, None));
+        storage.create_queue(queue, 0, Some(4)).await.unwrap();
+        storage.create_queue(queue, 7, None).await.unwrap();
+        assert_eq!(record(&storage).await, (7, Some(4)));
+        storage.create_queue(queue, 0, Some(0)).await.unwrap();
+        assert_eq!(record(&storage).await, (7, Some(0)));
+        assert_eq!(*storage.max_deliveries_limits.get(queue).unwrap(), 0);
+
+        let (group, _) = storage
+            .create_queue_group("g", 2, 0, Some(5))
+            .await
+            .unwrap();
+        storage.create_queue_group("g", 2, 3, None).await.unwrap();
+        for partition in &group.partition_queues {
+            let bytes = storage.db.get(keys::queue(partition)).await.unwrap();
+            let record = format::decode_queue(&bytes.unwrap()).unwrap();
+            assert_eq!((record.max_pending, record.max_deliveries), (3, Some(5)));
+        }
+    }
+
+    /// Goal: when a nack and a reclaim settle one claim at its last
+    /// delivery together, the settlement hold lets one of them win and the
+    /// message is dead-lettered once. Method: race the two on fresh claims,
+    /// many times.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_nack_and_reclaim_dead_letter_one_claim_once() {
+        let storage = Arc::new(create_temp_storage().await);
+        let queue = "race";
+        storage.create_queue(queue, 0, Some(1)).await.unwrap();
+        for trial in 0..50u64 {
+            let claimed = push_and_claim(&storage, queue, 1).await;
+            let (msg_ids, tokens) = split_claims(&claimed);
+            let read_at = crate::types::mono_now();
+            let read_by_recovery: Vec<ClaimInfo> = storage
+                .scan_claimed(Some(queue))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, msg_id, info)| ClaimInfo { msg_id, ..info })
+                .collect();
+            let nacker = {
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    storage
+                        .nack_messages(queue, &msg_ids, &tokens, "w", "l", NackOptions::default())
+                        .await
+                })
+            };
+            let reclaimer = {
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    storage
+                        .reclaim_messages(queue, &read_by_recovery, read_at)
+                        .await
+                        .unwrap()
+                })
+            };
+            let nacked = nacker.await.unwrap();
+            let reclaimed = reclaimer.await.unwrap();
+            assert_ne!(nacked.is_ok(), reclaimed.len() == 1, "trial {trial}");
+            if let Err(error) = &nacked {
+                assert_fenced(error, "");
+            }
+            let dead = trial + 1;
+            assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, dead));
+        }
+        assert!(storage.settling.is_empty());
+    }
+
+    /// Goal: a redrive returns dead letters to pending as new deliveries,
+    /// reports what it did not find, and is refused once the queue is
+    /// finished. Method: dead-letter a message at a limit of 1, redrive it
+    /// with an unknown msg_id, claim it at delivery 1, dead-letter it again,
+    /// and redrive after marking the queue finished.
+    #[tokio::test]
+    async fn test_redrive_resets_delivery_count() {
+        let storage = create_temp_storage().await;
+        let queue = "redrive";
+        storage.create_queue(queue, 0, Some(1)).await.unwrap();
+        let claimed = push_and_claim(&storage, queue, 1).await;
+        nack(&storage, queue, &claimed, NackOptions::default()).await;
+        let msg_id = claimed[0].message.msg_id.clone();
+
+        let ids = vec![msg_id.clone(), "unknown".to_string()];
+        let (redriven, missing) = storage.redrive_dead_letters(queue, &ids).await.unwrap();
+        assert_eq!(
+            (redriven, missing),
+            (vec![msg_id.clone()], vec!["unknown".to_string()])
+        );
+        assert_eq!(dead_counts(&storage, queue).await, (1, 0, 0, 0));
+        assert_eq!(storage.get_meta(queue).await.unwrap().total_pushed, 1);
+
+        let again = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
+        assert_eq!(again[0].message.msg_id, msg_id);
+        assert_eq!(again[0].delivery_count, 1);
+        assert_eq!(again[0].message.payload, claimed[0].message.payload);
+        assert_eq!(again[0].message.metadata, claimed[0].message.metadata);
+        nack(&storage, queue, &again, NackOptions::default()).await;
+        assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 1));
+
+        storage.mark_queue_finished(queue).await.unwrap();
+        let refused = storage
+            .redrive_dead_letters(queue, std::slice::from_ref(&msg_id))
+            .await
+            .unwrap_err();
+        assert_rejection(&refused, |r| matches!(r, Rejection::QueueFinished(_)));
+        assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 1));
+
+        let unknown = storage
+            .redrive_dead_letters("no-such-queue", &ids)
+            .await
+            .unwrap_err();
+        assert_rejection(&unknown, |r| matches!(r, Rejection::NotFound(_)));
+        assert!(storage.get_meta("no-such-queue").await.is_err());
+    }
+
+    /// Goal: a purge deletes dead letters into `total_acked`, so pushed
+    /// messages stay accounted for, and dead letters take no room in a
+    /// bounded queue, which a redrive may then overfill. Method: on a queue
+    /// bounded to 2, dead-letter both messages, push two more, purge one
+    /// letter twice and redrive the other.
+    #[tokio::test]
+    async fn test_purge_counts_acked_and_bound_excludes_dead() {
+        let storage = create_temp_storage().await;
+        let queue = "purge";
+        storage.create_queue(queue, 2, Some(1)).await.unwrap();
+        let claimed = push_and_claim(&storage, queue, 2).await;
+        nack(&storage, queue, &claimed, NackOptions::default()).await;
+        assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 2));
+        let more: Vec<Message> = (0..2).map(|_| Message::new(b"more".to_vec())).collect();
+        storage.push_messages(queue, &more).await.unwrap();
+        let full = storage
+            .push_message(queue, &Message::new(b"over".to_vec()))
+            .await
+            .unwrap_err();
+        assert_rejection(&full, |r| matches!(r, Rejection::QueueFull(_)));
+
+        let (msg_ids, _) = split_claims(&claimed);
+        let purge = vec![msg_ids[0].clone()];
+        let (purged, missing) = storage.purge_dead_letters(queue, &purge).await.unwrap();
+        assert_eq!((purged, missing), (purge.clone(), Vec::new()));
+        assert_eq!(dead_counts(&storage, queue).await, (2, 0, 1, 1));
+        let (purged, missing) = storage.purge_dead_letters(queue, &purge).await.unwrap();
+        assert_eq!((purged, missing), (Vec::new(), purge));
+        assert_eq!(dead_counts(&storage, queue).await, (2, 0, 1, 1));
+
+        let (redriven, _) = storage
+            .redrive_dead_letters(queue, &msg_ids[1..])
+            .await
+            .unwrap();
+        assert_eq!(redriven.len(), 1);
+        let meta = storage.get_meta(queue).await.unwrap();
+        assert_eq!(meta.push_seq - meta.claim_seq, 3, "over the bound of 2");
+        assert_eq!(
+            (meta.total_pushed, meta.total_acked, meta.dead_count),
+            (4, 1, 0)
+        );
+    }
+
+    /// Goal: deleting a queue deletes its dead letters, so a queue recreated
+    /// under the name starts without any, and with the default limit.
+    #[tokio::test]
+    async fn test_delete_queue_removes_dead_letters() {
+        let storage = create_temp_storage().await.with_default_max_deliveries(2);
+        let queue = "delete-dead";
+        storage.create_queue(queue, 0, Some(1)).await.unwrap();
+        let claimed = push_and_claim(&storage, queue, 2).await;
+        nack(&storage, queue, &claimed, NackOptions::default()).await;
+        assert_eq!(storage.delete_queue(queue).await.unwrap(), 2);
+        assert_rejection(
+            &storage
+                .list_dead_letters(queue, None, 10)
+                .await
+                .unwrap_err(),
+            |r| matches!(r, Rejection::NotFound(_)),
+        );
+
+        storage.create_queue(queue, 0, None).await.unwrap();
+        assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 0));
+        let claimed = push_and_claim(&storage, queue, 1).await;
+        nack(&storage, queue, &claimed, NackOptions::default()).await;
+        assert_eq!(
+            dead_counts(&storage, queue).await,
+            (1, 0, 0, 0),
+            "the deleted queue's limit of 1 is gone"
+        );
+    }
+
+    /// Goal: a finished queue holding only dead letters is drained: they
+    /// are settled, not work in flight.
+    #[tokio::test]
+    async fn test_drained_with_only_dead_letters() {
+        let storage = create_temp_storage().await;
+        let queue = "drain-dead";
+        storage.create_queue(queue, 0, Some(1)).await.unwrap();
+        let claimed = push_and_claim(&storage, queue, 3).await;
+        storage.mark_queue_finished(queue).await.unwrap();
+        assert_eq!(
+            storage.check_queue_completion(queue).await.unwrap(),
+            (true, false, 0, 3)
+        );
+        nack(&storage, queue, &claimed, NackOptions::default()).await;
+        assert_eq!(
+            storage.check_queue_completion(queue).await.unwrap(),
+            (true, true, 0, 0)
+        );
+    }
+
+    /// Goal: a reopened store derives the dead count from the dead letter
+    /// keys, keeps a queue's own limit, and counts purged letters in the
+    /// persisted acked total. Method: dead-letter, purge and redrive, reopen,
+    /// and compare the counts and the limit's effect.
+    #[tokio::test]
+    async fn test_dead_letter_counters_survive_reopen() {
+        let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("anvil_dead_reopen_test_{counter}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = format!("file://{}", dir.display());
+        let queue = "dead-reopen";
+
+        let storage = AnvilStorage::new(&db_path).await.unwrap();
+        storage.create_queue(queue, 0, Some(1)).await.unwrap();
+        let claimed = push_and_claim(&storage, queue, 4).await;
+        nack(&storage, queue, &claimed, NackOptions::default()).await;
+        let (msg_ids, _) = split_claims(&claimed);
+        storage
+            .purge_dead_letters(queue, &msg_ids[..1])
+            .await
+            .unwrap();
+        storage
+            .redrive_dead_letters(queue, &msg_ids[1..2])
+            .await
+            .unwrap();
+        let before = dead_counts(&storage, queue).await;
+        assert_eq!(before, (1, 0, 1, 2));
+        storage.close().await.unwrap();
+
+        let storage = AnvilStorage::new(&db_path).await.unwrap();
+        assert_eq!(dead_counts(&storage, queue).await, before);
+        let redriven = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
+        nack(&storage, queue, &redriven, NackOptions::default()).await;
+        assert_eq!(dead_counts(&storage, queue).await, (0, 0, 1, 3));
+        storage.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -3945,7 +4829,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         let msg = Message::new(b"hello".to_vec());
         storage.push_message(queue, &msg).await.unwrap();
@@ -3976,7 +4860,7 @@ pub(crate) mod tests {
         let storage = create_temp_storage().await;
         let queue = "test-queue";
 
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         // Initial state
         let meta = storage.get_queue_stats(queue).await.unwrap();
@@ -4027,7 +4911,14 @@ pub(crate) mod tests {
         let nack_ids: Vec<String> = claimed_ids[3..5].to_vec();
         let nack_tokens: Vec<String> = claimed_tokens[3..5].to_vec();
         storage
-            .nack_messages(queue, &nack_ids, &nack_tokens, "worker-1", "lease-1")
+            .nack_messages(
+                queue,
+                &nack_ids,
+                &nack_tokens,
+                "worker-1",
+                "lease-1",
+                NackOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -4066,7 +4957,7 @@ pub(crate) mod tests {
     async fn test_concurrent_push_claim_accounts_for_every_message() {
         let storage = Arc::new(create_temp_storage().await);
         let queue = "concurrent-push-claim";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         const PUSHERS: usize = 8;
         const CLAIMERS: usize = 8;
@@ -4183,7 +5074,7 @@ pub(crate) mod tests {
     async fn run_nack_claim_trial(n: u64, claimers: usize) -> u64 {
         let storage = Arc::new(create_temp_storage().await);
         let queue = "nack-claim-race";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         // Push N, claim all as a dead worker (no ack).
         let messages: Vec<Message> = (0..n)
@@ -4237,7 +5128,14 @@ pub(crate) mod tests {
             tokio::spawn(async move {
                 barrier.wait().await;
                 storage
-                    .nack_messages(queue, &dead_ids, &dead_tokens, "dead", "dead-lease")
+                    .nack_messages(
+                        queue,
+                        &dead_ids,
+                        &dead_tokens,
+                        "dead",
+                        "dead-lease",
+                        NackOptions::default(),
+                    )
                     .await
                     .unwrap();
             })
@@ -4266,8 +5164,8 @@ pub(crate) mod tests {
         let storage = Arc::new(create_temp_storage().await);
         let upstream = "ack-fwd-upstream";
         let downstream = "ack-fwd-downstream";
-        storage.create_queue(upstream, 0).await.unwrap();
-        storage.create_queue(downstream, 0).await.unwrap();
+        storage.create_queue(upstream, 0, None).await.unwrap();
+        storage.create_queue(downstream, 0, None).await.unwrap();
 
         const PRODUCERS: usize = 4;
         const TRANSFORMERS: usize = 8;
@@ -4432,7 +5330,7 @@ pub(crate) mod tests {
     async fn test_dead_worker_recovery_under_concurrent_pushes_and_claims() {
         let storage = Arc::new(create_temp_storage().await);
         let queue = "dead-worker-race";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         const PRODUCERS: usize = 4;
         const LIVE_CLAIMERS: usize = 6;

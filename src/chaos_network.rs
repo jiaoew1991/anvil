@@ -321,12 +321,15 @@ mod tests {
             Self { inner, addr, admin }
         }
 
+        /// Creates `queue` without a delivery limit: these tests expect every
+        /// message acked in the end, however often the faults redeliver it.
         async fn create_queue(&self, queue: &str) {
             self.admin
                 .clone()
                 .create_queue(CreateQueueRequest {
                     queue: queue.to_string(),
                     max_pending: 0,
+                    max_deliveries: Some(0),
                 })
                 .await
                 .unwrap();
@@ -1255,6 +1258,7 @@ mod tests {
                 group_name: group.to_string(),
                 num_partitions: PARTITIONS,
                 max_pending_per_partition: 0,
+                max_deliveries: None,
             })
             .await
             .unwrap()

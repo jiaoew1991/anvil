@@ -17,7 +17,8 @@ option java_outer_classname = "AnvilProto";
 //
 // Error codes:
 //   - FAILED_PRECONDITION: the caller no longer holds a claim it completes or
-//     renews (settled, reclaimed or redelivered). Drop the message.
+//     renews (settled, reclaimed or redelivered): drop the message. Or a
+//     redrive into a finished queue.
 //   - NOT_FOUND:           the queue or queue group does not exist.
 //   - INVALID_ARGUMENT:    the request is malformed.
 //   - RESOURCE_EXHAUSTED:  a bounded queue is full.
@@ -63,6 +64,15 @@ service Anvil {
   rpc DeleteQueue(DeleteQueueRequest) returns (DeleteQueueResponse);
   rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
 
+  // === Dead Letter API ===
+
+  // A message is dead-lettered when a nack asks for it, or when a nack or a
+  // reclaim settles the last delivery its queue allows. It then waits,
+  // neither pending nor claimed, until it is redriven or purged.
+  rpc ListDeadLetters(ListDeadLettersRequest) returns (ListDeadLettersResponse);
+  rpc RedriveDeadLetters(RedriveDeadLettersRequest) returns (RedriveDeadLettersResponse);
+  rpc PurgeDeadLetters(PurgeDeadLettersRequest) returns (PurgeDeadLettersResponse);
+
   // === Queue Completion API ===
 
   rpc MarkQueueFinished(MarkQueueFinishedRequest) returns (MarkQueueFinishedResponse);
@@ -104,7 +114,7 @@ message ClaimMessage {
   bytes payload = 2;
   map<string, string> metadata = 3;
   string claim_token = 4;               // inline with message (was separate list)
-  uint32 delivery_count = 5;            // 1 on first delivery; +1 per nack or reclaimed lease
+  uint32 delivery_count = 5;            // 1 on first delivery; +1 per nack or reclaimed lease; 1 again after a redrive
 }
 
 message ClaimResponse {
@@ -114,7 +124,7 @@ message ClaimResponse {
   string source_queue = 3;
   int32 source_partition = 4;
   // True when messages is empty AND the source queue/group is
-  // finished + fully drained (pending=0, claimed=0).
+  // finished + fully drained (pending=0, claimed=0; dead letters are settled).
   // Workers use this as the sole exit signal — no master notification needed.
   bool upstream_drained = 5;
 }
@@ -134,7 +144,7 @@ message CompleteRequest {
     AckAction ack = 6;                   // acknowledge (delete messages)
     ForwardAction forward = 7;           // ack + push to single downstream queue
     ScatterAction scatter = 8;           // ack + push to partition group
-    NackAction nack = 9;                 // return messages to queue
+    NackAction nack = 9;                 // return messages to queue, or dead-letter them
   }
 
   // Optional atomic state update (applied with any action)
@@ -153,7 +163,12 @@ message ScatterAction {
   repeated PartitionPayload partitions = 2;
 }
 
-message NackAction {}                    // return to queue for retry
+// Returns the messages to the queue for retry, unless this was the last
+// delivery the queue allows: then they are dead-lettered.
+message NackAction {
+  bool dead_letter = 1;                  // dead-letter now: a retry cannot succeed
+  string reason = 2;                     // kept with any message dead-lettered
+}
 
 message StateUpdate {
   string namespace = 1;
@@ -258,7 +273,11 @@ message StatePutResponse {
 
 message CreateQueueRequest {
   string queue = 1;
-  uint64 max_pending = 2;  // 0 = unlimited (default)
+  uint64 max_pending = 2;  // 0 = unlimited (default); 0 keeps an existing queue's
+  // Deliveries a message gets before a failed one is dead-lettered; 0 =
+  // unlimited. Absent: the broker's default for a new queue, and the current
+  // limit for an existing one.
+  optional uint32 max_deliveries = 3;
 }
 
 message CreateQueueResponse {
@@ -289,7 +308,61 @@ message QueueStats {
   int64 pending_count = 2;
   int64 claimed_count = 3;
   int64 total_pushed = 4;
-  int64 total_acked = 5;
+  int64 total_acked = 5;                 // dead letters purged included
+  int64 dead_count = 6;                  // dead letters waiting for a redrive or a purge
+}
+
+// ============================================================================
+// Dead Letter API Messages
+//
+// Each call handles at most 1000 dead letters. Redrive and purge skip the
+// msg_ids that hold no dead letter and report them, so a retried call
+// succeeds.
+// ============================================================================
+
+message ListDeadLettersRequest {
+  string queue = 1;
+  string start_after = 2;                // msg_id to list after; empty = from the first
+  uint32 limit = 3;                      // 1..=1000
+}
+
+message ListDeadLettersResponse {
+  repeated DeadLetter dead_letters = 1;  // in msg_id order
+  string next_start_after = 2;           // empty once the list is exhausted
+}
+
+message DeadLetter {
+  string msg_id = 1;
+  bytes payload = 2;
+  map<string, string> metadata = 3;
+  uint32 delivery_count = 4;             // deliveries it had, the last one included
+  string cause = 5;                      // "nack_limit", "reclaim_limit" or "rejected"
+  string reason = 6;                     // the last nack's reason; empty for a reclaim
+  string worker_id = 7;                  // the worker that held the last claim
+  uint64 dead_at_ms = 8;                 // wall clock, milliseconds since the Unix epoch
+}
+
+// Returns dead letters to the tail of pending with a fresh delivery count.
+// A finished queue refuses it with FAILED_PRECONDITION.
+message RedriveDeadLettersRequest {
+  string queue = 1;
+  repeated string msg_ids = 2;
+}
+
+message RedriveDeadLettersResponse {
+  repeated string redriven = 1;
+  repeated string missing = 2;
+}
+
+// Deletes dead letters; they count toward total_acked.
+message PurgeDeadLettersRequest {
+  string queue = 1;
+  repeated string msg_ids = 2;
+}
+
+message PurgeDeadLettersResponse {
+  repeated string purged = 1;
+  repeated string missing = 2;
 }
 
 // ============================================================================
@@ -324,6 +397,7 @@ message CreateQueueGroupRequest {
   string group_name = 1;
   int32 num_partitions = 2;
   uint64 max_pending_per_partition = 3;  // 0 = unlimited (default)
+  optional uint32 max_deliveries = 4;    // per partition, as CreateQueueRequest
 }
 
 message CreateQueueGroupResponse {
@@ -376,6 +450,7 @@ message PartitionStats {
   int64 claimed_count = 3;
   int64 total_pushed = 4;
   int64 total_acked = 5;
+  int64 dead_count = 6;
 }
 
 message MarkGroupFinishedRequest {

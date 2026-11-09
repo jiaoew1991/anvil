@@ -37,7 +37,7 @@ mod tests {
     use crate::server::AnvilBrokerInner;
     use crate::service::proto;
     use crate::storage::AnvilStorage;
-    use crate::types::AnvilConfig;
+    use crate::types::{AnvilConfig, DEFAULT_MAX_DELIVERIES};
 
     use proto::anvil_client::AnvilClient;
 
@@ -100,6 +100,7 @@ mod tests {
             max_queue_depth: 0,
             acked_retention_secs: 60.0,
             gc_interval_secs: 600.0,
+            default_max_deliveries: DEFAULT_MAX_DELIVERIES,
         };
 
         let storage = Arc::new(AnvilStorage::new(&config.db_path).await.unwrap());
@@ -188,6 +189,7 @@ mod tests {
             .create_queue(proto::CreateQueueRequest {
                 queue: queue.clone(),
                 max_pending: 0,
+                max_deliveries: None,
             })
             .await
             .unwrap();
@@ -270,6 +272,7 @@ mod tests {
             .create_queue(proto::CreateQueueRequest {
                 queue: queue.clone(),
                 max_pending: 0,
+                max_deliveries: None,
             })
             .await
             .unwrap();
@@ -401,6 +404,7 @@ mod tests {
             .create_queue(proto::CreateQueueRequest {
                 queue: queue.clone(),
                 max_pending: 0,
+                max_deliveries: None,
             })
             .await
             .unwrap();
@@ -728,6 +732,7 @@ mod tests {
             max_queue_depth: 0,
             acked_retention_secs,
             gc_interval_secs: 60.0,
+            default_max_deliveries: DEFAULT_MAX_DELIVERIES,
         };
         let storage = Arc::new(AnvilStorage::new(&config.db_path).await.unwrap());
         let mut broker = AnvilBrokerInner::new_with_storage(config, storage.clone())
@@ -746,6 +751,7 @@ mod tests {
             .create_queue(proto::CreateQueueRequest {
                 queue: queue.clone(),
                 max_pending: 0,
+                max_deliveries: None,
             })
             .await
             .unwrap();

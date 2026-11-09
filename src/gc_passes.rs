@@ -205,7 +205,7 @@ mod tests {
         let (storage, mut acked, live, counts_before) = crashed.block_on(async {
             let storage = AnvilStorage::new(&db_path).await.unwrap();
             for queue in &queues {
-                storage.create_queue(queue, 0).await.unwrap();
+                storage.create_queue(queue, 0, None).await.unwrap();
             }
             let mut acked = BTreeSet::new();
             for wave in 0..WAVES {
@@ -253,8 +253,8 @@ mod tests {
         let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let (queue, extended) = ("gc", "gc:00");
-        storage.create_queue(queue, 0).await.unwrap();
-        storage.create_queue(extended, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
+        storage.create_queue(extended, 0, None).await.unwrap();
         set_sim_time_nanos(T0_NANOS);
         ack_new(&storage, extended, 1).await;
 
@@ -307,7 +307,7 @@ mod tests {
         let setup = tokio::runtime::Runtime::new().unwrap();
         let (backlog, recent, live, counts_before) = setup.block_on(async {
             let storage = AnvilStorage::new(&template_path).await.unwrap();
-            storage.create_queue(&queue, 0).await.unwrap();
+            storage.create_queue(&queue, 0, None).await.unwrap();
             set_sim_time_nanos(T0_NANOS);
             let mut backlog = BTreeSet::new();
             for _ in 0..BACKLOG_BATCHES {
