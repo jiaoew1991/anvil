@@ -32,8 +32,6 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::path::Path;
 
-    use crate::format;
-    use crate::keys;
     use crate::storage::tests::split_claims;
     use crate::storage::{AnvilStorage, Rejection};
     use crate::types::{now_nanos, set_sim_time_nanos, ClaimedMessage, Message, SIM_TIME_LOCK};
@@ -306,14 +304,6 @@ mod tests {
         assert_eq!(deliveries, [1, 2]);
         ack(&storage, "claimed", &redelivered).await;
         assert_eq!(counts(&storage, "claimed").await, (3, 3, 0, 0));
-        let events = storage
-            .state_scan_prefix(keys::RECLAIM_EVENTS, "", 0)
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 2, "one reclaim by the writer, one here");
-        for (_, event) in &events {
-            format::decode_reclaim_event(event).unwrap();
-        }
 
         assert_eq!(counts(&storage, "acked").await, (3, 3, 0, 0));
         assert_eq!(storage.scan_acked(Some("acked")).await.unwrap().len(), 3);

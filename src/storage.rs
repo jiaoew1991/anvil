@@ -1755,6 +1755,8 @@ impl AnvilStorage {
         let mut deleted = 0;
 
         batch.delete(keys::queue(queue));
+        // A queue recreated under the same name starts unfinished.
+        batch.delete(keys::finished(queue));
         batch.delete(keys::total_pushed(queue));
         batch.delete(keys::total_acked(queue));
 
@@ -1940,20 +1942,6 @@ impl AnvilStorage {
                 claims.len() as u64,
                 &[opentelemetry::KeyValue::new("queue", queue.clone())],
             );
-
-            let ts_ns = now_nanos();
-            let events: HashMap<String, Vec<u8>> = claims
-                .iter()
-                .map(|claim| {
-                    (
-                        keys::reclaim_event(&queue, ts_ns, &claim.msg_id),
-                        format::encode_reclaim_event(&queue, claim, ts_ns),
-                    )
-                })
-                .collect();
-            self.state_put_batch(keys::RECLAIM_EVENTS, &events, &[])
-                .await?;
-
             total += claims.len();
         }
 
@@ -3917,8 +3905,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
+        storage.mark_queue_finished(queue).await.unwrap();
+
         let deleted = storage.delete_queue(queue).await.unwrap();
         assert!(deleted > 0);
+        assert!(!storage.is_queue_finished(queue).await.unwrap());
         assert!(!storage
             .list_queues()
             .await
@@ -3980,20 +3971,6 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(recovered, 1);
-        let events = storage
-            .state_scan_prefix(keys::RECLAIM_EVENTS, "", 0)
-            .await
-            .unwrap();
-        assert_eq!(events.len(), 1);
-        let event = format::decode_reclaim_event(&events[0].1).unwrap();
-        assert_eq!(
-            (event.queue.as_str(), event.msg_id.as_str()),
-            (queue, msg.msg_id.as_str())
-        );
-        assert_eq!(
-            (event.worker_id.as_str(), event.delivery_count),
-            ("worker-1", 1)
-        );
 
         let claimed = storage
             .claim_messages(queue, 1, "worker-2", "lease-2")

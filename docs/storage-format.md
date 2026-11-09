@@ -155,15 +155,9 @@ in `proto/anvil.proto`. The messages are:
 | `StoredMessage` | a message key | the queue and msg_id are the key's, not repeated |
 | `ClaimRecord` | a claim key | the queue and msg_id are the key's; `claim_token` is never empty; `delivery_count` is at least 1 |
 | `QueueGroup` | a queue group key | the name is the key's; `partition_queues` has `num_partitions` entries |
-| `ReclaimEvent` | a state value (below) | written by recovery |
 
 Protobuf leaves the order of map entries (`StoredMessage.metadata`) to the
 encoder; a reader must accept any order.
-
-**Reclaim events.** When recovery returns a claim to pending, it writes a
-`ReclaimEvent` as a state value in namespace `wq_events`, under the state key
-`timeout:{queue}:{timestamp_ns, 20 digits}:{msg_id}`. The key is a name, not
-a tuple: the event's fields are in the value.
 
 ### 4.2 Totals
 
