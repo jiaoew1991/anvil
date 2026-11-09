@@ -323,8 +323,8 @@ mod tests {
         /// requeues each of its claims, per queue in msg_id order, keeping
         /// their delivery counts.
         async fn kill(&mut self, w: usize) {
-            let now = crate::types::now_secs();
-            let live: HashMap<String, f64> = (0..WORKERS)
+            let now = crate::types::mono_now();
+            let live: HashMap<String, std::time::Instant> = (0..WORKERS)
                 .filter(|&other| other != w)
                 .map(|other| (format!("lease-{}", worker(other)), now))
                 .collect();
@@ -463,7 +463,6 @@ mod tests {
     /// the downstream stats count phantom pending messages
     /// (chaos_api::test_fenced_forward_leaves_no_phantom_pending).
     #[test]
-    #[ignore = "bug: a fenced forward inflates the downstream pending_count by its payload count"]
     fn test_service_matches_model_with_fenced_forwards() {
         run_seeds(true);
     }

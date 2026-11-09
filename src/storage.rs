@@ -25,20 +25,23 @@
 //   msg:{queue}:{msg_id}            -> Message JSON
 //   claimed:{queue}:{msg_id}        -> ClaimInfo JSON
 //   acked:{queue}:{ts:020d}:{msg_id} -> ""
-//   state:{namespace}:{key}         -> value bytes
+//   state:{namespace}:{key}         -> value bytes (namespace has no ':')
+//   max_pending:{queue}             -> u64 LE  (bound of a bounded queue)
 //
 // Hot paths (push, claim, ack, nack) use in-memory atomic counters
 // with CAS loops instead of SlateDB SerializableSnapshot transactions.
 // This eliminates transaction conflicts at high concurrency.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use slatedb::{Db, DbReadOps, Error as SlateError, MergeOperator, MergeOperatorError, WriteBatch};
 
-use crate::types::{now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta};
+use crate::state::lease_expired;
+use crate::types::{mono_now, now_nanos, ClaimInfo, ClaimedMessage, Message, QueueGroupMeta};
 
 /// Upper bound on keys one GC write deletes, so a large expired backlog is
 /// retired in many small commits instead of one batch that stalls writers.
@@ -147,6 +150,33 @@ impl std::fmt::Display for Rejection {
 
 impl std::error::Error for Rejection {}
 
+/// Whether `error` comes from a closed database: fenced by a newer writer,
+/// shut down, or stopped by a failed background task. A closed SlateDB
+/// instance never opens again, so nothing retried against it can succeed.
+pub fn is_closed(error: &StorageError) -> bool {
+    error
+        .downcast_ref::<SlateError>()
+        .is_some_and(|e| matches!(e.kind(), slatedb::ErrorKind::Closed(_)))
+}
+
+/// Refuses a state namespace that cannot be stored unambiguously. A
+/// namespace with ':' would make `state_key` read `job:a`/`k` and
+/// `job`/`a:k` as one key; refusing it keeps every existing key where it is,
+/// where escaping would move them.
+pub fn check_state_namespace(namespace: &str) -> Result<(), Rejection> {
+    if namespace.is_empty() {
+        return Err(Rejection::InvalidArgument(
+            "state without namespace".to_string(),
+        ));
+    }
+    if namespace.contains(':') {
+        return Err(Rejection::InvalidArgument(format!(
+            "state namespace {namespace:?} contains ':'"
+        )));
+    }
+    Ok(())
+}
+
 /// Per-queue in-memory state. **Single source of truth** for everything
 /// claimers and stage masters need to reason about queue progress.
 ///
@@ -163,11 +193,16 @@ impl std::error::Error for Rejection {}
 /// mutation step. `db.write` runs unlocked, so concurrent writers' batch
 /// commits still execute in parallel. The critical section is sub-µs
 /// (struct field bumps + maybe a `BTreeMap` insert).
+///
+/// Counters that add work (`push_seq_alloc`, `claim_seq`, `total_pushed`,
+/// `total_claimed`) move when a write is reserved, and counters that retire
+/// it move once its batch has landed (see `QueueWrite`), so a queue never
+/// looks drained while a write is in flight.
 #[derive(Debug, Default, Clone)]
 pub struct QueueState {
     /// Committed push watermark — claimers' upper bound. Only advanced
     /// *after* a writer's `db.write(batch)` returns, so any seq below
-    /// `push_seq_committed` has its `pending_key` durable.
+    /// `push_seq_committed` has its `pending_key` applied.
     ///
     /// `commit_log` tracks in-flight reservations so out-of-order
     /// commits don't roll this watermark backward — it only moves
@@ -180,6 +215,10 @@ pub struct QueueState {
     pub push_seq_alloc: u64,
     /// Next seq to be claimed.
     pub claim_seq: u64,
+    /// Seqs below `claim_seq` whose claim was abandoned before its write, by
+    /// a cancelled request or a failed read: their pending keys still wait,
+    /// so claims take them before advancing `claim_seq`.
+    pub returned: BTreeSet<u64>,
     /// Total messages ever pushed.
     pub total_pushed: u64,
     /// Monotonic count of msgs that entered claimed state.
@@ -189,18 +228,22 @@ pub struct QueueState {
     /// Total messages ever acked.
     pub total_acked: u64,
     /// In-flight reservations keyed by `base_seq`. Each entry's `done`
-    /// flips when the matching `PushReservationGuard` is dropped (post
-    /// `db.write`, success or failure). The committer walks the front
-    /// of the map and advances `push_seq_committed` through every
-    /// contiguous-done entry.
+    /// flips when the matching `QueueWrite` is dropped (after its write,
+    /// landed or not). The committer walks the front of the map and
+    /// advances `push_seq_committed` through every contiguous-done entry.
     pub commit_log: BTreeMap<u64, PushReservation>,
+    /// Writes admitted and not yet finished (see `QueueWrite`).
+    pub writers: u64,
+    /// Set by `delete_queue`, which then waits for `writers` to reach zero:
+    /// no further write is admitted.
+    pub deleted: bool,
 }
 
 impl QueueState {
     /// Pending count includes in-flight reservations. Use this for
     /// "is there work?" semantics (stage master, drained check).
     pub fn pending_count(&self) -> u64 {
-        self.push_seq_alloc.saturating_sub(self.claim_seq)
+        self.push_seq_alloc.saturating_sub(self.claim_seq) + self.returned.len() as u64
     }
 
     /// Currently-claimed count.
@@ -209,11 +252,33 @@ impl QueueState {
     }
 }
 
-/// Per-queue counters / state holder. Just wraps the `QueueState` in a
-/// mutex; everything else lives on the heap inside.
+/// Per-queue counters / state holder: the `QueueState` behind its mutex.
 #[derive(Default)]
 pub struct QueueCounters {
     pub state: std::sync::Mutex<QueueState>,
+    /// Notified when the last write admitted to a deleted queue finishes.
+    idle: tokio::sync::Notify,
+}
+
+impl QueueCounters {
+    /// Turns away every new write and waits for those admitted to finish.
+    async fn close(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            // Registered before the check, so the last writer's notification
+            // cannot slip in between.
+            idle.as_mut().enable();
+            {
+                let mut s = self.state.lock().expect("queue state poisoned");
+                s.deleted = true;
+                if s.writers == 0 {
+                    return;
+                }
+            }
+            idle.await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -222,49 +287,189 @@ pub struct PushReservation {
     pub done: bool,
 }
 
-/// RAII guard for an in-flight push reservation. `Drop` flips the
-/// matching `commit_log` entry to `done` and advances
-/// `push_seq_committed` through the contiguous-done prefix — all
-/// inside one mutex acquisition.
+/// One operation's write to one queue, from its admission to the end of its
+/// batch's write. `delete_queue` waits until every admitted write finished,
+/// so none lands after the delete and leaves keys under counters that no
+/// longer describe them.
 ///
-/// Drop runs on every exit path (Ok return, `?`-propagated error,
-/// panic, async task cancellation), so a writer cannot leak a Pending
-/// reservation and wedge the watermark.
-pub struct PushReservationGuard {
+/// Dropping it finishes the write in one critical section, on every exit
+/// path: an `Ok` return, a `?` error, a panic, or the request future
+/// being cancelled. It closes its push reservation (the watermark must not
+/// wedge behind it), returns a claim abandoned before its write, and, only if
+/// the batch landed, retires the claims it settled.
+struct QueueWrite {
     counters: Arc<QueueCounters>,
-    base_seq: u64,
+    /// Base seq of the range this write fills at the tail of pending.
+    push_base: Option<u64>,
+    /// Seqs this claim reserved and has not yet handed to its write.
+    claimed: Vec<u64>,
+    /// Claims this write acks, retired once it lands.
+    acked: u64,
+    /// Claims this write acks or requeues, retired once it lands.
+    unclaimed: u64,
+    /// Set by `commit` once the batch is applied.
+    landed: bool,
 }
 
-impl Drop for PushReservationGuard {
+impl QueueWrite {
+    /// Admits a write to the queue of `counters`, unless the queue is being
+    /// deleted.
+    fn admit(counters: Arc<QueueCounters>) -> Option<Self> {
+        {
+            let mut s = counters.state.lock().expect("queue state poisoned");
+            if s.deleted {
+                return None;
+            }
+            s.writers += 1;
+        }
+        Some(Self {
+            counters,
+            push_base: None,
+            claimed: Vec::new(),
+            acked: 0,
+            unclaimed: 0,
+            landed: false,
+        })
+    }
+
+    /// Reserves `count` seqs at the tail of pending for what `tail` puts
+    /// there and returns the first. Claimers see the range once the write
+    /// finishes.
+    fn reserve(&mut self, count: u64, tail: Tail) -> u64 {
+        assert!(self.push_base.is_none(), "one push reservation per write");
+        assert!(count > 0);
+        let mut s = self.counters.state.lock().expect("queue state poisoned");
+        match tail {
+            Tail::Pushed => s.total_pushed += count,
+            Tail::Requeued => self.unclaimed += count,
+        }
+        let base = s.push_seq_alloc;
+        s.push_seq_alloc += count;
+        s.commit_log
+            .insert(base, PushReservation { count, done: false });
+        self.push_base = Some(base);
+        base
+    }
+
+    /// Records `count` claims this write acks.
+    fn ack(&mut self, count: u64) {
+        self.acked += count;
+        self.unclaimed += count;
+    }
+
+    /// Reserves up to `batch_size` pending seqs, abandoned ones first. They
+    /// count as claimed at once, so the queue never looks drained while the
+    /// claim reads them; dropping the write before `hand_over_claims`
+    /// returns them.
+    fn claim(&mut self, batch_size: usize) -> Vec<u64> {
+        assert!(self.claimed.is_empty());
+        let mut s = self.counters.state.lock().expect("queue state poisoned");
+        while self.claimed.len() < batch_size {
+            let Some(seq) = s.returned.pop_first() else {
+                break;
+            };
+            self.claimed.push(seq);
+        }
+        assert!(s.claim_seq <= s.push_seq_committed);
+        let fresh =
+            ((batch_size - self.claimed.len()) as u64).min(s.push_seq_committed - s.claim_seq);
+        self.claimed.extend(s.claim_seq..s.claim_seq + fresh);
+        s.claim_seq += fresh;
+        s.total_claimed += self.claimed.len() as u64;
+        self.claimed.clone()
+    }
+
+    /// Hands the claim's `written` messages to its batch, which is about to
+    /// be committed. The other reserved seqs held no message (a pending key
+    /// or body gone), so they stop counting as claimed.
+    fn hand_over_claims(&mut self, written: usize) {
+        assert!(written <= self.claimed.len());
+        let empty = (self.claimed.len() - written) as u64;
+        if empty > 0 {
+            self.counters
+                .state
+                .lock()
+                .expect("queue state poisoned")
+                .total_claimed -= empty;
+        }
+        self.claimed.clear();
+    }
+}
+
+impl Drop for QueueWrite {
     fn drop(&mut self) {
         let mut s = match self.counters.state.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(entry) = s.commit_log.get_mut(&self.base_seq) {
-            entry.done = true;
+        if self.landed {
+            s.total_acked += self.acked;
+            s.total_unclaimed += self.unclaimed;
         }
-        // Walk the contiguous-done prefix from the front.
-        loop {
-            let front = s
-                .commit_log
-                .iter()
-                .next()
-                .map(|(&k, e)| (k, e.count, e.done));
-            match front {
-                Some((k, count, true)) if k == s.push_seq_committed => {
-                    s.push_seq_committed = k + count;
-                    s.commit_log.remove(&k);
+        let abandoned = self.claimed.len() as u64;
+        assert!(s.claimed_count() >= abandoned);
+        s.total_claimed -= abandoned;
+        s.returned.extend(self.claimed.drain(..));
+        if let Some(base) = self.push_base {
+            s.commit_log
+                .get_mut(&base)
+                .expect("reservation in the commit log")
+                .done = true;
+            // Walk the contiguous-done prefix from the front.
+            loop {
+                let front = s.commit_log.first_key_value().map(|(&k, &e)| (k, e));
+                match front {
+                    Some((k, PushReservation { count, done: true }))
+                        if k == s.push_seq_committed =>
+                    {
+                        s.push_seq_committed = k + count;
+                        s.commit_log.remove(&k);
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
         }
+        assert!(s.writers > 0);
+        s.writers -= 1;
+        if s.deleted && s.writers == 0 {
+            self.counters.idle.notify_waiters();
+        }
     }
+}
+
+/// What a batch releases once its write is over, applied or not. `commit`
+/// owns it until then, so a caller dropped mid-write cannot release it early.
+#[derive(Default)]
+struct Landing {
+    writes: Vec<QueueWrite>,
+    settlement: Option<SettlementHold>,
+    /// `delete_queue`'s hold on `counters_loading`.
+    loading: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// What a push reservation puts at the tail of pending.
+#[derive(Clone, Copy)]
+enum Tail {
+    /// New messages.
+    Pushed,
+    /// Claims the write returns to pending.
+    Requeued,
+}
+
+/// How far `commit` waits for a batch.
+#[derive(Clone, Copy)]
+enum Wait {
+    /// Until it would survive a crash: every RPC that reports success.
+    Durable,
+    /// Until it is applied, visible to every later read.
+    Applied,
 }
 
 /// Queue metadata for O(1) operations (return type for get_queue_stats)
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct QueueMeta {
+    /// The claim cursor less the seqs returned behind it, so that
+    /// `push_seq - claim_seq` counts every claimable message.
     pub claim_seq: u64,
     pub push_seq: u64,
     /// Number of currently claimed messages (O(1) stats)
@@ -361,59 +566,81 @@ pub struct AnvilStorage {
     /// them: a loader racing a writer could see a later push land before an
     /// earlier one and derive a claim cursor past the push cursor, and a late
     /// zero write could reset totals another writer had merged.
-    counters_loading: tokio::sync::Mutex<()>,
+    counters_loading: Arc<tokio::sync::Mutex<()>>,
     /// Per-group round-robin counters for O(1) steal path in claim_from_group
     steal_rr: std::sync::Mutex<HashMap<String, u64>>,
-    /// Per-queue max pending limits (0 = unlimited). Used for bounded queue support.
+    /// Bounds of bounded queues; an unbounded queue has no entry. Mirrors the
+    /// persisted `max_pending:{queue}` keys of the queues loaded so far.
     max_pending_limits: DashMap<String, u64>,
-    /// Claim keys whose settlement (ack, nack or reclaim) is between its
-    /// check and its durable write. Without the hold, two settlements of
-    /// one message both pass the check: a retried ack counts twice, and a
-    /// reclaim that read the claim before an ack requeues an acked message,
-    /// which undercounts `claimed_count` until a queue reports drained with
-    /// work still in flight. The broker is the database's only writer, so
-    /// an in-memory set is enough.
-    settling: DashSet<Vec<u8>>,
-    /// When each claim, by claim token, was last renewed by its worker. A
-    /// claim under a live lease is stuck once neither its claim nor its last
-    /// renewal is within `claim_age_timeout_secs`. Kept in memory only: a
-    /// restarted broker has no live leases, so every claim is reclaimed
-    /// regardless. Recovery prunes tokens that no longer hold a claim.
-    renewed_at: DashMap<String, f64>,
+    /// Claims, as claim key and the token presented for it, whose
+    /// settlement (ack, nack or reclaim) is between its check and its
+    /// write. Without the hold, two settlements of one message both
+    /// pass the check: a retried ack counts twice, and a reclaim that read
+    /// the claim before an ack requeues an acked message, which undercounts
+    /// `claimed_count` until a queue reports drained with work still in
+    /// flight. The token is part of the key so that a request presenting a
+    /// stale one never holds the claim its owner settles: of the
+    /// settlements of one message, only those presenting its current token
+    /// can pass the check, and the token cannot change while one holds it.
+    /// The broker is the database's only writer, so an in-memory set is
+    /// enough.
+    settling: Arc<DashSet<(Vec<u8>, String)>>,
+    /// When each claim, by claim token, was taken, on the monotonic clock.
+    /// Claim age is timed from here rather than from the persisted
+    /// `claimed_at`, which is wall clock and would let a clock step age a
+    /// claim at once or never. Kept in memory only: a restarted broker has
+    /// no live leases, so it reclaims every earlier claim regardless of age.
+    /// Recovery prunes tokens that no longer hold a claim.
+    taken_at: DashMap<String, Instant>,
+    /// When each claim, by claim token, was last renewed by its worker, on
+    /// the monotonic clock. A claim under a live lease is stuck once neither
+    /// its taking nor its last renewal is within `claim_age_timeout_secs`.
+    /// In memory and pruned like `taken_at`.
+    renewed_at: DashMap<String, Instant>,
 }
 
-/// Claims held for settlement, released when dropped: after the durable
-/// write, on an error, or when the request future is cancelled.
-struct SettlementHold<'a> {
-    settling: &'a DashSet<Vec<u8>>,
-    claim_keys: Vec<Vec<u8>>,
+/// Claims held for settlement, released when dropped: once the write is
+/// applied, on an error, or when the request is cancelled before its write.
+struct SettlementHold {
+    settling: Arc<DashSet<(Vec<u8>, String)>>,
+    claims: Vec<(Vec<u8>, String)>,
 }
 
-impl<'a> SettlementHold<'a> {
-    fn new(settling: &'a DashSet<Vec<u8>>) -> Self {
+impl SettlementHold {
+    fn new(settling: Arc<DashSet<(Vec<u8>, String)>>) -> Self {
         Self {
             settling,
-            claim_keys: Vec::new(),
+            claims: Vec::new(),
         }
     }
 
-    /// Takes the claim unless another settlement holds it.
-    fn take(&mut self, claim_key: Vec<u8>) -> bool {
-        if !self.settling.insert(claim_key.clone()) {
+    /// Takes the claim under `token` unless another settlement presenting
+    /// the same token holds it.
+    fn take(&mut self, claim_key: Vec<u8>, token: &str) -> bool {
+        let claim = (claim_key, token.to_string());
+        if !self.settling.insert(claim.clone()) {
             return false;
         }
-        self.claim_keys.push(claim_key);
+        self.claims.push(claim);
         true
     }
 }
 
-impl Drop for SettlementHold<'_> {
+impl Drop for SettlementHold {
     fn drop(&mut self) {
-        for claim_key in &self.claim_keys {
-            let released = self.settling.remove(claim_key);
+        for claim in &self.claims {
+            let released = self.settling.remove(claim);
             assert!(released.is_some(), "settlement hold released twice");
         }
     }
+}
+
+/// The claims an operation settles, held and verified, and the write that
+/// settles them.
+struct Settlement {
+    write: QueueWrite,
+    hold: SettlementHold,
+    claims: Vec<ClaimInfo>,
 }
 
 impl AnvilStorage {
@@ -441,20 +668,68 @@ impl AnvilStorage {
         Ok(Self {
             db,
             counters: DashMap::new(),
-            counters_loading: tokio::sync::Mutex::new(()),
+            counters_loading: Arc::new(tokio::sync::Mutex::new(())),
             steal_rr: std::sync::Mutex::new(HashMap::new()),
             max_pending_limits: DashMap::new(),
-            settling: DashSet::new(),
+            settling: Arc::new(DashSet::new()),
+            taken_at: DashMap::new(),
             renewed_at: DashMap::new(),
         })
     }
 
-    /// Commit a batch and wait until it is durable. SlateDB's `write`
-    /// returns once the batch is in the in-memory WAL; every anvil RPC must
-    /// not report success before its effect would survive a crash.
-    #[allow(clippy::disallowed_methods)] // the one sanctioned write path
-    async fn write_durable(&self, batch: WriteBatch) -> Result<(), StorageError> {
-        self.db.write(batch).await?.await_durable().await?;
+    /// Writes `batch` and then waits as `wait` says. SlateDB's `write`
+    /// returns once the batch is applied: in the in-memory WAL and memtable,
+    /// visible to every later read. Every anvil RPC must not report success
+    /// before its effect would survive a crash, so all but a claim then wait
+    /// for durability.
+    ///
+    /// The write runs in a task of its own, which drops `landing` once the
+    /// batch is applied, after marking its queue writes landed. The task is
+    /// what makes a request cancel-safe. A client deadline drops the
+    /// handler's future at its next await, and `Db::write` may or may not
+    /// apply a batch whose future is dropped; awaited in the caller, the
+    /// write could be applied after the holds and reservations it relies on
+    /// were released, or be cut off after they were spent. The task finishes
+    /// both together whatever happens to the caller. What memory reflects is
+    /// what every read sees, so a caller cut off while waiting for
+    /// durability leaves nothing to undo.
+    ///
+    /// A failed write retires nothing (see `QueueState`): SlateDB retries
+    /// object-store errors itself and fails a write only for a malformed
+    /// batch or a Db closed or fenced, which serves nothing more; a new
+    /// broker derives every counter from the keys.
+    async fn commit(
+        &self,
+        batch: WriteBatch,
+        wait: Wait,
+        landing: Landing,
+    ) -> Result<(), StorageError> {
+        let db = self.db.clone();
+        let handle = tokio::spawn(async move {
+            let Landing {
+                mut writes,
+                settlement,
+                loading,
+            } = landing;
+            #[allow(clippy::disallowed_methods)] // the one sanctioned write path
+            let written = db.write(batch).await;
+            if written.is_ok() {
+                for write in &mut writes {
+                    write.landed = true;
+                }
+            }
+            // The counters first: a settlement or load let in by a release
+            // must find them up to date.
+            drop(writes);
+            drop(settlement);
+            drop(loading);
+            written
+        })
+        .await??;
+        match wait {
+            Wait::Durable => handle.await_durable().await?,
+            Wait::Applied => {}
+        }
         Ok(())
     }
 
@@ -545,7 +820,15 @@ impl AnvilStorage {
     }
 
     fn state_key(namespace: &str, key: &str) -> Vec<u8> {
+        assert!(
+            check_state_namespace(namespace).is_ok(),
+            "unchecked state namespace {namespace:?}"
+        );
         format!("state:{}:{}", namespace, key).into_bytes()
+    }
+
+    fn max_pending_key(queue: &str) -> Vec<u8> {
+        format!("max_pending:{}", queue).into_bytes()
     }
 
     fn finished_key(queue: &str) -> Vec<u8> {
@@ -574,10 +857,36 @@ impl AnvilStorage {
         batch.put(Self::cnt_total_acked_key(queue), zero);
     }
 
-    /// Holds the claims of `msg_ids` and verifies each one's token, lease and
-    /// worker. The caller settles them while it keeps the returned hold, which
-    /// must outlive its durable write: a claim that is already being settled
-    /// fails the check like a stale token.
+    /// Admits a write to `queue`, creating the queue on first use. A write
+    /// that finds the queue being deleted retries: `delete_queue` removed
+    /// the counters it found before closing them, so the retry waits for
+    /// `counters_loading` and sees the queue as the delete left it.
+    async fn admit(&self, queue: &str) -> Result<QueueWrite, StorageError> {
+        loop {
+            if let Some(write) = QueueWrite::admit(self.load_or_init_counters(queue).await?) {
+                return Ok(write);
+            }
+        }
+    }
+
+    /// Admits a write to `queue` like `admit`, or `None` if the queue does
+    /// not exist, which this never creates.
+    async fn admit_existing(&self, queue: &str) -> Result<Option<QueueWrite>, StorageError> {
+        loop {
+            let Some(counters) = self.load_counters(queue).await? else {
+                return Ok(None);
+            };
+            if let Some(write) = QueueWrite::admit(counters) {
+                return Ok(Some(write));
+            }
+        }
+    }
+
+    /// Admits a write to `queue`, then holds the claims of `msg_ids` and
+    /// verifies each one's token, lease and worker. The caller settles them
+    /// through the returned write while it keeps the hold, which must outlive
+    /// its write: a claim that is already being settled under the
+    /// same token fails the check like a stale token.
     async fn validate_claims(
         &self,
         queue: &str,
@@ -585,12 +894,18 @@ impl AnvilStorage {
         claim_tokens: &[String],
         expected_lease_id: Option<&str>,
         expected_worker_id: Option<&str>,
-    ) -> Result<(SettlementHold<'_>, Vec<ClaimInfo>), StorageError> {
-        let mut hold = SettlementHold::new(&self.settling);
+    ) -> Result<Settlement, StorageError> {
+        assert!(!msg_ids.is_empty());
+        let write = self.admit_existing(queue).await?.ok_or_else(|| {
+            Rejection::Fenced(format!(
+                "message_not_claimed: queue={queue} does not exist, msg_id={}",
+                msg_ids[0]
+            ))
+        })?;
+        let mut hold = SettlementHold::new(self.settling.clone());
         let mut claims = Vec::with_capacity(msg_ids.len());
         for (msg_id, token) in msg_ids.iter().zip(claim_tokens.iter()) {
-            let claim_key = Self::claimed_key(queue, msg_id);
-            if !hold.take(claim_key.clone()) {
+            if !hold.take(Self::claimed_key(queue, msg_id), token) {
                 return Err(Box::new(Rejection::Fenced(format!(
                     "claim_settling: queue={queue}, msg_id={msg_id} is being settled concurrently"
                 ))));
@@ -601,8 +916,53 @@ impl AnvilStorage {
             );
         }
         assert_eq!(claims.len(), msg_ids.len());
-        assert_eq!(hold.claim_keys.len(), msg_ids.len());
-        Ok((hold, claims))
+        assert_eq!(hold.claims.len(), msg_ids.len());
+        Ok(Settlement {
+            write,
+            hold,
+            claims,
+        })
+    }
+
+    /// Settles the claims of `msg_ids` in `queue` (none if it is empty) by
+    /// `validate_claims` and admits a write to each queue of `downstream`.
+    /// The downstream counters are loaded before any write is admitted:
+    /// `delete_queue` waits for admitted writes while it holds
+    /// `counters_loading`, so an admitted write must never wait for it.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_settlement(
+        &self,
+        queue: &str,
+        msg_ids: &[String],
+        claim_tokens: &[String],
+        expected_lease_id: Option<&str>,
+        expected_worker_id: Option<&str>,
+        downstream: &[&str],
+    ) -> Result<(Option<Settlement>, Vec<QueueWrite>), StorageError> {
+        loop {
+            let mut counters = Vec::with_capacity(downstream.len());
+            for queue in downstream {
+                counters.push(self.load_or_init_counters(queue).await?);
+            }
+            let settlement = if msg_ids.is_empty() {
+                None
+            } else {
+                Some(
+                    self.validate_claims(
+                        queue,
+                        msg_ids,
+                        claim_tokens,
+                        expected_lease_id,
+                        expected_worker_id,
+                    )
+                    .await?,
+                )
+            };
+            // A downstream queue deleted since it was loaded is loaded anew.
+            if let Some(writes) = counters.into_iter().map(QueueWrite::admit).collect() {
+                return Ok((settlement, writes));
+            }
+        }
     }
 
     /// Reads the claim on `msg_id` and checks that its holder presented the
@@ -691,47 +1051,11 @@ impl AnvilStorage {
             );
         }
         // All or none: one stale claim fails the call before any renews.
-        let now = crate::types::now_secs();
+        let now = mono_now();
         for claim in claims {
             self.renewed_at.insert(claim.claim_token, now);
         }
         Ok(())
-    }
-
-    /// Reserve a contiguous push range and register a pending entry in
-    /// the queue's commit log. Returns a `PushReservationGuard` that
-    /// closes the reservation on `Drop` (advancing the watermark through
-    /// the contiguous-committed prefix).
-    ///
-    /// **Crucial**: callers MUST hold the guard for the entire span of
-    /// "writing this push to the DB" — `Ok` returns, `?`-propagated
-    /// errors, panics, and async-task cancellation all run the same
-    /// `Drop` path. Without this, an early return between
-    /// `reserve_push_range` and a separate explicit-commit call would
-    /// leave a `Pending` entry in the log forever, wedging the watermark
-    /// and orphaning every subsequent push to that queue. (That bug
-    /// was real on this PR's first iteration — see
-    /// `docs/lessons/anvil-publish-commit-race.md` for the trace.)
-    ///
-    /// All three push-side writers (`push_messages`,
-    /// `nack_messages_internal`, the downstream-push branch of
-    /// `ack_internal`) share this single bookkeeping path. The
-    /// `push_commit_log` mutex is held only briefly here and inside
-    /// `Drop` — never across `db.write` — so concurrent writers run
-    /// their commits fully in parallel.
-    fn reserve_push_range(c: &Arc<QueueCounters>, count: u64) -> PushReservationGuard {
-        let base_seq = {
-            let mut s = c.state.lock().expect("queue state poisoned");
-            let base = s.push_seq_alloc;
-            s.push_seq_alloc += count;
-            s.commit_log
-                .insert(base, PushReservation { count, done: false });
-            base
-        };
-        PushReservationGuard {
-            counters: c.clone(),
-            base_seq,
-        }
     }
 
     /// Seq of a pending key of `queue`, or `None` for a key of another queue
@@ -804,7 +1128,7 @@ impl AnvilStorage {
         if let Some(c) = self.counters.get(queue) {
             return Ok(Some(c.clone()));
         }
-        let loading = self.counters_loading.lock().await;
+        let loading = self.counters_loading.clone().lock_owned().await;
         self.load_counters_locked(queue, &loading).await
     }
 
@@ -813,7 +1137,7 @@ impl AnvilStorage {
     async fn load_counters_locked(
         &self,
         queue: &str,
-        _loading: &tokio::sync::MutexGuard<'_, ()>,
+        _loading: &tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<Option<Arc<QueueCounters>>, StorageError> {
         // Loaded by the previous holder of the lock.
         if let Some(c) = self.counters.get(queue) {
@@ -851,8 +1175,9 @@ impl AnvilStorage {
                     total_claimed: claimed_count,
                     total_unclaimed: 0,
                     total_acked,
-                    commit_log: BTreeMap::new(),
+                    ..QueueState::default()
                 }),
+                ..QueueCounters::default()
             })
         } else {
             // Try old meta:{queue} JSON (migration path)
@@ -877,8 +1202,9 @@ impl AnvilStorage {
                     total_claimed: migrated_total_claimed,
                     total_unclaimed: migrated_total_unclaimed,
                     total_acked: old_meta.total_acked,
-                    commit_log: BTreeMap::new(),
+                    ..QueueState::default()
                 }),
+                ..QueueCounters::default()
             });
 
             // Persist new counter keys
@@ -892,11 +1218,16 @@ impl AnvilStorage {
                 Self::cnt_total_acked_key(queue),
                 old_meta.total_acked.to_le_bytes(),
             );
-            self.write_durable(batch).await?;
+            self.commit(batch, Wait::Durable, Landing::default())
+                .await?;
 
             c
         };
 
+        if let Some(limit) = self.db.get(&Self::max_pending_key(queue)).await? {
+            self.max_pending_limits
+                .insert(queue.to_string(), Self::read_u64_le(&limit));
+        }
         let previous = self.counters.insert(queue.to_string(), counters.clone());
         assert!(previous.is_none(), "counters of {queue} loaded twice");
         Ok(Some(counters))
@@ -908,13 +1239,14 @@ impl AnvilStorage {
         if let Some(c) = self.counters.get(queue) {
             return Ok(c.clone());
         }
-        let loading = self.counters_loading.lock().await;
+        let loading = self.counters_loading.clone().lock_owned().await;
         if let Some(counters) = self.load_counters_locked(queue, &loading).await? {
             return Ok(counters);
         }
         let mut batch = WriteBatch::new();
         Self::write_zero_counters(&mut batch, queue);
-        self.write_durable(batch).await?;
+        self.commit(batch, Wait::Durable, Landing::default())
+            .await?;
         let counters = Arc::new(QueueCounters::default());
         let previous = self.counters.insert(queue.to_string(), counters.clone());
         assert!(previous.is_none(), "counters of {queue} created twice");
@@ -960,38 +1292,64 @@ impl AnvilStorage {
         let s = counters.state.lock().expect("queue state poisoned");
         QueueMeta {
             push_seq: s.push_seq_committed,
-            claim_seq: s.claim_seq,
+            claim_seq: s.claim_seq - s.returned.len() as u64,
             claimed_count: s.claimed_count(),
             total_pushed: s.total_pushed,
             total_acked: s.total_acked,
         }
     }
 
-    /// Create a queue — write the 6 counter keys (all zeros).
-    /// `max_pending`: 0 = unlimited (default), >0 = bounded queue.
+    /// Create a queue: write its zero counter keys.
+    /// `max_pending`: 0 = unlimited (default), >0 = bounded queue. Creating
+    /// an existing queue with a bound replaces its bound; with 0 it keeps it.
     pub async fn create_queue(&self, queue: &str, max_pending: u64) -> Result<(), StorageError> {
-        // Always set in-memory limit (survives idempotent create on persistent DB).
-        if max_pending > 0 {
-            self.max_pending_limits
-                .insert(queue.to_string(), max_pending);
-        }
-
-        // Held from the check to the write: see `counters_loading`.
-        let _loading = self.counters_loading.lock().await;
-        // Check if already exists (either new or old format)
-        if self.db.get(&Self::seq_push_key(queue)).await?.is_some() {
-            return Ok(());
-        }
-        if self.db.get(&Self::meta_key(queue)).await?.is_some() {
+        // Held from the check until the write is applied: see
+        // `counters_loading`. It also orders this bound against a loader
+        // reading the persisted one.
+        let loading = self.counters_loading.clone().lock_owned().await;
+        let exists = self.db.get(&Self::seq_push_key(queue)).await?.is_some()
+            || self.db.get(&Self::meta_key(queue)).await?.is_some();
+        if exists && max_pending == 0 {
             return Ok(());
         }
 
         let mut batch = WriteBatch::new();
-        Self::write_zero_counters(&mut batch, queue);
-        self.write_durable(batch).await?;
-        self.db.flush().await?;
-
+        if !exists {
+            Self::write_zero_counters(&mut batch, queue);
+        }
+        Self::write_max_pending(&mut batch, queue, max_pending);
+        self.set_max_pending(queue, max_pending);
+        self.commit(
+            batch,
+            Wait::Durable,
+            Landing {
+                loading: Some(loading),
+                ..Landing::default()
+            },
+        )
+        .await?;
+        if !exists {
+            self.db.flush().await?;
+        }
         Ok(())
+    }
+
+    /// Persists the bound of a bounded queue in `batch`, so it survives a
+    /// restart; 0 (unbounded) writes nothing.
+    fn write_max_pending(batch: &mut WriteBatch, queue: &str, max_pending: u64) {
+        if max_pending > 0 {
+            batch.put(Self::max_pending_key(queue), max_pending.to_le_bytes());
+        }
+    }
+
+    /// Applies a bound `write_max_pending` puts in a batch about to be
+    /// committed. The caller holds `counters_loading` until that batch is
+    /// applied, so no loader overwrites it with the bound it read before.
+    fn set_max_pending(&self, queue: &str, max_pending: u64) {
+        if max_pending > 0 {
+            self.max_pending_limits
+                .insert(queue.to_string(), max_pending);
+        }
     }
 
     /// Check if a queue has capacity for `additional` messages.
@@ -1002,35 +1360,94 @@ impl AnvilStorage {
         queue: &str,
         additional: usize,
     ) -> Result<(), StorageError> {
-        if let Some(limit) = self.max_pending_limits.get(queue) {
-            let max = *limit;
-            if max > 0 {
-                // Always load counters — they may not be cached yet on first access.
-                let counters = self.load_or_init_counters(queue).await?;
-                let in_flight = {
-                    let s = counters.state.lock().expect("queue state poisoned");
-                    s.total_pushed.saturating_sub(s.total_acked)
-                };
-                if in_flight + additional as u64 > max {
-                    return Err(Box::new(Rejection::QueueFull(format!(
-                        "QueueFull: queue={queue}, in_flight={in_flight}, max_pending={max}, attempted={additional}"
-                    ))));
-                }
-            }
+        // Loading the counters loads the persisted bound. A queue not created
+        // yet has none, and checking it must not create it.
+        let Some(counters) = self.load_counters(queue).await? else {
+            return Ok(());
+        };
+        let Some(max) = self.max_pending_limits.get(queue).map(|limit| *limit) else {
+            return Ok(());
+        };
+        assert!(max > 0, "unbounded queue {queue} has a bound");
+        let in_flight = {
+            let s = counters.state.lock().expect("queue state poisoned");
+            s.total_pushed.saturating_sub(s.total_acked)
+        };
+        if in_flight + additional as u64 > max {
+            return Err(Box::new(Rejection::QueueFull(format!(
+                "QueueFull: queue={queue}, in_flight={in_flight}, max_pending={max}, attempted={additional}"
+            ))));
         }
         Ok(())
     }
 
     // === Push Operations (NO TRANSACTION) ===
 
+    /// Puts `messages` into `batch` as new pending messages of `queue`
+    /// from `base_seq` on, with the increment of its lifetime push total.
+    fn put_new_messages(batch: &mut WriteBatch, queue: &str, base_seq: u64, messages: &[Message]) {
+        batch.merge(
+            Self::cnt_total_pushed_key(queue),
+            (messages.len() as u64).to_le_bytes(),
+        );
+        for (i, msg) in messages.iter().enumerate() {
+            batch.put(Self::msg_key(queue, &msg.msg_id), encode_message(msg));
+            batch.put(
+                Self::pending_key(queue, base_seq + i as u64),
+                encode_pending(&msg.msg_id, 0),
+            );
+        }
+    }
+
+    /// Puts the ack of the claims `settlement` holds into `batch`, and the
+    /// settlement into the `landing` of its write.
+    fn ack_claims(
+        batch: &mut WriteBatch,
+        landing: &mut Landing,
+        queue: &str,
+        msg_ids: &[String],
+        settlement: Settlement,
+    ) {
+        let Settlement {
+            mut write, hold, ..
+        } = settlement;
+        assert_eq!(hold.claims.len(), msg_ids.len());
+        let ack_count = msg_ids.len() as u64;
+        write.ack(ack_count);
+        batch.merge(Self::cnt_total_acked_key(queue), ack_count.to_le_bytes());
+        // The body is dead once acked: no reader of acked entries needs the
+        // payload, and keeping it until GC multiplies the live data every
+        // point read has to search.
+        let now_ns = now_nanos();
+        for msg_id in msg_ids {
+            batch.delete(Self::claimed_key(queue, msg_id));
+            batch.delete(Self::msg_key(queue, msg_id));
+            batch.put(Self::acked_key(queue, now_ns, msg_id), []);
+        }
+        landing.writes.push(write);
+        landing.settlement = Some(hold);
+    }
+
+    /// Puts the state updates of an operation into its `batch`.
+    fn put_state(
+        batch: &mut WriteBatch,
+        namespace: &str,
+        puts: Option<&HashMap<String, Vec<u8>>>,
+        deletes: Option<&[String]>,
+    ) {
+        for (key, value) in puts.into_iter().flatten() {
+            batch.put(Self::state_key(namespace, key), value);
+        }
+        for key in deletes.into_iter().flatten() {
+            batch.delete(Self::state_key(namespace, key));
+        }
+    }
+
     /// Push messages to queue.
     ///
-    /// Reserves a unique seq range via `reserve_push_range` (briefly
-    /// touches the per-queue commit log mutex), runs `db.write` without
-    /// holding any per-queue lock, and lets the returned guard's `Drop`
-    /// advance the claimer-visible `push_seq` watermark through the
-    /// contiguous-committed prefix on every exit path. Concurrent
-    /// pushers / nacks proceed fully in parallel through their `db.write`s.
+    /// Reserves a unique seq range at the tail; claimers see it once the
+    /// write finishes and the watermark passes it. Concurrent pushers and
+    /// nacks run their writes fully in parallel.
     pub async fn push_messages(
         &self,
         queue: &str,
@@ -1042,32 +1459,19 @@ impl AnvilStorage {
 
         self.check_queue_capacity(queue, messages.len()).await?;
 
-        let c = self.load_or_init_counters(queue).await?;
-        let count = messages.len() as u64;
-
-        // Reserve seq range + bump total_pushed in one locked critical
-        // section. push_seq_committed does NOT advance here — claimers
-        // can't see this range until the watermark catches up after this
-        // guard drops (post-`db.write`).
-        let _push_guard = Self::reserve_push_range(&c, count);
-        let base_seq = _push_guard.base_seq;
-        c.state.lock().expect("queue state poisoned").total_pushed += count;
+        let mut write = self.admit(queue).await?;
+        let base_seq = write.reserve(messages.len() as u64, Tail::Pushed);
         let mut batch = WriteBatch::new();
-        batch.merge(Self::cnt_total_pushed_key(queue), count.to_le_bytes());
-
-        for (i, msg) in messages.iter().enumerate() {
-            let seq = base_seq + i as u64;
-            batch.put(Self::msg_key(queue, &msg.msg_id), encode_message(msg));
-            batch.put(
-                Self::pending_key(queue, seq),
-                encode_pending(&msg.msg_id, 0),
-            );
-        }
-        // Guard drops at end-of-scope — both on the Ok return below and on
-        // the `?` propagation from `db.write` errors. No early-return path
-        // can leak the reservation.
-        self.write_durable(batch).await?;
-        Ok(())
+        Self::put_new_messages(&mut batch, queue, base_seq, messages);
+        self.commit(
+            batch,
+            Wait::Durable,
+            Landing {
+                writes: vec![write],
+                ..Landing::default()
+            },
+        )
+        .await
     }
 
     /// Push a single message (convenience wrapper, used in tests)
@@ -1078,19 +1482,12 @@ impl AnvilStorage {
 
     // === Claim Operations (CAS loop, NO TRANSACTION) ===
 
-    /// Claim messages from queue using CAS on claim_seq.
+    /// Claims up to `batch_size` pending messages for `worker_id`.
     ///
-    /// Reserve a range of seqs and load their messages.
-    ///
-    /// **One critical section** for the reservation: lock the queue
-    /// state, observe `(claim_seq, push_seq_committed)`, advance
-    /// `claim_seq` and bump `total_claimed` by the reserved range,
-    /// release. DB reads + batch build + `db.write` run unlocked.
-    ///
-    /// If some seqs in the reserved range had no `pending_key`
-    /// committed (publish/nack writer in flight, or msg_data deleted),
-    /// the over-bump on `total_claimed` is undone in a second brief
-    /// lock. Brief inflation is the safe direction for `drained` checks.
+    /// The seqs are reserved, and counted claimed, in one critical section
+    /// (`QueueWrite::claim`); the reads and the write run unlocked. A claim
+    /// cancelled or failed before its write returns the seqs, so another
+    /// claim takes them.
     pub async fn claim_messages(
         &self,
         queue: &str,
@@ -1098,102 +1495,77 @@ impl AnvilStorage {
         worker_id: &str,
         lease_id: &str,
     ) -> Result<Vec<ClaimedMessage>, StorageError> {
-        let c = self.load_or_init_counters(queue).await?;
+        let mut write = self.admit(queue).await?;
+        let seqs = write.claim(batch_size);
 
-        // Reserve the seq range under one lock.
-        let (start, end) = {
-            let mut s = c.state.lock().expect("queue state poisoned");
-            let cur = s.claim_seq;
-            let lim = s.push_seq_committed;
-            if cur >= lim {
-                return Ok(Vec::new());
-            }
-            let target = std::cmp::min(cur + batch_size as u64, lim);
-            let reserved = target - cur;
-            s.claim_seq = target;
-            // Bump total_claimed *together with* claim_seq so any reader
-            // sees them consistently. Adjusted below if some seqs end up
-            // empty (phantom claims).
-            s.total_claimed += reserved;
-            (cur, target)
-        };
-
-        // Read pending_keys + msg payloads (lock not held — DB reads).
-        let mut claimed_items = Vec::new();
-        for seq in start..end {
+        let mut batch = WriteBatch::new();
+        let mut claimed = Vec::with_capacity(seqs.len());
+        for seq in seqs {
             let pending_key = Self::pending_key(queue, seq);
-            if let Some(pending_bytes) = self.db.get(&pending_key).await? {
-                let pending = decode_pending(&pending_bytes)?;
-                let msg_id = pending.msg_id;
-                if let Some(msg_data) = self.db.get(&Self::msg_key(queue, &msg_id)).await? {
-                    let msg = decode_message(queue, &msg_data)?;
-                    let claim_info = ClaimInfo::new(
-                        msg_id.clone(),
-                        worker_id.to_string(),
-                        lease_id.to_string(),
-                        pending.delivery_count + 1,
-                    );
-                    claimed_items.push((pending_key, msg_id, msg, claim_info));
-                }
-            } else {
-                tracing::warn!(
-                    "claim: pending_key missing (publish-commit race, orphaned msg): \
-                     queue={}, seq={}, claim_seq=[{},{}), push_seq_seen={}",
-                    queue,
-                    seq,
-                    start,
-                    end,
-                    end
-                );
-            }
+            let Some(pending_bytes) = self.db.get(&pending_key).await? else {
+                tracing::warn!("claim: pending_key missing: queue={queue}, seq={seq}");
+                continue;
+            };
+            let pending = decode_pending(&pending_bytes)?;
+            let Some(msg_data) = self.db.get(&Self::msg_key(queue, &pending.msg_id)).await? else {
+                continue;
+            };
+            let message = decode_message(queue, &msg_data)?;
+            let claim_info = ClaimInfo::new(
+                pending.msg_id,
+                worker_id.to_string(),
+                lease_id.to_string(),
+                pending.delivery_count + 1,
+            );
+            batch.delete(&pending_key);
+            batch.put(
+                Self::claimed_key(queue, &claim_info.msg_id),
+                serde_json::to_vec(&claim_info)?,
+            );
+            claimed.push(ClaimedMessage {
+                message,
+                claim_token: claim_info.claim_token,
+                delivery_count: claim_info.delivery_count,
+            });
+        }
+        write.hand_over_claims(claimed.len());
+        if claimed.is_empty() {
+            return Ok(claimed);
         }
 
-        let actual_count = claimed_items.len() as u64;
-        let reserved = end - start;
-
-        if actual_count < reserved {
-            c.state.lock().expect("queue state poisoned").total_claimed -= reserved - actual_count;
-        }
-
-        if claimed_items.is_empty() {
-            return Ok(Vec::new());
-        }
-        let redelivered = claimed_items
-            .iter()
-            .filter(|(_, _, _, claim_info)| claim_info.delivery_count > 1)
-            .count() as u64;
+        let redelivered = claimed.iter().filter(|c| c.delivery_count > 1).count() as u64;
         if redelivered > 0 {
             crate::metrics::events().redelivered.add(
                 redelivered,
                 &[opentelemetry::KeyValue::new("queue", queue.to_string())],
             );
         }
-
-        let mut batch = WriteBatch::new();
-        let mut result = Vec::new();
-        for (pending_key, msg_id, msg, claim_info) in claimed_items {
-            batch.delete(&pending_key);
-            batch.put(
-                Self::claimed_key(queue, &msg_id),
-                &serde_json::to_vec(&claim_info)?,
-            );
-            result.push(ClaimedMessage {
-                message: msg,
-                claim_token: claim_info.claim_token.clone(),
-                delivery_count: claim_info.delivery_count,
-            });
-        }
         // The claim persists no cursor or count: both are derived from the
-        // pending and claimed keys on load. A claim need not be durable before the worker sees it. If the
-        // broker crashes first, recovery reloads the older durable cursor and
-        // `pending` entry and redelivers the message, which at-least-once
-        // already allows. The WAL is one ordered log, so the durable ack that
-        // follows a claim makes the claim durable with it. Skipping the wait
-        // halves a worker's per-key broker latency.
-        #[allow(clippy::disallowed_methods)]
-        let _not_awaited_for_durability = self.db.write(batch).await?;
-
-        Ok(result)
+        // pending and claimed keys on load. A claim need not be durable
+        // before the worker sees it. If the broker crashes first, recovery
+        // reloads the older durable `pending` entry and redelivers the
+        // message, which at-least-once already allows. The WAL is one
+        // ordered log, so the durable ack that follows a claim makes the
+        // claim durable with it. Skipping the wait halves a worker's per-key
+        // broker latency.
+        //
+        // Stamped before the write so a claim applied after its caller was
+        // cut off still has one; a stamp left by a failed write is pruned
+        // by recovery with the tokens that hold no claim.
+        let now = mono_now();
+        for claimed in &claimed {
+            self.taken_at.insert(claimed.claim_token.clone(), now);
+        }
+        self.commit(
+            batch,
+            Wait::Applied,
+            Landing {
+                writes: vec![write],
+                ..Landing::default()
+            },
+        )
+        .await?;
+        Ok(claimed)
     }
 
     // === Ack Operations (NO TRANSACTION) ===
@@ -1205,12 +1577,16 @@ impl AnvilStorage {
         msg_ids: &[String],
         opts: AckOptions<'_>,
     ) -> Result<(), StorageError> {
-        if msg_ids.is_empty() && opts.downstream_messages.is_none_or(|m| m.is_empty()) {
+        let downstream = match (opts.downstream_queue, opts.downstream_messages) {
+            (Some(queue), Some(messages)) if !messages.is_empty() => Some((queue, messages)),
+            _ => None,
+        };
+        if msg_ids.is_empty() && downstream.is_none() {
             return Ok(());
         }
 
         let claim_tokens = if msg_ids.is_empty() {
-            None
+            &[][..]
         } else {
             let tokens = opts.claim_tokens.ok_or_else(|| {
                 Rejection::InvalidArgument("claim_tokens is required for ack".to_string())
@@ -1222,129 +1598,47 @@ impl AnvilStorage {
                     tokens.len()
                 ))));
             }
-            Some(tokens)
+            tokens
         };
 
-        let expected_lease_id = opts.lease_id.filter(|v| !v.is_empty());
-        let expected_worker_id = opts.worker_id.filter(|v| !v.is_empty());
-
-        let now_ns = now_nanos();
-        let ack_count = msg_ids.len() as u64;
-
-        // 0. Check downstream capacity BEFORE any mutations (atomic counters
-        //    are fetch_add — if we increment first and then fail on QueueFull,
-        //    the counters are permanently corrupted).
-        if let (Some(downstream_queue), Some(messages)) =
-            (opts.downstream_queue, opts.downstream_messages)
-        {
-            if !messages.is_empty() {
-                self.check_queue_capacity(downstream_queue, messages.len())
-                    .await?;
-            }
+        // Checked before anything is admitted or reserved, so a full queue
+        // changes nothing.
+        if let Some((downstream_queue, messages)) = downstream {
+            self.check_queue_capacity(downstream_queue, messages.len())
+                .await?;
         }
 
-        // For the downstream-push branch we need a reservation on the
-        // downstream queue's seq range (same invariant as push_messages
-        // and nack_messages_internal). The guard drops at end-of-scope so
-        // the watermark advances even if any later step (validate_claims,
-        // serde_json::to_vec, db.write) returns Err via `?`. This is the
-        // bug that orphaned a transform_output batch in PR #84's CI run:
-        // ack_and_forward had reserved the downstream range, validate_claims
-        // returned a stale-token error, and the previous code never
-        // closed the reservation — wedging the watermark behind it and
-        // hiding every subsequent committed pending_key.
-        let _downstream_push_guard: Option<PushReservationGuard> =
-            match (opts.downstream_queue, opts.downstream_messages) {
-                (Some(dq), Some(msgs)) if !msgs.is_empty() => {
-                    let dc = self.load_or_init_counters(dq).await?;
-                    Some(Self::reserve_push_range(&dc, msgs.len() as u64))
-                }
-                _ => None,
-            };
+        // The downstream range is reserved only once the claims are verified:
+        // a refused forward must leave no reservation, which would count as
+        // pending downstream until a claim walked past its empty seqs.
+        let downstream_queues: Vec<&str> = downstream.iter().map(|(queue, _)| *queue).collect();
+        let (settlement, mut downstream_writes) = self
+            .admit_settlement(
+                queue,
+                msg_ids,
+                claim_tokens,
+                opts.lease_id.filter(|v| !v.is_empty()),
+                opts.worker_id.filter(|v| !v.is_empty()),
+                &downstream_queues,
+            )
+            .await?;
 
         let mut batch = WriteBatch::new();
-
-        // 1. Validate claims + move messages from claimed to acked
-        let mut _settlement_hold = None;
-        if !msg_ids.is_empty() {
-            let (hold, _claims) = self
-                .validate_claims(
-                    queue,
-                    msg_ids,
-                    claim_tokens.unwrap(),
-                    expected_lease_id,
-                    expected_worker_id,
-                )
-                .await?;
-            _settlement_hold = Some(hold);
-
-            let c = self.load_or_init_counters(queue).await?;
-            {
-                let mut s = c.state.lock().expect("queue state poisoned");
-                s.total_unclaimed += ack_count;
-                s.total_acked += ack_count;
-            }
-            batch.merge(Self::cnt_total_acked_key(queue), ack_count.to_le_bytes());
-
-            // The body is dead once acked: no reader of acked entries needs
-            // the payload, and keeping it until GC multiplies the live data
-            // every point read has to search.
-            for msg_id in msg_ids {
-                batch.delete(Self::claimed_key(queue, msg_id));
-                batch.delete(Self::msg_key(queue, msg_id));
-                batch.put(Self::acked_key(queue, now_ns, msg_id), []);
-            }
+        let mut landing = Landing::default();
+        if let Some(settlement) = settlement {
+            Self::ack_claims(&mut batch, &mut landing, queue, msg_ids, settlement);
         }
-
-        // 2. Push downstream messages (capacity checked in step 0,
-        //    seq range reserved via _downstream_push_guard above).
-        if let (Some(downstream_queue), Some(messages)) =
-            (opts.downstream_queue, opts.downstream_messages)
-        {
-            if !messages.is_empty() {
-                let guard = _downstream_push_guard
-                    .as_ref()
-                    .expect("downstream guard set when we have messages");
-                let dc = &guard.counters;
-                let base_seq = guard.base_seq;
-                let count = messages.len() as u64;
-                dc.state.lock().expect("queue state poisoned").total_pushed += count;
-                batch.merge(
-                    Self::cnt_total_pushed_key(downstream_queue),
-                    count.to_le_bytes(),
-                );
-
-                for (i, msg) in messages.iter().enumerate() {
-                    batch.put(
-                        Self::msg_key(downstream_queue, &msg.msg_id),
-                        encode_message(msg),
-                    );
-                    batch.put(
-                        Self::pending_key(downstream_queue, base_seq + i as u64),
-                        encode_pending(&msg.msg_id, 0),
-                    );
-                }
-            }
+        if let Some((downstream_queue, messages)) = downstream {
+            assert_eq!(downstream_writes.len(), 1);
+            let mut write = downstream_writes.pop().expect("the downstream write");
+            let base_seq = write.reserve(messages.len() as u64, Tail::Pushed);
+            Self::put_new_messages(&mut batch, downstream_queue, base_seq, messages);
+            landing.writes.push(write);
         }
-
-        // 3. Update state if provided
         if let Some(namespace) = opts.state_namespace {
-            if let Some(puts) = opts.state_puts {
-                for (key, value) in puts {
-                    batch.put(Self::state_key(namespace, key), value);
-                }
-            }
-            if let Some(deletes) = opts.state_deletes {
-                for key in deletes {
-                    batch.delete(Self::state_key(namespace, key));
-                }
-            }
+            Self::put_state(&mut batch, namespace, opts.state_puts, opts.state_deletes);
         }
-
-        // Guard drops at end-of-scope (on success or `?`-propagated error
-        // from db.write), advancing the downstream watermark.
-        self.write_durable(batch).await?;
-        Ok(())
+        self.commit(batch, Wait::Durable, landing).await
     }
 
     /// Acknowledge messages (move to acked)
@@ -1509,20 +1803,24 @@ impl AnvilStorage {
     /// Returns claims to pending after their worker died or stopped renewing
     /// them. It races the claimants' own acks, nacks and renewals, so each
     /// claim is settled only if it is not being settled already, still
-    /// carries the token the caller read at `read_at` (from `now_secs`), and
+    /// carries the token the caller read at `read_at` (from `mono_now`), and
     /// was not renewed since; the rest are skipped. Returns the claims
     /// requeued.
     pub async fn reclaim_messages(
         &self,
         queue: &str,
         claims: &[ClaimInfo],
-        read_at: f64,
+        read_at: Instant,
     ) -> Result<Vec<ClaimInfo>, StorageError> {
-        let mut hold = SettlementHold::new(&self.settling);
+        // Claims of a queue that no longer exists are no one's to requeue.
+        let Some(write) = self.admit_existing(queue).await? else {
+            return Ok(Vec::new());
+        };
+        let mut hold = SettlementHold::new(self.settling.clone());
         let mut reclaimed = Vec::with_capacity(claims.len());
         for claim in claims {
             let claim_key = Self::claimed_key(queue, &claim.msg_id);
-            if !hold.take(claim_key.clone()) {
+            if !hold.take(claim_key.clone(), &claim.claim_token) {
                 continue;
             }
             let Some(data) = self.db.get(&claim_key).await? else {
@@ -1545,8 +1843,12 @@ impl AnvilStorage {
             return Ok(reclaimed);
         }
         let msg_ids: Vec<String> = reclaimed.iter().map(|c| c.msg_id.clone()).collect();
-        let delivery_counts: Vec<u32> = reclaimed.iter().map(|c| c.delivery_count).collect();
-        self.requeue_claims(queue, &msg_ids, &delivery_counts, None, None, None)
+        let settlement = Settlement {
+            write,
+            hold,
+            claims: reclaimed.clone(),
+        };
+        self.requeue_claims(queue, &msg_ids, settlement, None, None, None)
             .await?;
         Ok(reclaimed)
     }
@@ -1574,7 +1876,7 @@ impl AnvilStorage {
             ))));
         }
 
-        let (_settlement_hold, claims) = self
+        let settlement = self
             .validate_claims(
                 queue,
                 msg_ids,
@@ -1583,12 +1885,10 @@ impl AnvilStorage {
                 Some(worker_id).filter(|v| !v.is_empty()),
             )
             .await?;
-        // The requeued entries keep the delivery count their claims carried.
-        let delivery_counts: Vec<u32> = claims.iter().map(|c| c.delivery_count).collect();
         self.requeue_claims(
             queue,
             msg_ids,
-            &delivery_counts,
+            settlement,
             state_namespace,
             state_puts,
             state_deletes,
@@ -1596,65 +1896,48 @@ impl AnvilStorage {
         .await
     }
 
-    /// Moves held claims back to the tail of pending, with any state updates
+    /// Moves the claims `settlement` holds back to the tail of pending, each
+    /// keeping the delivery count its claim carried, with any state updates
     /// in the same batch.
     async fn requeue_claims(
         &self,
         queue: &str,
         msg_ids: &[String],
-        delivery_counts: &[u32],
+        settlement: Settlement,
         state_namespace: Option<&str>,
         state_puts: Option<&HashMap<String, Vec<u8>>>,
         state_deletes: Option<&[String]>,
     ) -> Result<(), StorageError> {
+        let Settlement {
+            mut write,
+            hold,
+            claims,
+        } = settlement;
         assert!(!msg_ids.is_empty());
-        assert_eq!(delivery_counts.len(), msg_ids.len());
+        assert_eq!(claims.len(), msg_ids.len());
 
-        let c = self.load_or_init_counters(queue).await?;
-        let nack_count = msg_ids.len() as u64;
-
-        // Reserve seq range at the tail and register the pending commit.
-        // Watermark stays put until this guard drops at end-of-scope.
-        let _push_guard = Self::reserve_push_range(&c, nack_count);
-        let base_seq = _push_guard.base_seq;
-        c.state
-            .lock()
-            .expect("queue state poisoned")
-            .total_unclaimed += nack_count;
-
+        let base_seq = write.reserve(msg_ids.len() as u64, Tail::Requeued);
         let mut batch = WriteBatch::new();
-        for (i, (msg_id, delivery_count)) in msg_ids.iter().zip(delivery_counts).enumerate() {
+        for (i, (msg_id, claim)) in msg_ids.iter().zip(&claims).enumerate() {
             batch.delete(Self::claimed_key(queue, msg_id));
             batch.put(
                 Self::pending_key(queue, base_seq + i as u64),
-                encode_pending(msg_id, *delivery_count),
+                encode_pending(msg_id, claim.delivery_count),
             );
         }
-
-        // State updates
-        let has_state_updates = state_namespace.is_some()
-            && (state_puts.is_some_and(|puts| !puts.is_empty())
-                || state_deletes.is_some_and(|deletes| !deletes.is_empty()));
-        if has_state_updates {
-            let namespace = state_namespace.unwrap();
-            if let Some(puts) = state_puts {
-                for (key, value) in puts {
-                    batch.put(Self::state_key(namespace, key), value);
-                }
-            }
-            if let Some(deletes) = state_deletes {
-                for key in deletes {
-                    batch.delete(Self::state_key(namespace, key));
-                }
-            }
+        if let Some(namespace) = state_namespace {
+            Self::put_state(&mut batch, namespace, state_puts, state_deletes);
         }
-
-        // Guard drops at end-of-scope; on `?` propagation from db.write
-        // the reservation is still closed out (just with no pending_key
-        // committed for the missing batch — which is the correct
-        // localization of a failed nack).
-        self.write_durable(batch).await?;
-        Ok(())
+        self.commit(
+            batch,
+            Wait::Durable,
+            Landing {
+                writes: vec![write],
+                settlement: Some(hold),
+                ..Landing::default()
+            },
+        )
+        .await
     }
 
     // === Scan Operations ===
@@ -1725,11 +2008,23 @@ impl AnvilStorage {
     /// Deletes a queue and every message in it. Deleting a queue that does
     /// not exist deletes nothing and is not an error, so a retried delete
     /// succeeds.
+    ///
+    /// Fenced against every operation on the queue: writes admitted before
+    /// it finish first, and later ones wait for `counters_loading`, which it
+    /// holds until its batch has landed, and then see the queue as it left
+    /// it. Without the fence, a claim or push holding the old counters
+    /// writes keys after the delete, beside the fresh zero counters of the
+    /// queue's next use.
     pub async fn delete_queue(&self, queue: &str) -> Result<usize, StorageError> {
-        let Some(counters) = self.load_counters(queue).await? else {
+        let loading = self.counters_loading.clone().lock_owned().await;
+        let Some(counters) = self.load_counters_locked(queue, &loading).await? else {
             return Ok(0);
         };
-        let meta = Self::meta_of(&counters);
+        // Removed before closing, so a write turned away loads anew, with
+        // its bound, under `counters_loading`.
+        self.counters.remove(queue);
+        self.max_pending_limits.remove(queue);
+        counters.close().await;
         let claimed = self.scan_claimed(Some(queue)).await?;
         let acked = self.scan_acked(Some(queue)).await?;
 
@@ -1743,16 +2038,20 @@ impl AnvilStorage {
         batch.delete(Self::cnt_total_claimed_key(queue));
         batch.delete(Self::cnt_total_unclaimed_key(queue));
         batch.delete(Self::cnt_total_acked_key(queue));
+        batch.delete(Self::max_pending_key(queue));
         // Also delete old meta key (migration cleanup)
         batch.delete(Self::meta_key(queue));
 
-        // Delete pending entries and messages
-        for seq in meta.claim_seq..meta.push_seq {
-            let pending_key = Self::pending_key(queue, seq);
-            if let Some(pending_bytes) = self.db.get(&pending_key).await? {
-                let msg_id = decode_pending(&pending_bytes)?.msg_id;
-                batch.delete(&pending_key);
-                batch.delete(Self::msg_key(queue, &msg_id));
+        // Every pending key, including those a returned claim left behind
+        // the claim cursor.
+        let mut pending = self
+            .db
+            .scan_prefix(format!("pending:{queue}:").as_bytes(), ..)
+            .await?;
+        while let Some(kv) = pending.next().await? {
+            if Self::pending_seq(queue, &kv.key).is_some() {
+                batch.delete(&kv.key);
+                batch.delete(Self::msg_key(queue, &decode_pending(&kv.value)?.msg_id));
                 deleted += 1;
             }
         }
@@ -1772,12 +2071,15 @@ impl AnvilStorage {
         }
 
         // Always written: an empty queue still has its counter keys.
-        self.write_durable(batch).await?;
-
-        // Remove from in-memory caches
-        self.counters.remove(queue);
-        self.max_pending_limits.remove(queue);
-
+        self.commit(
+            batch,
+            Wait::Durable,
+            Landing {
+                loading: Some(loading),
+                ..Landing::default()
+            },
+        )
+        .await?;
         Ok(deleted)
     }
 
@@ -1812,12 +2114,18 @@ impl AnvilStorage {
                 batch_keys += 1;
                 deleted += 1;
                 if batch_keys == GC_BATCH_KEYS_MAX {
-                    self.write_durable(std::mem::take(&mut batch)).await?;
+                    self.commit(
+                        std::mem::take(&mut batch),
+                        Wait::Durable,
+                        Landing::default(),
+                    )
+                    .await?;
                     batch_keys = 0;
                 }
             }
             if batch_keys > 0 {
-                self.write_durable(batch).await?;
+                self.commit(batch, Wait::Durable, Landing::default())
+                    .await?;
             }
         }
         if deleted > 0 {
@@ -1831,8 +2139,9 @@ impl AnvilStorage {
     ///
     /// - `lease_timeout_secs`: how long a lease's heartbeat can lag before
     ///   the worker is considered dead. A lease is "alive" when its
-    ///   `last_seen` is within this many seconds of `now`. Tunes
-    ///   *worker-death detection*.
+    ///   `last_seen` is within this many seconds of `now`, on the
+    ///   monotonic clock. Tunes *worker-death detection*. A lease absent
+    ///   from `active_leases` is dead.
     /// - `claim_age_timeout_secs`: how long a single claim can be held
     ///   before being treated as stuck, even if the worker's lease still
     ///   appears alive. Tunes *task-duration SLA* and covers the lag
@@ -1848,14 +2157,16 @@ impl AnvilStorage {
         &self,
         lease_timeout_secs: f64,
         claim_age_timeout_secs: f64,
-        active_leases: Option<&HashMap<String, f64>>,
+        active_leases: Option<&HashMap<String, Instant>>,
     ) -> Result<usize, StorageError> {
-        let now = crate::types::now_secs();
+        let now = mono_now();
         let all_claimed = self.scan_claimed(None).await?;
         let live_tokens: std::collections::HashSet<&str> = all_claimed
             .iter()
             .map(|(_, _, claim_info)| claim_info.claim_token.as_str())
             .collect();
+        self.taken_at
+            .retain(|token, _| live_tokens.contains(token.as_str()));
         self.renewed_at
             .retain(|token, _| live_tokens.contains(token.as_str()));
 
@@ -1864,7 +2175,7 @@ impl AnvilStorage {
         for (queue, msg_id, claim_info) in all_claimed {
             let lease_alive = if let Some(leases) = active_leases {
                 if let Some(last_seen) = leases.get(&claim_info.lease_id) {
-                    now - *last_seen <= lease_timeout_secs
+                    !lease_expired(*last_seen, now, lease_timeout_secs)
                 } else {
                     // Lease not in active set — worker is dead
                     false
@@ -1879,13 +2190,21 @@ impl AnvilStorage {
                 // both a genuinely stuck worker (alive but not making
                 // progress) AND the lag window between a Ray-level worker
                 // death and the broker noticing the lease drop.
+                //
+                // A claim with no `taken_at` was taken by an earlier broker
+                // process, or its stamp was pruned in a race with this scan;
+                // its age is timed from now rather than from the wall-clock
+                // `claimed_at`.
+                let taken_at = *self
+                    .taken_at
+                    .entry(claim_info.claim_token.clone())
+                    .or_insert(now);
                 let held_since = self
                     .renewed_at
                     .get(&claim_info.claim_token)
-                    .map_or(claim_info.claimed_at, |renewed_at| {
-                        renewed_at.max(claim_info.claimed_at)
-                    });
-                if now - held_since > claim_age_timeout_secs {
+                    .map_or(taken_at, |renewed_at| taken_at.max(*renewed_at));
+                if now.saturating_duration_since(held_since).as_secs_f64() > claim_age_timeout_secs
+                {
                     let mut info = claim_info.clone();
                     info.msg_id = msg_id;
                     expired_by_queue.entry(queue).or_default().push(info);
@@ -1911,6 +2230,7 @@ impl AnvilStorage {
         }
 
         let mut total = 0;
+        let wall_now = crate::types::now_secs();
         for (queue, expired) in expired_by_queue {
             let claims = self.reclaim_messages(&queue, &expired, now).await?;
             if claims.is_empty() {
@@ -1928,7 +2248,7 @@ impl AnvilStorage {
                 let event = serde_json::json!({
                     "event_type": "timeout",
                     "timestamp_ns": ts_ns,
-                    "timestamp": now,
+                    "timestamp": wall_now,
                     "queue": queue,
                     "msg_id": claim.msg_id,
                     "worker_id": claim.worker_id,
@@ -1965,6 +2285,7 @@ impl AnvilStorage {
         namespace: &str,
         keys: &[String],
     ) -> Result<HashMap<String, Vec<u8>>, StorageError> {
+        check_state_namespace(namespace)?;
         let mut results = HashMap::new();
         for key in keys {
             if let Some(data) = self.db.get(&Self::state_key(namespace, key)).await? {
@@ -1980,6 +2301,7 @@ impl AnvilStorage {
         puts: &HashMap<String, Vec<u8>>,
         deletes: &[String],
     ) -> Result<(usize, usize), StorageError> {
+        check_state_namespace(namespace)?;
         let mut batch = WriteBatch::new();
 
         for (key, value) in puts {
@@ -1989,7 +2311,8 @@ impl AnvilStorage {
             batch.delete(Self::state_key(namespace, key));
         }
 
-        self.write_durable(batch).await?;
+        self.commit(batch, Wait::Durable, Landing::default())
+            .await?;
         Ok((puts.len(), deletes.len()))
     }
 
@@ -1999,6 +2322,7 @@ impl AnvilStorage {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+        check_state_namespace(namespace)?;
         let key_prefix = format!("state:{}:{}", namespace, prefix).into_bytes();
         let mut iter = self.db.scan_prefix(&key_prefix, ..).await?;
         let mut results = Vec::new();
@@ -2049,7 +2373,8 @@ impl AnvilStorage {
     pub async fn mark_queue_finished(&self, queue: &str) -> Result<(), StorageError> {
         let mut batch = WriteBatch::new();
         batch.put(Self::finished_key(queue), b"1");
-        self.write_durable(batch).await?;
+        self.commit(batch, Wait::Durable, Landing::default())
+            .await?;
         self.db.flush().await?;
         tracing::info!("Queue {} marked as finished", queue);
         Ok(())
@@ -2088,7 +2413,8 @@ impl AnvilStorage {
     pub async fn clear_queue_finished(&self, queue: &str) -> Result<(), StorageError> {
         let mut batch = WriteBatch::new();
         batch.delete(Self::finished_key(queue));
-        self.write_durable(batch).await?;
+        self.commit(batch, Wait::Durable, Landing::default())
+            .await?;
         Ok(())
     }
 
@@ -2107,56 +2433,64 @@ impl AnvilStorage {
         }
     }
 
-    /// Create a queue group with N partition queues atomically.
-    /// Idempotent: returns existing group if it already exists.
-    /// `max_pending_per_partition`: 0 = unlimited (default), >0 = bounded partitions.
+    /// Create a queue group with N partition queues atomically, and report
+    /// whether this call created it. Idempotent: returns the existing group
+    /// if it already exists, with `false`.
+    /// `max_pending_per_partition`: 0 = unlimited (default), >0 = bounded
+    /// partitions, replacing their bounds if the group exists.
     pub async fn create_queue_group(
         &self,
         group_name: &str,
         num_partitions: u32,
         max_pending_per_partition: u64,
-    ) -> Result<QueueGroupMeta, StorageError> {
-        // Held from the check to the write: see `counters_loading`.
-        let _loading = self.counters_loading.lock().await;
-        // Check for existing group
-        if let Some(existing) = self.get_group_meta(group_name).await? {
-            // Always set in-memory limits (survives idempotent create on persistent DB).
-            if max_pending_per_partition > 0 {
-                for queue_name in &existing.partition_queues {
-                    self.max_pending_limits
-                        .insert(queue_name.clone(), max_pending_per_partition);
-                }
-            }
-            return Ok(existing);
-        }
-
-        let meta = QueueGroupMeta::new(group_name.to_string(), num_partitions);
-
-        // Create group_meta + all partition queue counter keys in one WriteBatch
+    ) -> Result<(QueueGroupMeta, bool), StorageError> {
+        // Held from the check until the write is applied: see
+        // `counters_loading`. Of concurrent creates of one group, the first
+        // to take it creates the group and the others find it.
+        let loading = self.counters_loading.clone().lock_owned().await;
         let mut batch = WriteBatch::new();
-        batch.put(
-            Self::group_meta_key(group_name),
-            &serde_json::to_vec(&meta)?,
-        );
-        for queue_name in &meta.partition_queues {
-            Self::write_zero_counters(&mut batch, queue_name);
-        }
-        self.write_durable(batch).await?;
-
-        // Store max_pending limits for each partition queue
-        if max_pending_per_partition > 0 {
-            for queue_name in &meta.partition_queues {
-                self.max_pending_limits
-                    .insert(queue_name.clone(), max_pending_per_partition);
+        let existing = self.get_group_meta(group_name).await?;
+        let created = existing.is_none();
+        let meta = match existing {
+            Some(existing) => existing,
+            None => {
+                let meta = QueueGroupMeta::new(group_name.to_string(), num_partitions);
+                batch.put(
+                    Self::group_meta_key(group_name),
+                    &serde_json::to_vec(&meta)?,
+                );
+                for queue_name in &meta.partition_queues {
+                    Self::write_zero_counters(&mut batch, queue_name);
+                }
+                meta
             }
+        };
+        for queue_name in &meta.partition_queues {
+            Self::write_max_pending(&mut batch, queue_name, max_pending_per_partition);
+        }
+        for queue_name in &meta.partition_queues {
+            self.set_max_pending(queue_name, max_pending_per_partition);
+        }
+        if created || max_pending_per_partition > 0 {
+            self.commit(
+                batch,
+                Wait::Durable,
+                Landing {
+                    loading: Some(loading),
+                    ..Landing::default()
+                },
+            )
+            .await?;
         }
 
-        tracing::info!(
-            "Created queue group '{}' with {} partitions",
-            group_name,
-            num_partitions
-        );
-        Ok(meta)
+        if created {
+            tracing::info!(
+                "Created queue group '{}' with {} partitions",
+                group_name,
+                num_partitions
+            );
+        }
+        Ok((meta, created))
     }
 
     /// Atomic ack upstream + push to multiple downstream partition queues.
@@ -2191,120 +2525,64 @@ impl AnvilStorage {
             }
         }
 
-        let expected_lease_id = if lease_id.is_empty() {
-            None
-        } else {
-            Some(lease_id)
-        };
-        let expected_worker_id = if worker_id.is_empty() {
-            None
-        } else {
-            Some(worker_id)
-        };
-
         // 0. Check capacity for all downstream partition queues before any mutations
-        for (pid, messages) in partition_payloads {
-            if messages.is_empty() {
-                continue;
-            }
-            let partition_queue = &group.partition_queues[*pid as usize];
+        let payloads: Vec<(&str, &[Message])> = partition_payloads
+            .iter()
+            .filter(|(_, messages)| !messages.is_empty())
+            .map(|(pid, messages)| {
+                (
+                    group.partition_queues[*pid as usize].as_str(),
+                    messages.as_slice(),
+                )
+            })
+            .collect();
+        for (partition_queue, messages) in &payloads {
             self.check_queue_capacity(partition_queue, messages.len())
                 .await?;
         }
+        if !upstream_msg_ids.is_empty() && upstream_claim_tokens.len() != upstream_msg_ids.len() {
+            return Err(Box::new(Rejection::InvalidArgument(
+                "claim_tokens length must match msg_ids".to_string(),
+            )));
+        }
 
-        let now_ns = now_nanos();
-        let ack_count = upstream_msg_ids.len() as u64;
-        let mut all_new_msg_ids = Vec::new();
+        // As in a forward, the partition ranges are reserved only once the
+        // claims are verified.
+        let partition_queues: Vec<&str> = payloads.iter().map(|(queue, _)| *queue).collect();
+        let (settlement, partition_writes) = self
+            .admit_settlement(
+                upstream_queue,
+                upstream_msg_ids,
+                upstream_claim_tokens,
+                Some(lease_id).filter(|v| !v.is_empty()),
+                Some(worker_id).filter(|v| !v.is_empty()),
+                &partition_queues,
+            )
+            .await?;
+
         let mut batch = WriteBatch::new();
-        let mut _settlement_hold = None;
-
-        // 1. Validate claims and ack upstream
-        if !upstream_msg_ids.is_empty() {
-            if upstream_claim_tokens.len() != upstream_msg_ids.len() {
-                return Err(Box::new(Rejection::InvalidArgument(
-                    "claim_tokens length must match msg_ids".to_string(),
-                )));
-            }
-
-            let (hold, _claims) = self
-                .validate_claims(
-                    upstream_queue,
-                    upstream_msg_ids,
-                    upstream_claim_tokens,
-                    expected_lease_id,
-                    expected_worker_id,
-                )
-                .await?;
-            _settlement_hold = Some(hold);
-
-            let uc = self.load_or_init_counters(upstream_queue).await?;
-            {
-                let mut s = uc.state.lock().expect("queue state poisoned");
-                s.total_unclaimed += ack_count;
-                s.total_acked += ack_count;
-            }
-            batch.merge(
-                Self::cnt_total_acked_key(upstream_queue),
-                ack_count.to_le_bytes(),
+        let mut landing = Landing::default();
+        if let Some(settlement) = settlement {
+            Self::ack_claims(
+                &mut batch,
+                &mut landing,
+                upstream_queue,
+                upstream_msg_ids,
+                settlement,
             );
-
-            for msg_id in upstream_msg_ids {
-                batch.delete(Self::claimed_key(upstream_queue, msg_id));
-                batch.delete(Self::msg_key(upstream_queue, msg_id));
-                batch.put(Self::acked_key(upstream_queue, now_ns, msg_id), []);
-            }
         }
-
-        // 2. Push to each partition queue. Each push goes through the
-        //    reservation-guard pattern so the watermark advance happens
-        //    post-commit, in lockstep with the other writers.
-        let mut push_guards: Vec<PushReservationGuard> = Vec::new();
-        for (pid, messages) in partition_payloads {
-            if messages.is_empty() {
-                continue;
-            }
-            let partition_queue = &group.partition_queues[*pid as usize];
-            let dc = self.load_or_init_counters(partition_queue).await?;
-            let msg_count = messages.len() as u64;
-
-            let guard = Self::reserve_push_range(&dc, msg_count);
-            let base_seq = guard.base_seq;
-            dc.state.lock().expect("queue state poisoned").total_pushed += msg_count;
-            push_guards.push(guard);
-            batch.merge(
-                Self::cnt_total_pushed_key(partition_queue),
-                msg_count.to_le_bytes(),
-            );
-
-            for (i, msg) in messages.iter().enumerate() {
-                let seq = base_seq + i as u64;
-                batch.put(
-                    Self::msg_key(partition_queue, &msg.msg_id),
-                    encode_message(msg),
-                );
-                batch.put(
-                    Self::pending_key(partition_queue, seq),
-                    encode_pending(&msg.msg_id, 0),
-                );
-                all_new_msg_ids.push(msg.msg_id.clone());
-            }
+        let mut all_new_msg_ids = Vec::new();
+        assert_eq!(partition_writes.len(), payloads.len());
+        for ((partition_queue, messages), mut write) in payloads.into_iter().zip(partition_writes) {
+            let base_seq = write.reserve(messages.len() as u64, Tail::Pushed);
+            Self::put_new_messages(&mut batch, partition_queue, base_seq, messages);
+            all_new_msg_ids.extend(messages.iter().map(|msg| msg.msg_id.clone()));
+            landing.writes.push(write);
         }
-
-        // 3. State updates
         if let Some(namespace) = state_namespace {
-            if let Some(puts) = state_puts {
-                for (key, value) in puts {
-                    batch.put(Self::state_key(namespace, key), value);
-                }
-            }
-            if let Some(deletes) = state_deletes {
-                for key in deletes {
-                    batch.delete(Self::state_key(namespace, key));
-                }
-            }
+            Self::put_state(&mut batch, namespace, state_puts, state_deletes);
         }
-
-        self.write_durable(batch).await?;
+        self.commit(batch, Wait::Durable, landing).await?;
         Ok(all_new_msg_ids)
     }
 
@@ -2449,7 +2727,8 @@ impl AnvilStorage {
         for queue_name in &group.partition_queues {
             batch.put(Self::finished_key(queue_name), b"1");
         }
-        self.write_durable(batch).await?;
+        self.commit(batch, Wait::Durable, Landing::default())
+            .await?;
 
         // Clean up in-memory round-robin counters for this group
         let prefix = format!("{}_", group_name);
@@ -3145,7 +3424,7 @@ pub(crate) mod tests {
             .collect();
         storage.push_messages(queue, &messages).await.unwrap();
         let claimed = storage.claim_messages(queue, 3, "w", "l").await.unwrap();
-        let read_at = crate::types::now_secs();
+        let read_at = crate::types::mono_now();
         let read_by_recovery: Vec<ClaimInfo> = storage
             .scan_claimed(Some(queue))
             .await
@@ -3232,7 +3511,7 @@ pub(crate) mod tests {
             .unwrap();
         let claimed = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
         let (msg_ids, tokens) = split_claims(&claimed);
-        let read_at = crate::types::now_secs();
+        let read_at = crate::types::mono_now();
         let read_by_recovery: Vec<ClaimInfo> = storage
             .scan_claimed(Some(queue))
             .await
@@ -3242,8 +3521,8 @@ pub(crate) mod tests {
             .collect();
 
         {
-            let mut held = SettlementHold::new(&storage.settling);
-            assert!(held.take(AnvilStorage::claimed_key(queue, &msg_ids[0])));
+            let mut held = SettlementHold::new(storage.settling.clone());
+            assert!(held.take(AnvilStorage::claimed_key(queue, &msg_ids[0]), &tokens[0]));
             let err = storage
                 .ack_messages(queue, &msg_ids, &tokens, "w", "l")
                 .await
@@ -3272,7 +3551,9 @@ pub(crate) mod tests {
             "a failed check released its hold"
         );
 
-        // The same message twice in one batch would settle it twice.
+        // The same message twice in one batch would settle it twice. The
+        // service refuses such a batch as INVALID_ARGUMENT before it gets
+        // here; the hold still settles the message once for any caller.
         let twice = vec![msg_ids[0].clone(), msg_ids[0].clone()];
         let err = storage
             .ack_messages(
@@ -3320,7 +3601,10 @@ pub(crate) mod tests {
         let mut batch = WriteBatch::new();
         batch.put(AnvilStorage::seq_push_key(queue), lagging);
         batch.put(AnvilStorage::seq_claim_key(queue), 9u64.to_le_bytes());
-        storage.write_durable(batch).await.unwrap();
+        storage
+            .commit(batch, Wait::Durable, Landing::default())
+            .await
+            .unwrap();
         storage.close().await.unwrap();
 
         let storage = AnvilStorage::new(&db_path).await.unwrap();
@@ -3404,7 +3688,7 @@ pub(crate) mod tests {
         advance_sim_time_secs(1.0);
 
         let mut active = HashMap::new();
-        active.insert("lease-1".to_string(), crate::types::now_secs());
+        active.insert("lease-1".to_string(), crate::types::mono_now());
 
         // Both timeouts comfortably above the 1 s elapsed: lease just
         // heartbeated AND claim is fresh, so recovery should leave it alone.
@@ -3455,7 +3739,7 @@ pub(crate) mod tests {
             )
         };
         let recover = || {
-            let live = HashMap::from([("l".to_string(), crate::types::now_secs())]);
+            let live = HashMap::from([("l".to_string(), crate::types::mono_now())]);
             async move {
                 storage
                     .recover_expired_claims(
@@ -3548,7 +3832,7 @@ pub(crate) mod tests {
             .unwrap();
         let claimed = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
         let (msg_ids, tokens) = split_claims(&claimed);
-        let read_at = crate::types::now_secs();
+        let read_at = crate::types::mono_now();
         let read_by_recovery: Vec<ClaimInfo> = storage
             .scan_claimed(Some(queue))
             .await
@@ -3572,7 +3856,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(storage.renewed_at.len(), 1);
-        let live = HashMap::from([("l".to_string(), crate::types::now_secs())]);
+        let live = HashMap::from([("l".to_string(), crate::types::mono_now())]);
         storage
             .recover_expired_claims(
                 LEASE_TIMEOUT_SECS_PRODUCTION,
@@ -3712,7 +3996,10 @@ pub(crate) mod tests {
             for i in first..first + GC_BATCH_KEYS_MAX {
                 batch.put(entry_key(i), b"");
             }
-            storage.write_durable(batch).await.unwrap();
+            storage
+                .commit(batch, Wait::Durable, Landing::default())
+                .await
+                .unwrap();
         }
 
         let config = AnvilConfig {
@@ -4447,11 +4734,12 @@ pub(crate) mod tests {
             let storage = storage.clone();
             let stop = stop.clone();
             tokio::spawn(async move {
-                let mut active = HashMap::<String, f64>::new();
+                let mut active = HashMap::<String, std::time::Instant>::new();
                 for w in 0..LIVE_CLAIMERS {
                     active.insert(
                         format!("claimer-{w}-lease"),
-                        crate::types::now_secs() + LEASE_FAR_FUTURE_SECS,
+                        crate::types::mono_now()
+                            + std::time::Duration::from_secs_f64(LEASE_FAR_FUTURE_SECS),
                     );
                 }
                 while !stop.load(std::sync::atomic::Ordering::Acquire) {

@@ -43,7 +43,11 @@ pub(crate) mod tests {
 
     pub(crate) async fn service() -> (Arc<AnvilService>, Arc<AnvilStorage>) {
         let storage = Arc::new(AnvilStorage::new("memory://").await.unwrap());
-        let service = AnvilService::new(Arc::new(AnvilState::new()), storage.clone());
+        let service = AnvilService::new(
+            Arc::new(AnvilState::new()),
+            storage.clone(),
+            AnvilConfig::default().lease_timeout_secs,
+        );
         (Arc::new(service), storage)
     }
 
@@ -454,12 +458,11 @@ pub(crate) mod tests {
 
     /// Goal: one msg_id twice in a Complete is a malformed request,
     /// INVALID_ARGUMENT. Method: ack and nack a claim listed twice.
-    /// Today the second entry fails `SettlementHold::take` against the first
-    /// and reports FAILED_PRECONDITION, which tells the worker it lost a
-    /// claim it still holds: it drops the message, which then waits out the
-    /// claim-age timeout.
+    /// Settled as is, the second entry fails `SettlementHold::take` against
+    /// the first and reports FAILED_PRECONDITION, which tells the worker it
+    /// lost a claim it still holds: it drops the message, which then waits
+    /// out the claim-age timeout.
     #[tokio::test]
-    #[ignore = "bug: a msg_id repeated in one ack or nack is FAILED_PRECONDITION, not INVALID_ARGUMENT"]
     async fn test_duplicate_msg_ids_in_one_complete_are_invalid_argument() {
         let (service, _storage) = service().await;
         let message = push_and_claim(&service, "dup").await;
@@ -474,10 +477,9 @@ pub(crate) mod tests {
     }
 
     /// Goal: claim tokens that pair with no msg_id are INVALID_ARGUMENT, the
-    /// contract's own example. Method: a Complete with one token and no ids.
-    /// Today `execute_complete` skips its length check when msg_ids is empty.
+    /// contract's own example. Method: a Complete with one token and no ids,
+    /// which a length check skipping empty msg_ids lets through.
     #[tokio::test]
-    #[ignore = "bug: claim_tokens without msg_ids are accepted; the length check skips empty msg_ids"]
     async fn test_unpaired_claim_tokens_are_invalid_argument() {
         let (service, _storage) = service().await;
         let mut request = complete_request("q", &[], ack());
@@ -487,12 +489,10 @@ pub(crate) mod tests {
     }
 
     /// Goal: a Complete whose state update the broker will not write fails
-    /// whole. Method: ack with puts but no namespace. Today `has_state` is
-    /// false for an empty namespace, so the puts are dropped and the ack
-    /// succeeds alone, though StatePut refuses the same update as
-    /// INVALID_ARGUMENT.
+    /// whole. Method: ack with puts but no namespace, which StatePut refuses
+    /// as INVALID_ARGUMENT; dropping the puts and acking alone would lose the
+    /// update.
     #[tokio::test]
-    #[ignore = "bug: Complete silently drops a state update without a namespace and still acks"]
     async fn test_complete_state_without_namespace_is_rejected() {
         let (service, _storage) = service().await;
         let message = push_and_claim(&service, "q").await;
@@ -508,22 +508,42 @@ pub(crate) mod tests {
     }
 
     /// Goal: a key of one state namespace is invisible in another. Method:
-    /// put namespace "job:a" key "k", get namespace "job" key "a:k".
-    /// `state_key` joins both with ':', which either may contain, so the two
-    /// are one stored key.
+    /// namespace "job:a" key "k" and namespace "job" key "a:k" would be one
+    /// stored key, since `state_key` joins them with ':'. A namespace with
+    /// ':' is refused, so keys of existing namespaces stay where they are,
+    /// and a key with ':' still round-trips in its own namespace.
     #[tokio::test]
-    #[ignore = "bug: state namespace \"job:a\" key \"k\" and namespace \"job\" key \"a:k\" are one key"]
     async fn test_state_namespaces_do_not_collide() {
         let (service, _storage) = service().await;
-        service
-            .state_put(Request::new(StatePutRequest {
+        let put = |namespace: &str, key: &str| StatePutRequest {
+            namespace: namespace.to_string(),
+            puts: HashMap::from([(key.to_string(), namespace.as_bytes().to_vec())]),
+            deletes: Vec::new(),
+        };
+        let refused = service.state_put(Request::new(put("job:a", "k"))).await;
+        assert_code(&refused, Code::InvalidArgument, "put to job:a");
+        let refused = service
+            .state_get(Request::new(StateGetRequest {
                 namespace: "job:a".to_string(),
-                puts: HashMap::from([("k".to_string(), b"of job:a".to_vec())]),
-                deletes: Vec::new(),
+                keys: vec!["k".to_string()],
             }))
+            .await;
+        assert_code(&refused, Code::InvalidArgument, "get of job:a");
+        let message = push_and_claim(&service, "q").await;
+        let mut request = complete_request("q", &[message], ack());
+        request.state = Some(StateUpdate {
+            namespace: "job:a".to_string(),
+            puts: HashMap::from([("k".to_string(), b"1".to_vec())]),
+            deletes: Vec::new(),
+        });
+        let refused = complete(&service, request).await;
+        assert_code(&refused, Code::InvalidArgument, "complete into job:a");
+
+        service
+            .state_put(Request::new(put("job", "a:k")))
             .await
             .unwrap();
-        let other = service
+        let read = service
             .state_get(Request::new(StateGetRequest {
                 namespace: "job".to_string(),
                 keys: vec!["a:k".to_string()],
@@ -531,10 +551,9 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert!(
-            other.values.is_empty(),
-            "job reads job:a: {:?}",
-            other.values
+        assert_eq!(
+            read.values,
+            HashMap::from([("a:k".to_string(), b"job".to_vec())])
         );
     }
 
@@ -543,7 +562,6 @@ pub(crate) mod tests {
     /// queue named "" can be filled but never finished or inspected. Method:
     /// push, claim, create and forward to "".
     #[tokio::test]
-    #[ignore = "bug: Push, Claim, CreateQueue and forward accept the empty queue name"]
     async fn test_empty_queue_name_is_invalid_argument() {
         let (service, _storage) = service().await;
         let pushed = push(&service, "", vec![b"x".to_vec()]).await;
@@ -574,7 +592,6 @@ pub(crate) mod tests {
     /// GetStats and IsQueueFinished count three phantom pending messages
     /// (not drained) until a claim walks past the hole.
     #[tokio::test]
-    #[ignore = "bug: a fenced forward inflates the downstream pending_count by its payload count"]
     async fn test_fenced_forward_leaves_no_phantom_pending() {
         let (service, _storage) = service().await;
         let mut message = push_and_claim(&service, "up").await;
@@ -600,13 +617,11 @@ pub(crate) mod tests {
 
     /// Goal: a broker config with NaN timeouts or non-positive intervals is
     /// refused by `start` with an error. Method: start a broker per bad
-    /// config. Today a NaN lease timeout trips an assert inside `start`
-    /// (BrokerConfig lets NaN through its `<= 0.0` check), and a zero or NaN
-    /// recovery interval or a negative GC interval panics only the spawned
-    /// background task: `start` returns Ok and the broker serves with no
-    /// recovery (dead workers' claims are never reclaimed) or no GC.
+    /// config. A NaN passes a `<= 0.0` check, and a zero or NaN recovery
+    /// interval or a negative GC interval panics only the spawned background
+    /// task: unrefused, the broker serves with no recovery (dead workers'
+    /// claims are never reclaimed) or no GC.
     #[test]
-    #[ignore = "bug: NaN timeouts panic broker start; bad intervals silently kill recovery or GC"]
     fn test_invalid_broker_config_is_refused() {
         let base = AnvilConfig {
             host: "127.0.0.1".to_string(),
@@ -644,6 +659,9 @@ pub(crate) mod tests {
             ),
         ];
         let runtime = race_runtime();
+        // `tokio::spawn` runs before `block_on` enters the runtime. The
+        // spawn turns a panic in `start` into a failed join, not a test abort.
+        let _context = runtime.enter();
         for (case, config) in cases {
             let started = runtime.block_on(tokio::spawn(async move {
                 let mut broker = AnvilBrokerInner::new(config).await.unwrap();
@@ -698,7 +716,7 @@ pub(crate) mod tests {
                         let (_, msg_id, info) =
                             storage.scan_claimed(Some("up")).await.unwrap().remove(0);
                         let claim_info = ClaimInfo { msg_id, ..info };
-                        let read_at = crate::types::now_secs();
+                        let read_at = crate::types::mono_now();
                         let attempts: Vec<_> = ATTEMPTS
                             .iter()
                             .map(|&settlement| {
@@ -921,7 +939,6 @@ pub(crate) mod tests {
     /// holds, and the message waits for the claim-age timeout and is
     /// processed again.
     #[test]
-    #[ignore = "bug: a stale-token ack racing the owner's ack fences the owner (claim_settling)"]
     fn test_stale_settlement_does_not_fence_the_owner() {
         const TRIALS: usize = 20;
         const ZOMBIES: usize = 8;
@@ -1120,17 +1137,18 @@ pub(crate) mod tests {
     }
 
     /// Goal: after DeleteQueue races workers, the queue's counters agree
-    /// with its keys. Method: delete while tasks push, claim and ack, 30
-    /// times, then compare claimed_count with the claimed keys. Today
-    /// `delete_queue` is not fenced against operations in flight: a claim
-    /// that loaded the old counters writes its claimed key after the delete
-    /// batch, and the next access recreates the queue with zero counters
-    /// beside the orphan. The live broker reports claimed_count 0 over
-    /// orphan claims, which recovery requeues into the new queue (pointing
-    /// at deleted bodies) and a restart counts as claimed; orphan pending
-    /// keys likewise move the push cursor on restart.
+    /// with its keys. Method: delete while concurrent pushes, claims and acks
+    /// are in flight, 30 times, then compare claimed_count with the claimed
+    /// keys. The pushes and acks are issued at once rather than one after
+    /// another: a durable write waits for a WAL flush, and the race is with
+    /// the writes in flight when the delete runs, not with later ones.
+    /// Unfenced, a claim that loaded the old counters writes its claimed key
+    /// after the delete batch, and the next access recreates the queue with
+    /// zero counters beside the orphan. The live broker reports
+    /// claimed_count 0 over orphan claims, which recovery requeues into the
+    /// new queue (pointing at deleted bodies) and a restart counts as
+    /// claimed; orphan pending keys likewise move the push cursor on restart.
     #[test]
-    #[ignore = "bug: delete_queue racing claims leaves orphan claimed keys under fresh zero counters"]
     fn test_delete_queue_racing_workers_leaves_counters_matching_keys() {
         const TRIALS: usize = 30;
         race_runtime().block_on(async {
@@ -1138,32 +1156,29 @@ pub(crate) mod tests {
                 let (service, storage) = service().await;
                 push(&service, "q", vec![b"x".to_vec(); 20]).await.unwrap();
                 let held = claim(&service, "q", 5).await.unwrap();
-                let pusher = {
+                let mut tasks: Vec<_> = (0..20)
+                    .map(|_| {
+                        let service = service.clone();
+                        tokio::spawn(async move {
+                            let _ = push(&service, "q", vec![b"y".to_vec()]).await;
+                        })
+                    })
+                    .collect();
+                tasks.extend(held.into_iter().map(|message| {
                     let service = service.clone();
                     tokio::spawn(async move {
-                        for _ in 0..20 {
-                            let _ = push(&service, "q", vec![b"y".to_vec()]).await;
-                        }
+                        let _ = complete(&service, complete_request("q", &[message], ack())).await;
                     })
-                };
-                let claimer = {
+                }));
+                tasks.push({
                     let service = service.clone();
                     tokio::spawn(async move {
                         for _ in 0..20 {
                             let _ = claim(&service, "q", 2).await;
                         }
                     })
-                };
-                let acker = {
-                    let service = service.clone();
-                    tokio::spawn(async move {
-                        for message in held {
-                            let _ =
-                                complete(&service, complete_request("q", &[message], ack())).await;
-                        }
-                    })
-                };
-                let deleter = {
+                });
+                tasks.push({
                     let service = service.clone();
                     tokio::spawn(async move {
                         tokio::task::yield_now().await;
@@ -1172,8 +1187,8 @@ pub(crate) mod tests {
                         };
                         service.delete_queue(Request::new(request)).await.unwrap();
                     })
-                };
-                for task in [pusher, claimer, acker, deleter] {
+                });
+                for task in tasks {
                     tokio::time::timeout(TASK_DEADLINE, task)
                         .await
                         .unwrap()
@@ -1190,11 +1205,10 @@ pub(crate) mod tests {
     }
 
     /// Goal: of concurrent CreateQueueGroup calls for one new group, exactly
-    /// one reports `created`. Method: two creates race, 20 times. Both read
-    /// the group meta before either writes it, so both report created and
-    /// both write the partitions' zero counters.
+    /// one reports `created`. Method: two creates race, 20 times. A create
+    /// that reads the group meta outside the lock it writes under lets both
+    /// report created and both write the partitions' zero counters.
     #[test]
-    #[ignore = "bug: concurrent CreateQueueGroup calls for one new group both report created=true"]
     fn test_concurrent_group_creates_report_one_creation() {
         const TRIALS: usize = 20;
         race_runtime().block_on(async {

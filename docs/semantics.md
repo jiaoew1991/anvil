@@ -112,9 +112,14 @@ Key Schema:
   claimed:{queue}:{msg_id}              → ClaimInfo JSON
   acked:{queue}:{timestamp_ns}:{msg_id} → ""
   state:{namespace}:{key}               → value bytes
+  max_pending:{queue}                   → u64 LE, bound of a bounded queue
 ```
 
 All operations use `WriteBatch` for atomicity.
+
+A state namespace may not be empty or contain ':', so `state:{namespace}:{key}`
+splits at its first ':' after the prefix and no two (namespace, key) pairs
+share a key; a key may contain ':'.
 
 ### 2.4 Error Contract
 
@@ -124,12 +129,17 @@ A failed RPC's status code tells the caller what to do next:
 |------|---------|-------------------|
 | `FAILED_PRECONDITION` | The caller no longer holds a claim it acks, nacks, forwards, scatters or renews: its token, lease or worker does not match, the message is no longer claimed, or another settlement holds it | Drop the message; another worker owns it or it is done |
 | `NOT_FOUND` | The queue or queue group does not exist | Create it first |
-| `INVALID_ARGUMENT` | The request is malformed, e.g. claim tokens that do not pair up with message ids | Fix the request |
+| `INVALID_ARGUMENT` | The request is malformed: claim tokens that do not pair up with message ids, a message id listed twice in one ack, nack or renewal, an empty queue name (push, claim, create, forward target), a state update with an empty namespace or one containing ':', a negative `steal_pending_threshold` | Fix the request |
 | `RESOURCE_EXHAUSTED` | A bounded queue is full (message starts with `QueueFull`) | Back off and retry |
+| `UNAVAILABLE` | The broker's database is closed for good: a newer broker opened it and fenced this one, or a storage background task failed | Fail over to the current broker; do not retry this one |
 | `INTERNAL` | The broker's storage failed | Retry |
 
 `Complete` reports every failure, including forward and scatter, as an error
-status; `success` in its response is always true. The Python client raises
+status; `success` in its response is always true. A `Complete` whose state
+update is refused fails whole: nothing is acked without its state.
+
+A fenced broker stops its recovery and GC tasks, which could only fail
+from then on, and answers `UNAVAILABLE` until it is stopped. The Python client raises
 `ClaimLostError` (a `RuntimeError`) for `FAILED_PRECONDITION`.
 
 Reading a queue never creates it: `GetStats` for an unknown queue returns
@@ -315,27 +325,47 @@ Most sinks can be made idempotent:
 
 ### 4.1 Message-Level Recovery
 
-**Automatic claim timeout recovery:**
+**Leases.** A worker holds a lease by keeping a `HeartbeatStream` open and
+pinging it. Every claim records the lease it was made under. The broker keeps
+its lease table in memory and is the only one to mint lease ids:
 
-```rust
-// recovery.rs - runs periodically
-pub async fn recover_expired_claims(&self, timeout_secs: f64) {
-    let now = now_secs();
-    let all_claimed = self.scan_claimed(None).await?;
+- The first ping of a stream presents the lease the worker holds. The broker
+  keeps that lease while its table still holds it, so a worker whose stream or
+  connection broke keeps its lease and its claims when it reconnects within
+  `lease_timeout_secs`. A lease the table no longer holds is never revived:
+  the worker is given a new lease, and its old claims are reclaimed.
+- A stream closes once silent for `lease_timeout_secs`; neither it nor its
+  HTTP/2 connection is part of the lease, so the transport may drop either
+  sooner without costing the worker its claims.
+- Each recovery tick (`recovery_interval_secs`) forgets the leases that have
+  expired, then reclaims every claim whose lease is dead (expired or absent
+  from the table) and every claim under a live lease that has been neither
+  taken nor renewed within `claim_age_timeout_secs`. A reclaimed claim returns
+  to the tail of pending with `delivery_count + 1`, and its token rotates, so
+  the former holder's ack fails with `FAILED_PRECONDITION`.
+- Lease age and claim age run on the broker's monotonic clock, not the wall
+  clock, so a clock step neither revives a dead lease nor reclaims a live
+  worker's claims. The persisted `claimed_at` is wall clock and is kept for
+  events only. A claim's age is timed from when this broker process handed it
+  out; that is enough, since a restarted broker reclaims every earlier claim
+  regardless of age.
 
-    for (queue, msg_id, claim_info) in all_claimed {
-        if now - claim_info.claimed_at > timeout_secs {
-            // Return to pending queue (at tail)
-            self.nack_messages(&queue, &[msg_id]).await?;
-        }
-    }
-}
-```
+**Broker restart.** The lease table does not survive a restart. After a broker
+restart, every claim in flight is returned to pending on the first recovery
+tick and redelivered with `delivery_count + 1`, even to a worker that
+reconnects at once presenting its old lease, which the restarted broker does
+not know. Workers should expect their acks of claims made before the restart
+to fail with `FAILED_PRECONDITION`, and drop those messages.
 
 **Configuration:**
 - `lease_timeout_secs`: Default 60s - how long a lease may miss heartbeats before its worker is considered dead and all its claims are reclaimed
 - `claim_age_timeout_secs`: Default 60s - how long a claim under a live lease may go without being taken or renewed before it is considered stuck. A task that may run longer renews its claims (`RenewClaims`) from its processing loop; renewing from a background timer would keep a stuck task's claims alive
 - `recovery_interval_secs`: Default 10s - how often to check for expired claims
+
+Each timeout and interval (`gc_interval_secs` too) must be a positive, finite
+duration, and `acked_retention_secs` a non-negative one. `BrokerConfig(...)`
+raises `ValueError` otherwise, and starting a broker with such a config fails
+instead of running without recovery or GC.
 
 ### 4.2 Worker-Level Recovery
 
@@ -470,7 +500,8 @@ Timeline:
   t2: [Broker CRASH]
   t3: All workers lose connection
   t4: Workers retry connection (grpc retry)
-  t5: If broker restarts: SlateDB state recovered, processing resumes
+  t5: If broker restarts: SlateDB state recovered, processing resumes;
+      every claim in flight is redelivered (see 4.1, Broker restart)
   t6: If broker doesn't restart: Job fails
 
 Data safety: SlateDB persists to disk/S3, no message loss

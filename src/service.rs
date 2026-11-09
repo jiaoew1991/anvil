@@ -20,7 +20,7 @@
 //   Push:             single + batch
 //   ClaimAndComplete: combined claim + complete (halves round trips)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +31,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 #[allow(unused_imports)]
 use crate::state::AnvilState;
-use crate::storage::{AnvilStorage, Rejection, StorageError};
+use crate::storage::{self, AnvilStorage, Rejection, StorageError};
 use crate::types::{ClaimedMessage, Message};
 
 // Generated protobuf types. Generated code is not ours to lint: each Rust
@@ -47,10 +47,14 @@ use proto::*;
 /// The one place a storage error becomes a gRPC status. A `Rejection` gets
 /// the code its caller acts on, so a worker can tell `FAILED_PRECONDITION`
 /// (its claim is lost: drop the message) from `INTERNAL` (the broker failed:
-/// retry).
+/// retry) and from `UNAVAILABLE` (this broker's database is closed for good,
+/// typically fenced by a newer broker: fail over instead of retrying here).
 fn storage_status(rpc: &str, error: StorageError) -> Status {
     let Some(rejection) = error.downcast_ref::<Rejection>() else {
         tracing::error!("{rpc} failed: {error}");
+        if storage::is_closed(&error) {
+            return Status::unavailable(format!("Storage closed: {error}"));
+        }
         return Status::internal(format!("Storage error: {error}"));
     };
     tracing::warn!("{rpc} rejected: {rejection}");
@@ -62,15 +66,60 @@ fn storage_status(rpc: &str, error: StorageError) -> Status {
     }
 }
 
+/// Refuses the empty queue name, which GetStats reads as "every queue" and
+/// MarkQueueFinished refuses: a queue named "" could be filled but never
+/// inspected or finished.
+fn check_queue_name(queue: &str, role: &str) -> Result<(), Status> {
+    if queue.is_empty() {
+        return Err(Status::invalid_argument(format!("{role} is required")));
+    }
+    Ok(())
+}
+
+/// Refuses claims that do not pair up one token per msg_id, or that name a
+/// msg_id twice: the second entry of a repeated id would be fenced by the
+/// first and fail the request as FAILED_PRECONDITION, telling the worker it
+/// lost a claim it still holds.
+fn check_claims(msg_ids: &[String], claim_tokens: &[String]) -> Result<(), Status> {
+    if claim_tokens.len() != msg_ids.len() {
+        return Err(Status::invalid_argument(format!(
+            "claim_tokens length must match msg_ids (msg_ids={}, claim_tokens={})",
+            msg_ids.len(),
+            claim_tokens.len()
+        )));
+    }
+    let mut seen = HashSet::with_capacity(msg_ids.len());
+    if let Some(repeated) = msg_ids.iter().find(|id| !seen.insert(id.as_str())) {
+        return Err(Status::invalid_argument(format!(
+            "duplicate msg_id {repeated}"
+        )));
+    }
+    Ok(())
+}
+
 /// Anvil gRPC service implementation
 pub struct AnvilService {
     state: Arc<AnvilState>,
     storage: Arc<AnvilStorage>,
+    /// How long a heartbeat stream may stay silent before it is closed:
+    /// `lease_timeout_secs`, after which its lease is dead anyway.
+    lease_timeout: Duration,
 }
 
 impl AnvilService {
-    pub fn new(state: Arc<AnvilState>, storage: Arc<AnvilStorage>) -> Self {
-        Self { state, storage }
+    pub fn new(
+        state: Arc<AnvilState>,
+        storage: Arc<AnvilStorage>,
+        lease_timeout_secs: f64,
+    ) -> Self {
+        // An infinite lease timeout never closes a silent stream.
+        let lease_timeout =
+            Duration::try_from_secs_f64(lease_timeout_secs).unwrap_or(Duration::MAX);
+        Self {
+            state,
+            storage,
+            lease_timeout,
+        }
     }
 
     /// Convert internal Message to slim ClaimMessage (no queue, no created_at)
@@ -86,15 +135,19 @@ impl AnvilService {
 
     /// Execute a Complete operation (shared by `complete` and `claim_and_complete`)
     async fn execute_complete(&self, req: CompleteRequest) -> Result<CompleteResponse, Status> {
-        if !req.msg_ids.is_empty() && req.claim_tokens.len() != req.msg_ids.len() {
-            return Err(Status::invalid_argument(
-                "claim_tokens length must match msg_ids",
-            ));
-        }
+        check_claims(&req.msg_ids, &req.claim_tokens)?;
 
-        let has_state = req.state.as_ref().is_some_and(|s| {
-            !s.namespace.is_empty() && (!s.puts.is_empty() || !s.deletes.is_empty())
-        });
+        // A state update the broker would not write fails the whole Complete:
+        // acking without it would lose the update the worker counts on.
+        let has_state = req
+            .state
+            .as_ref()
+            .is_some_and(|s| !s.puts.is_empty() || !s.deletes.is_empty());
+        if has_state {
+            let namespace = req.state.as_ref().map_or("", |s| s.namespace.as_str());
+            storage::check_state_namespace(namespace)
+                .map_err(|rejection| Status::invalid_argument(rejection.to_string()))?;
+        }
         let state_ns = req
             .state
             .as_ref()
@@ -186,6 +239,7 @@ impl AnvilService {
 
             // --- Forward: ack upstream + push to single downstream queue ---
             Some(complete_request::Action::Forward(fwd)) => {
+                check_queue_name(&fwd.downstream_queue, "forward downstream_queue")?;
                 let downstream_messages: Vec<Message> = fwd
                     .payloads
                     .iter()
@@ -299,6 +353,7 @@ impl AnvilService {
         match req.source {
             // --- Plain queue claim ---
             Some(claim_request::Source::Queue(queue)) => {
+                check_queue_name(&queue, "claim queue")?;
                 let claimed = self
                     .storage
                     .claim_messages(&queue, batch_size, &req.worker_id, &req.lease_id)
@@ -346,6 +401,15 @@ impl AnvilService {
                 if group.group_name.is_empty() {
                     return Err(Status::invalid_argument("group_name is required"));
                 }
+                // Cast to u64, a negative threshold becomes a huge one that
+                // no partition's backlog exceeds, silently disabling stealing.
+                let Ok(steal_pending_threshold) = u64::try_from(group.steal_pending_threshold)
+                else {
+                    return Err(Status::invalid_argument(format!(
+                        "steal_pending_threshold must not be negative, got {}",
+                        group.steal_pending_threshold
+                    )));
+                };
 
                 let assigned: Vec<u32> = group
                     .assigned_partitions
@@ -362,7 +426,7 @@ impl AnvilService {
                         &req.lease_id,
                         &assigned,
                         group.allow_steal,
-                        group.steal_pending_threshold as u64,
+                        steal_pending_threshold,
                     )
                     .await
                     .map_err(|e| storage_status("Claim(group)", e))?;
@@ -434,6 +498,7 @@ impl Anvil for AnvilService {
         request: Request<RenewClaimsRequest>,
     ) -> Result<Response<RenewClaimsResponse>, Status> {
         let req = request.into_inner();
+        check_claims(&req.msg_ids, &req.claim_tokens)?;
         self.storage
             .renew_claims(
                 &req.queue,
@@ -450,6 +515,7 @@ impl Anvil for AnvilService {
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushResponse>, Status> {
         let req = request.into_inner();
 
+        check_queue_name(&req.queue, "push queue")?;
         if req.payloads.is_empty() {
             return Err(Status::invalid_argument("at least one payload is required"));
         }
@@ -509,11 +575,6 @@ impl Anvil for AnvilService {
         request: Request<StateGetRequest>,
     ) -> Result<Response<StateGetResponse>, Status> {
         let req = request.into_inner();
-
-        if req.namespace.is_empty() {
-            return Err(Status::invalid_argument("namespace is required"));
-        }
-
         match self
             .storage
             .state_get_batch(&req.namespace, &req.keys)
@@ -529,11 +590,6 @@ impl Anvil for AnvilService {
         request: Request<StatePutRequest>,
     ) -> Result<Response<StatePutResponse>, Status> {
         let req = request.into_inner();
-
-        if req.namespace.is_empty() {
-            return Err(Status::invalid_argument("namespace is required"));
-        }
-
         let puts: HashMap<String, Vec<u8>> = req.puts.into_iter().collect();
 
         match self
@@ -550,11 +606,19 @@ impl Anvil for AnvilService {
     }
 
     // =========================================================================
-    // Heartbeat (unchanged)
+    // Heartbeat
     // =========================================================================
 
     type HeartbeatStreamStream = Pin<Box<dyn Stream<Item = Result<HeartbeatPong, Status>> + Send>>;
 
+    /// A stream's first ping opens its lease: the lease it presents if the
+    /// broker still holds it, so a worker whose stream broke keeps its claims
+    /// when it reconnects, else a new one. A stream lives only as long as its
+    /// lease could: it closes once silent for `lease_timeout_secs`, or once
+    /// its lease has been pruned, and the worker's next stream opens anew.
+    /// Neither the stream nor its connection is part of the lease, so the
+    /// transport may drop either one sooner without costing the worker its
+    /// claims.
     async fn heartbeat_stream(
         &self,
         request: Request<Streaming<HeartbeatPing>>,
@@ -562,22 +626,37 @@ impl Anvil for AnvilService {
         let mut stream = request.into_inner();
         let (tx, rx) = mpsc::channel(16);
         let state = self.state.clone();
-
-        const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+        let lease_timeout = self.lease_timeout;
 
         tokio::spawn(async move {
-            let lease_id = uuid::Uuid::now_v7().to_string();
+            let Ok(Some(Ok(first))) = timeout(lease_timeout, stream.next()).await else {
+                return;
+            };
+            let pong = HeartbeatPong {
+                lease_id: state.open_lease(&first.lease_id),
+                ok: true,
+                next_ping_ms: 5000,
+            };
+            if !first.lease_id.is_empty() && first.lease_id != pong.lease_id {
+                tracing::info!(
+                    "Worker {} presented unknown lease {}, opened lease {}",
+                    first.worker_id,
+                    first.lease_id,
+                    pong.lease_id
+                );
+            }
 
             loop {
-                match timeout(HEARTBEAT_TIMEOUT, stream.next()).await {
+                if tx.send(Ok(pong.clone())).await.is_err() {
+                    break;
+                }
+                match timeout(lease_timeout, stream.next()).await {
                     Ok(Some(Ok(_ping))) => {
-                        state.update_lease(&lease_id);
-                        let pong = HeartbeatPong {
-                            lease_id: lease_id.clone(),
-                            ok: true,
-                            next_ping_ms: 5000,
-                        };
-                        if tx.send(Ok(pong)).await.is_err() {
+                        if !state.renew_lease(&pong.lease_id) {
+                            tracing::debug!(
+                                "Heartbeat lease {} pruned, closing stream",
+                                pong.lease_id
+                            );
                             break;
                         }
                     }
@@ -587,7 +666,7 @@ impl Anvil for AnvilService {
                     }
                     Ok(None) => break,
                     Err(_) => {
-                        tracing::debug!("Heartbeat timeout, closing connection");
+                        tracing::debug!("Heartbeat silent for the lease timeout, closing stream");
                         break;
                     }
                 }
@@ -606,6 +685,7 @@ impl Anvil for AnvilService {
         request: Request<CreateQueueRequest>,
     ) -> Result<Response<CreateQueueResponse>, Status> {
         let req = request.into_inner();
+        check_queue_name(&req.queue, "queue")?;
         match self.storage.create_queue(&req.queue, req.max_pending).await {
             Ok(()) => {
                 self.state.get_or_create_queue(&req.queue);
@@ -735,13 +815,6 @@ impl Anvil for AnvilService {
             return Err(Status::invalid_argument("num_partitions must be positive"));
         }
 
-        let existed = self
-            .storage
-            .get_group_meta(&req.group_name)
-            .await
-            .map_err(|e| storage_status("CreateQueueGroup", e))?
-            .is_some();
-
         match self
             .storage
             .create_queue_group(
@@ -751,14 +824,14 @@ impl Anvil for AnvilService {
             )
             .await
         {
-            Ok(meta) => {
+            Ok((meta, created)) => {
                 for queue_name in &meta.partition_queues {
                     self.state.get_or_create_queue(queue_name);
                 }
                 Ok(Response::new(CreateQueueGroupResponse {
                     queue_names: meta.partition_queues,
                     version: meta.version as i32,
-                    created: !existed,
+                    created,
                 }))
             }
             Err(e) => Err(storage_status("CreateQueueGroup", e)),
@@ -896,11 +969,16 @@ impl Anvil for AnvilService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AnvilConfig;
     use tonic::Code;
 
     async fn create_service() -> (AnvilService, Arc<AnvilStorage>) {
         let storage = Arc::new(AnvilStorage::new("memory://").await.unwrap());
-        let service = AnvilService::new(Arc::new(AnvilState::new()), storage.clone());
+        let service = AnvilService::new(
+            Arc::new(AnvilState::new()),
+            storage.clone(),
+            AnvilConfig::default().lease_timeout_secs,
+        );
         (service, storage)
     }
 
@@ -1041,6 +1119,42 @@ mod tests {
         assert_status(&status, Code::FailedPrecondition, "message_not_claimed");
     }
 
+    /// A renewal naming a claim twice and a group claim with a negative
+    /// steal threshold are malformed: INVALID_ARGUMENT, and nothing renews.
+    #[tokio::test]
+    async fn test_malformed_requests_are_invalid_argument() {
+        let (service, _storage) = create_service().await;
+        let message = push_and_claim(&service, "q").await;
+        let status = service
+            .renew_claims(Request::new(RenewClaimsRequest {
+                queue: "q".to_string(),
+                msg_ids: vec![message.msg_id.clone(), message.msg_id.clone()],
+                claim_tokens: vec![message.claim_token.clone(), message.claim_token],
+                worker_id: "w".to_string(),
+                lease_id: "l".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_status(&status, Code::InvalidArgument, "duplicate msg_id");
+
+        let status = service
+            .claim(Request::new(ClaimRequest {
+                source: Some(claim_request::Source::Group(GroupClaimSource {
+                    group_name: "group".to_string(),
+                    assigned_partitions: vec![0],
+                    allow_steal: true,
+                    steal_pending_threshold: -1,
+                })),
+                worker_id: "w".to_string(),
+                lease_id: "l".to_string(),
+                batch_size: 1,
+                timeout_ms: 0,
+            }))
+            .await
+            .unwrap_err();
+        assert_status(&status, Code::InvalidArgument, "steal_pending_threshold");
+    }
+
     /// A push past a bounded queue's capacity is RESOURCE_EXHAUSTED, and the
     /// message still names QueueFull, which clients match on.
     #[tokio::test]
@@ -1063,10 +1177,10 @@ mod tests {
         assert_status(&status, Code::ResourceExhausted, "QueueFull");
     }
 
-    /// A failure of the storage itself stays INTERNAL, the code a worker
-    /// retries: the database is closed under the service.
+    /// A closed database is UNAVAILABLE, not INTERNAL: it never reopens, so
+    /// a worker must fail over instead of retrying this broker.
     #[tokio::test]
-    async fn test_storage_failure_is_internal() {
+    async fn test_closed_storage_is_unavailable() {
         let (service, storage) = create_service().await;
         storage.close().await.unwrap();
         let status = service
@@ -1077,7 +1191,7 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert_status(&status, Code::Internal, "Storage error");
+        assert_status(&status, Code::Unavailable, "Storage closed");
     }
 
     /// Reading the stats of a queue that does not exist reports NOT_FOUND

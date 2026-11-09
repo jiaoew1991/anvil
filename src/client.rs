@@ -202,14 +202,26 @@ async fn run_heartbeat_stream(inner: &Arc<ClientInner>) -> Result<(), tonic::Sta
         .await?;
     let mut stream = response.into_inner();
 
+    // Every ping presents the lease held, so a reconnect keeps it and its
+    // claims. The broker answers with another lease only once the held one
+    // is dead (expired, or lost in a broker restart); its claims are then
+    // reclaimed, and the new lease must be adopted for any further claim.
     while inner.heartbeat_running.load(Ordering::SeqCst) {
         match stream.message().await? {
             Some(pong) => {
                 let mut lease = inner.lease_id.write();
-                *lease = pong.lease_id;
                 if !pong.ok {
                     tracing::warn!("Lease invalidated by server");
                     *lease = String::new();
+                } else if *lease != pong.lease_id {
+                    if !lease.is_empty() {
+                        tracing::warn!(
+                            "Lease {} is dead, its claims will be redelivered; now holding lease {}",
+                            *lease,
+                            pong.lease_id
+                        );
+                    }
+                    *lease = pong.lease_id;
                 }
             }
             None => break,
@@ -230,7 +242,9 @@ fn make_state_update(
     let ns = namespace.unwrap_or_default();
     let p = puts.unwrap_or_default();
     let d = deletes.unwrap_or_default();
-    if ns.is_empty() || (p.is_empty() && d.is_empty()) {
+    // An update without a namespace is still sent, for the broker to refuse:
+    // dropping it here would ack without the state the caller wrote.
+    if p.is_empty() && d.is_empty() {
         None
     } else {
         Some(proto::StateUpdate {

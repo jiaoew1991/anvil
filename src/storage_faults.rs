@@ -176,7 +176,6 @@ mod tests {
     /// count true. Method: restart the broker so the message bodies live only
     /// in the store, make every read slow, cancel a claim while it reads
     /// them, then lift the latency, drain the queue and mark it finished.
-    #[ignore = "bug: a cancelled or failed claim advances the claim cursor past messages it never claims"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_claim_cancelled_mid_read_leaves_messages_claimable() {
         const MESSAGES: usize = 16;
@@ -323,7 +322,11 @@ mod tests {
         let store = FaultStore::new(memory(), 5);
         let storage = Arc::new(open(&store).await);
         let state = Arc::new(AnvilState::new());
-        let service = Arc::new(AnvilService::new(state.clone(), storage.clone()));
+        let service = Arc::new(AnvilService::new(
+            state.clone(),
+            storage.clone(),
+            LEASE_TIMEOUT.as_secs_f64(),
+        ));
         let config = AnvilConfig {
             lease_timeout_secs: LEASE_TIMEOUT.as_secs_f64(),
             claim_age_timeout_secs: 600.0,
@@ -506,16 +509,19 @@ mod tests {
     }
 
     /// Goal: once a second broker opens the same database and fences this
-    /// one, this broker must stop answering INTERNAL, the code a worker
-    /// retries, since no retry against it can succeed. Method: open two
+    /// one, this broker must answer UNAVAILABLE, not INTERNAL, the code a
+    /// worker retries, since no retry against it can succeed. Method: open two
     /// brokers on one store and push through the fenced one's service.
-    #[ignore = "bug: a fenced broker answers INTERNAL forever, so workers retry it instead of failing over"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_fenced_broker_stops_inviting_retries() {
         let store = FaultStore::new(memory(), 8);
         let queue = "q";
         let fenced = Arc::new(open(&store).await);
-        let service = AnvilService::new(Arc::new(AnvilState::new()), fenced.clone());
+        let service = AnvilService::new(
+            Arc::new(AnvilState::new()),
+            fenced.clone(),
+            AnvilConfig::default().lease_timeout_secs,
+        );
         let push = || PushRequest {
             queue: queue.to_string(),
             payloads: vec![b"x".to_vec()],
@@ -529,7 +535,7 @@ mod tests {
                 .await
                 .expect("push to the fenced broker hung")
                 .expect_err("the fenced broker acknowledged a push");
-            assert_ne!(status.code(), Code::Internal, "{status:?}");
+            assert_eq!(status.code(), Code::Unavailable, "{status:?}");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert_eq!(drain(&successor, queue).await.len(), 1);

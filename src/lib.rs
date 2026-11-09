@@ -126,19 +126,7 @@ impl BrokerConfig {
         acked_retention_secs: f64,
         gc_interval_secs: f64,
     ) -> PyResult<Self> {
-        // A non-positive timeout reclaims every claim on the first recovery
-        // tick, so the queue would redeliver work as fast as it hands it out.
-        if lease_timeout_secs <= 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "lease_timeout_secs must be positive",
-            ));
-        }
-        if claim_age_timeout_secs <= 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "claim_age_timeout_secs must be positive",
-            ));
-        }
-        Ok(Self {
+        let config = Self {
             db_path,
             host,
             port,
@@ -148,7 +136,11 @@ impl BrokerConfig {
             max_queue_depth,
             acked_retention_secs,
             gc_interval_secs,
-        })
+        };
+        AnvilConfig::from(config.clone())
+            .validate()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(config)
     }
 
     fn __repr__(&self) -> String {
@@ -216,9 +208,15 @@ impl AnvilBroker {
             ));
         }
 
+        // The config's fields are settable after construction, so it is
+        // checked again here, where a bad one can still raise.
+        let config: AnvilConfig = self.config.clone().into();
+        config
+            .validate()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+
         self.running.store(true, Ordering::SeqCst);
 
-        let config: AnvilConfig = self.config.clone().into();
         let handler = self.event_handler.as_ref().map(|h| h.clone_ref(py));
         let running = self.running.clone();
         let actual_port = self.actual_port.clone();

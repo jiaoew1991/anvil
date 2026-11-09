@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 
 use crate::state::AnvilState;
-use crate::storage::{AnvilStorage, GC_PASS_KEYS_MAX};
+use crate::storage::{self, AnvilStorage, GC_PASS_KEYS_MAX};
 use crate::types::AnvilConfig;
 
 /// Upper bound on back-to-back GC passes in one interval (100M entries at
@@ -75,8 +75,10 @@ impl RecoveryTask {
         let interval_secs = self.config.recovery_interval_secs;
         let lease_timeout_secs = self.config.lease_timeout_secs;
         let claim_age_timeout_secs = self.config.claim_age_timeout_secs;
-        assert!(lease_timeout_secs > 0.0);
-        assert!(claim_age_timeout_secs > 0.0);
+        // A bad interval would panic only the spawned task, silently.
+        if let Err(e) = self.config.validate() {
+            panic!("recovery task started with an invalid config: {e}");
+        }
 
         let handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs_f64(interval_secs));
@@ -94,8 +96,8 @@ impl RecoveryTask {
                             break;
                         }
 
+                        state.prune_leases(lease_timeout_secs);
                         let lease_snapshot = state.lease_snapshot();
-                        // Recovery is now handled entirely by storage
                         if let Err(e) = storage
                             .recover_expired_claims(
                                 lease_timeout_secs,
@@ -105,6 +107,11 @@ impl RecoveryTask {
                             .await
                         {
                             tracing::error!("Recovery error: {}", e);
+                            // A closed database never reopens: every later
+                            // tick would fail the same way.
+                            if storage::is_closed(&e) {
+                                break;
+                            }
                         }
                     }
                 }
@@ -195,6 +202,9 @@ impl GcTask {
         let interval_secs = self.config.gc_interval_secs;
         let retention_secs = self.config.acked_retention_secs;
         let retention_ns = (retention_secs * 1_000_000_000.0) as u64;
+        if let Err(e) = self.config.validate() {
+            panic!("GC task started with an invalid config: {e}");
+        }
 
         let handle = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs_f64(interval_secs));
@@ -209,7 +219,8 @@ impl GcTask {
                 // A pass that hit its cap left expired entries behind.
                 // Acks can outpace one capped pass per interval, so keep
                 // passing until the backlog is cleared rather than let it
-                // grow without bound.
+                // grow without bound. The passes report whether the database
+                // is closed, which ends the task: it never reopens.
                 let passes = async {
                     for _ in 0..GC_PASSES_PER_TICK_MAX {
                         match storage.gc_acked_messages(retention_ns).await {
@@ -217,10 +228,11 @@ impl GcTask {
                             Ok(_) => break,
                             Err(e) => {
                                 tracing::error!("GC error: {}", e);
-                                break;
+                                return storage::is_closed(&e);
                             }
                         }
                     }
+                    false
                 };
                 // A pass reads and deletes up to GC_PASS_KEYS_MAX entries and
                 // runs for seconds, so a stop drops it at its next await
@@ -232,7 +244,7 @@ impl GcTask {
                 tokio::select! {
                     biased;
                     _ = shutdown_notify.notified() => break,
-                    _ = passes => {}
+                    closed = passes => if closed { break },
                 }
             }
         });

@@ -498,7 +498,6 @@ mod tests {
     /// completion. The forward reserves a downstream seq before it checks
     /// the claim, and the reservation is closed with no key behind it.
     #[tokio::test]
-    #[ignore = "bug: a fenced forward leaves a phantom pending message in the downstream queue"]
     async fn test_fenced_forward_leaves_downstream_untouched() {
         let _guard = SIM_TIME_LOCK.lock().unwrap();
         let storage = AnvilStorage::new("memory://").await.unwrap();
@@ -545,7 +544,6 @@ mod tests {
     /// then ack with the lease the new stream returned, which the client
     /// sends with every later request.
     #[tokio::test]
-    #[ignore = "bug: a reconnected heartbeat gets a new lease, so in-flight claims are fenced and reclaimed"]
     async fn test_reconnected_heartbeat_keeps_in_flight_claims() {
         let _guard = SIM_TIME_LOCK.lock().unwrap();
         let (_broker, client) = start_broker(broker_config("memory://", SHORT_TIMEOUT_SECS)).await;
@@ -580,7 +578,6 @@ mod tests {
     /// several heartbeat streams, wait out many lease timeouts, and read the
     /// broker's lease table.
     #[tokio::test]
-    #[ignore = "bug: dead leases are never removed from the lease table"]
     async fn test_dead_leases_leave_the_lease_table() {
         let _guard = SIM_TIME_LOCK.lock().unwrap();
         let (broker, client) = start_broker(broker_config("memory://", SHORT_TIMEOUT_SECS)).await;
@@ -703,17 +700,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Goal: a broker restart honours the lease contract for workers that
-    /// reconnect at once: a claim returns to pending only after its lease
-    /// has missed heartbeats for `lease_timeout_secs`, not at the restart.
-    /// Method: claim under a long lease timeout, kill and restart the
-    /// broker, reconnect the worker's heartbeat with its old lease id within
-    /// a fraction of the timeout, and check the claim is still held. The
-    /// restarted broker's lease table is empty and its first recovery tick
-    /// fires at once, so every claim reads as held by a dead lease.
+    /// Goal: a broker restart returns every claim in flight to pending, as
+    /// the README documents, even for a worker that reconnects at once
+    /// presenting its old lease: the lease table is in memory, so the
+    /// restarted broker knows no lease from before. The claim is redelivered
+    /// with `delivery_count + 1`, and an ack of the claim made before the
+    /// restart fails with `FAILED_PRECONDITION`. Method: claim under a long
+    /// lease timeout, kill and restart the broker, reconnect the worker's
+    /// heartbeat with its old lease id, then check the lease it gets, the
+    /// redelivery and the old claim's ack.
     #[test]
-    #[ignore = "bug: a restarted broker reclaims every claim on its first tick, before lease_timeout"]
-    fn test_restart_keeps_claims_of_workers_that_reconnect() {
+    fn test_restart_reclaims_claims_of_workers_that_reconnect() {
         let _guard = SIM_TIME_LOCK.lock().unwrap();
         let (dir, db_path) = crash_test_db_path("chaos_restart_lease");
         let config = broker_config(&db_path, LONG_TIMEOUT_SECS);
@@ -733,48 +730,54 @@ mod tests {
         before.kill();
 
         let after = BrokerProcess::start(config);
-        let outcome = workers.block_on(async {
+        workers.block_on(async {
             let client = connect(after.port).await;
-            let _heartbeat = Heartbeat::open_with_lease(&client, "worker", &old_lease).await;
-            tokio::time::sleep(Duration::from_secs_f64(RECOVERY_INTERVAL_SECS * 20.0)).await;
-            let worker = Worker {
-                id: "worker",
-                lease_id: &old_lease,
-            };
-            complete(&client, queue, &held, &worker, ack_action()).await
+            let heartbeat = Heartbeat::open_with_lease(&client, "worker", &old_lease).await;
+            assert_ne!(
+                heartbeat.lease_id, old_lease,
+                "a restarted broker honoured a lease from before the restart"
+            );
+            wait_for_pending(&client, queue, 1).await;
+            let worker = heartbeat.worker("worker");
+            assert_fenced(
+                complete(&client, queue, &held, &worker, ack_action()).await,
+                "ack of a claim made before the restart",
+            );
+            let redelivered = claim(&client, queue, &worker, 1).await.messages;
+            assert_eq!(ids_of(&redelivered), ids_of(&held));
+            assert!(redelivered.iter().all(|c| c.delivery_count == 2));
+            complete(&client, queue, &redelivered, &worker, ack_action())
+                .await
+                .unwrap();
         });
         after.kill();
         drop(workers);
         let _ = std::fs::remove_dir_all(&dir);
-        outcome.expect("the claim of a reconnected worker was reclaimed at the restart");
     }
 
     // =====================================================================
     // Configuration edges
     // =====================================================================
 
-    /// Goal: a recovery interval of zero still recovers dead workers' claims,
-    /// or is refused up front; it must not leave a broker serving with no
-    /// recovery at all. Method: start a broker with
-    /// `recovery_interval_secs = 0`, which the Python `BrokerConfig`
-    /// accepts, claim under a heartbeat, close it, and wait for the claim to
-    /// return. `tokio::time::interval` panics on a zero period inside the
-    /// spawned recovery task, which then dies without a trace.
+    /// Goal: a recovery interval of zero is refused up front; it must not
+    /// leave a broker serving with no recovery at all. Method: start a broker
+    /// with `recovery_interval_secs = 0`. Refusing beats running recovery
+    /// back to back: a zero interval is a configuration mistake, not a wish
+    /// to scan every claim in a busy loop, and a broker that refuses to start
+    /// says so where the operator looks, while one that panics only its
+    /// recovery task serves on and never reclaims a dead worker's claims.
     #[tokio::test]
-    #[ignore = "bug: recovery_interval_secs = 0 kills the recovery task; claims are never reclaimed"]
-    async fn test_zero_recovery_interval_still_recovers() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+    async fn test_zero_recovery_interval_is_refused_at_start() {
         let config = AnvilConfig {
             recovery_interval_secs: 0.0,
             ..broker_config("memory://", SHORT_TIMEOUT_SECS)
         };
-        let (_broker, client) = start_broker(config).await;
-        let queue = "no-recovery";
-        push(&client, queue, 1).await;
-        let heartbeat = Heartbeat::open(&client, "worker").await;
-        claim(&client, queue, &heartbeat.worker("worker"), 1).await;
-        drop(heartbeat);
-        wait_for_pending(&client, queue, 1).await;
+        let mut broker = AnvilBrokerInner::new(config).await.unwrap();
+        let error = broker.start().await.unwrap_err();
+        assert!(
+            error.to_string().contains("recovery_interval_secs"),
+            "{error}"
+        );
     }
 
     // =====================================================================
@@ -1150,11 +1153,10 @@ mod tests {
     /// Goal: a dead worker's claims return once its lease has gone
     /// `lease_timeout` without a heartbeat, even if the wall clock stepped
     /// backwards meanwhile, as an NTP correction does. Method: on simulated
-    /// time, a lease heartbeats, claims and dies; the clock steps back an
-    /// hour; then two lease timeouts pass. Leases are stamped with the wall
-    /// clock, so the dead lease looks alive for the hour the clock lost.
+    /// time, a lease heartbeats, claims and dies; the wall clock steps back
+    /// an hour; then two lease timeouts pass. Were leases stamped with the
+    /// wall clock, the dead lease would look alive for the hour it lost.
     #[tokio::test]
-    #[ignore = "bug: leases expire on the wall clock; a backward step keeps a dead worker's claims"]
     async fn test_backward_clock_step_does_not_extend_a_dead_lease() {
         const LEASE_TIMEOUT_SECS: f64 = 5.0;
 
@@ -1187,12 +1189,11 @@ mod tests {
 
     /// Goal: a live worker keeps its claims when the wall clock steps
     /// forwards. Method: on simulated time, a lease heartbeats every second
-    /// and claims; the clock jumps an hour ahead and recovery runs before
-    /// the next heartbeat, as it does when its tick lands first. Lease age
-    /// and claim age are both read off the wall clock, so the live worker
-    /// looks dead and its claim is taken from it.
+    /// and claims; the wall clock jumps an hour ahead and recovery runs
+    /// before the next heartbeat, as it does when its tick lands first. Were
+    /// lease age or claim age read off the wall clock, the live worker would
+    /// look dead and its claim would be taken from it.
     #[tokio::test]
-    #[ignore = "bug: leases expire on the wall clock; a forward step reclaims live workers' claims"]
     async fn test_forward_clock_step_keeps_a_live_lease() {
         const LEASE_TIMEOUT_SECS: f64 = 5.0;
 
@@ -1213,7 +1214,7 @@ mod tests {
             leases.update_lease("lease");
         }
 
-        advance_sim_time_secs(3600.0);
+        set_sim_time_nanos(SIM_EPOCH_NANOS + 3_600_000_000_000);
         let recovered = storage
             .recover_expired_claims(
                 LEASE_TIMEOUT_SECS,
@@ -1333,10 +1334,9 @@ mod tests {
 
     /// Goal: a bounded queue stays bounded after a broker restart. Method:
     /// fill a queue created with `max_pending = 2`, crash, reopen and push
-    /// once more. The limit lives only in memory, set by `create_queue`,
-    /// which nothing calls again after a restart.
+    /// once more. A limit kept only in memory, set by `create_queue`, would
+    /// be lost: nothing calls it again after a restart.
     #[test]
-    #[ignore = "bug: max_pending is kept only in memory, so a restart unbounds the queue"]
     fn test_bounded_queue_stays_bounded_across_restart() {
         let _guard = SIM_TIME_LOCK.lock().unwrap();
         let (dir, db_path) = crash_test_db_path("chaos_bounded");

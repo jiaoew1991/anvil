@@ -18,16 +18,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // === Simulated time (test-only) ===
 //
-// In test builds, `now_secs()` and `now_nanos()` check a global override so that
-// DST and time-sensitive tests can control the clock deterministically.
-// In release/production builds, they are direct wall-clock reads with zero overhead.
+// In test builds, `now_secs()`, `now_nanos()` and `mono_now()` check a global
+// override so that DST and time-sensitive tests can control both clocks
+// deterministically. In release/production builds, they are direct clock reads
+// with zero overhead.
 
 #[cfg(test)]
 static SIM_TIME_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Simulated monotonic time, in nanoseconds past `SIM_MONO_ORIGIN`; 0 while
+/// time is real.
+#[cfg(test)]
+static SIM_MONO_NANOS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static SIM_MONO_ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// Mutex to serialize tests that use simulated time.
 /// Acquire this lock before calling `set_sim_time_nanos` to prevent
@@ -35,18 +44,45 @@ static SIM_TIME_NANOS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub static SIM_TIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Set simulated time (nanoseconds since epoch). Pass 0 to restore real time.
+/// Set the simulated wall clock (nanoseconds since epoch). Pass 0 to restore
+/// real time on both clocks. Any other value steps the wall clock alone, as
+/// an NTP correction does: the monotonic clock freezes when simulation starts
+/// and then moves only with `advance_sim_time_secs`.
 /// IMPORTANT: Acquire `SIM_TIME_LOCK` before calling this in tests.
 #[cfg(test)]
 pub fn set_sim_time_nanos(nanos: u64) {
-    SIM_TIME_NANOS.store(nanos, Ordering::Release);
+    let was = SIM_TIME_NANOS.swap(nanos, Ordering::AcqRel);
+    if nanos == 0 {
+        SIM_MONO_NANOS.store(0, Ordering::Release);
+    } else if was == 0 {
+        SIM_MONO_NANOS.store(1, Ordering::Release);
+    }
 }
 
-/// Advance simulated time by the given number of seconds.
+/// Let the given number of seconds pass on both simulated clocks.
 #[cfg(test)]
 pub fn advance_sim_time_secs(secs: f64) {
     let delta = (secs * 1_000_000_000.0) as u64;
     SIM_TIME_NANOS.fetch_add(delta, Ordering::Release);
+    SIM_MONO_NANOS.fetch_add(delta, Ordering::Release);
+}
+
+/// The monotonic clock that times leases and claim ages: unlike the wall
+/// clock, it never steps, so an NTP correction can neither revive a dead
+/// lease nor kill a live one.
+#[cfg(not(test))]
+pub fn mono_now() -> Instant {
+    Instant::now()
+}
+
+/// The monotonic clock — test version with sim clock
+#[cfg(test)]
+pub fn mono_now() -> Instant {
+    let sim = SIM_MONO_NANOS.load(Ordering::Acquire);
+    if sim > 0 {
+        return *SIM_MONO_ORIGIN.get_or_init(Instant::now) + Duration::from_nanos(sim);
+    }
+    Instant::now()
 }
 
 /// Get current time as Unix timestamp (seconds with fractional part)
@@ -234,6 +270,39 @@ impl Default for AnvilConfig {
             acked_retention_secs: 3600.0,
             gc_interval_secs: 60.0,
         }
+    }
+}
+
+impl AnvilConfig {
+    /// Refuses a config the broker cannot run as asked. Every entry point,
+    /// Rust or Python, checks it before starting: a bad interval would
+    /// otherwise panic only the spawned recovery or GC task, leaving a broker
+    /// that serves with no recovery or no GC.
+    pub fn validate(&self) -> Result<(), String> {
+        // A non-positive timeout reclaims every claim on the first recovery
+        // tick, so the queue would redeliver work as fast as it hands it out,
+        // and a zero interval panics `tokio::time::interval`. NaN, negative,
+        // infinite and overflowing values are no `Duration` at all.
+        let positive = [
+            ("lease_timeout_secs", self.lease_timeout_secs),
+            ("claim_age_timeout_secs", self.claim_age_timeout_secs),
+            ("recovery_interval_secs", self.recovery_interval_secs),
+            ("gc_interval_secs", self.gc_interval_secs),
+        ];
+        for (name, secs) in positive {
+            match Duration::try_from_secs_f64(secs) {
+                Ok(duration) if !duration.is_zero() => {}
+                _ => return Err(format!("{name} must be a positive duration, got {secs}")),
+            }
+        }
+        // Zero retention is valid: acked messages go at the next GC pass.
+        if Duration::try_from_secs_f64(self.acked_retention_secs).is_err() {
+            return Err(format!(
+                "acked_retention_secs must be a non-negative duration, got {}",
+                self.acked_retention_secs
+            ));
+        }
+        Ok(())
     }
 }
 
