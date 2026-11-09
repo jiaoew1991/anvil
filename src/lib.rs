@@ -33,6 +33,8 @@ mod types;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
+mod chaos_worker;
+#[cfg(test)]
 mod dst;
 #[cfg(test)]
 mod fault_store;
