@@ -2,8 +2,8 @@ name: Release
 
 # A release is cut by pushing a v<version> tag on a commit of main whose
 # Cargo.toml and pyproject.toml already carry that version (see
-# scripts/bump-version.sh). The unit tests and the bench bars must pass,
-# then the wheels are built and the release is published with notes
+# scripts/bump-version.sh). The unit tests must pass and the bench must
+# not fall behind the previous release's, then the wheels are built and the release is published with notes
 # generated from the pull requests merged since the previous tag. Re-run a
 # failed release from the Actions tab, or with workflow_dispatch on the tag.
 on:

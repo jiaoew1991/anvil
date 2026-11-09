@@ -18,15 +18,14 @@ env:
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        # The bars guard against regressions on GitHub's 4-vCPU runners, at
-        # about 80% of the throughput first measured there (latency 8.4k
-        # keys/s, contention 9.3k): room for runner noise, while the kind of
-        # hot-path lock this is meant to catch cost a third. Revisit them once
-        # the daily runs show the real spread. The runner is CPU-bound well
+        # Each profile runs this code and the previous release alternately
+        # on one runner (scripts/bench-compare.sh): a shared runner's speed
+        # swings by close to half between jobs, so a fixed bar either misses
+        # regressions or fails on a slow machine. The runner is CPU-bound well
         # below production hardware, so it cannot check the 8.7k keys/s target
         # itself; that needs a 32-core host.
         include:
@@ -34,52 +33,39 @@ jobs:
           - profile: latency
             keys: 300000
             workers: 1000
-            keys_per_sec_min: 6700
-            ack_p99_ms_max: 300
+            ack_p99_ratio_max: 1.3
           # Enough workers to saturate the runner, so contention on the hot
           # path shows up as lost throughput.
           - profile: contention
             keys: 600000
             workers: 4000
-            keys_per_sec_min: 7400
-            ack_p99_ms_max: 0
+            ack_p99_ratio_max: 0
     name: bench (${{ matrix.profile }})
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The release tags, the baseline the bench compares with.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
-      - run: cargo test --release --locked --no-run
-      - name: Run worker profile
+      - name: Compare with the previous release
         env:
           ANVIL_BENCH_KEYS: ${{ matrix.keys }}
           ANVIL_BENCH_WORKERS: ${{ matrix.workers }}
           ANVIL_BENCH_CLAIM_BATCH: 1
-          ANVIL_BENCH_MIN_KEYS_PER_SEC: ${{ matrix.keys_per_sec_min }}
-          ANVIL_BENCH_MAX_ACK_P99_MS: ${{ matrix.ack_p99_ms_max }}
-        # A shared runner's throughput swings by close to half between runs
-        # of the same commit, so one slow run is retried on a fresh store; a
-        # regression misses the bar on both attempts.
+          KEYS_PER_SEC_RATIO_MIN: 0.85
+          ACK_P99_RATIO_MAX: ${{ matrix.ack_p99_ratio_max }}
         run: |
           ulimit -n "$(ulimit -Hn)"
           set -o pipefail
-          for attempt in 1 2; do
-            echo "=== attempt $attempt" | tee -a bench.log
-            db_dir=$(mktemp -d "$RUNNER_TEMP/anvil-bench.XXXXXX")
-            if ANVIL_BENCH_DB="file://$db_dir" \
-              cargo test --release --locked --lib bench_worker_profile -- --ignored --nocapture \
-              2>&1 | tee -a bench.log; then
-              exit 0
-            fi
-            rm -rf "$db_dir"
-          done
-          exit 1
+          scripts/bench-compare.sh 2>&1 | tee bench.log
       - name: Summarize
         if: always()
         run: |
           {
-            echo "### ${{ matrix.profile }}: bar ${{ matrix.keys_per_sec_min }} keys/s"
+            echo "### ${{ matrix.profile }}"
             echo '```'
-            grep -E "===|dispatch:|process:|panicked|below the bar|above the bar" bench.log || echo "no bench output"
+            grep -E "^===|^process:|panicked|^median|ratio|regressed|did not finish|no earlier" bench.log || echo "no bench output"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

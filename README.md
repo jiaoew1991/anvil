@@ -107,7 +107,8 @@ add no work to the request path.
    `git tag v0.3.0 origin/main && git push origin v0.3.0`.
 
 The tag starts the Release workflow. It refuses a tag that does not match the
-code's version or is not on `main`, runs the tests and the bench bars, builds
+code's version or is not on `main`, runs the tests, benches the code against
+the previous release on the same runner (`scripts/bench-compare.sh`), builds
 the wheels and publishes a GitHub release with generated notes.
 
 ## License
