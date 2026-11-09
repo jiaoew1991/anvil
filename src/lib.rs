@@ -47,6 +47,8 @@ mod dst;
 #[cfg(test)]
 mod fault_store;
 #[cfg(test)]
+mod format_compat;
+#[cfg(test)]
 mod gc_passes;
 #[cfg(test)]
 mod grpc_e2e;
