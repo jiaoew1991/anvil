@@ -87,6 +87,7 @@ A tag, once assigned, is never reused for another layout.
 | `0x08` | finished | `str(queue)` | empty |
 | `0x09` | queue group | `str(group)` | `QueueGroup` |
 | `0x0A` | state | `str(namespace) str(key)` | the caller's bytes |
+| `0x0B` | dead letter | `str(queue) str(msg_id)` | `DeadLetter` |
 
 For example, the pending key of seq 258 in queue `q:1` is
 `04 71 3a 31 00 01 00 00 00 00 00 00 01 02`, and the state key of namespace
@@ -107,6 +108,10 @@ named and no key of any other queue, group or namespace:
 - **A queue's acked entries in timestamp order**, and those acked before a
   cutoff (GC): from `0x07 str(queue)` up to, excluding,
   `0x07 str(queue) u64(cutoff_ns)`: one contiguous range.
+- **A queue's dead letters in msg_id order** (load, `ListDeadLetters`,
+  `delete_queue`): `0x0B str(queue)` as a prefix. Those after a msg_id start
+  at that msg_id's key followed by `0x00`, the first key past it, since
+  strings are prefix-free.
 - **A namespace's state keys starting with a prefix**:
   `0x0A str(namespace)` followed by the prefix escaped as a string, without
   the terminator. Escaping maps each byte on its own, so the escaped
@@ -123,18 +128,28 @@ named and no key of any other queue, group or namespace:
 - **Pending.** One key per message waiting to be claimed, at its seq. A push
   or a requeue (nack, reclaim) appends at the tail; a claim removes the key.
 - **Message.** The body of every message that is pending or claimed. An ack
-  deletes it with the claim.
+  deletes it with the claim, and so does a dead-lettering, whose dead letter
+  carries the body; a redrive writes it back.
 - **Claim.** One key per message claimed and not yet settled.
 - **Acked.** One empty key per ack, until GC removes it after the retention
   period.
 - **Finished.** Present once the queue is marked finished.
+- **Dead letter.** One key per message of the queue taken out of
+  circulation: a nack or reclaim settled its last allowed delivery, or a nack
+  asked for it. A message has at most one of a pending key, a claim key or a
+  dead letter key. A redrive deletes the dead letter and writes a pending key
+  and the body; a purge deletes it and merges one into the queue's total
+  acked, so that every message pushed is pending, claimed, acked or dead. A
+  store without the family has no dead letters, as every store written
+  before it existed.
 - **Queue group.** The group's partitions; its partition queues are ordinary
   queues.
 - **State.** The caller's key-value state, by namespace.
 
 No cursor or in-flight count is persisted: a loaded queue derives its claim
-cursor and push cursor from its oldest and newest pending keys and its
-claimed count from its claim keys. A persisted absolute value could be
+cursor and push cursor from its oldest and newest pending keys, its
+claimed count from its claim keys and its dead count from its dead letter
+keys. A persisted absolute value could be
 overtaken by an older one written by a concurrent writer, so only totals,
 which are merged, are persisted.
 
@@ -150,14 +165,22 @@ in `proto/anvil.proto`. The messages are:
 | Message | Value of | Notes |
 |---|---|---|
 | `StoreFormat` | the format marker | `version` is at least 1 |
-| `QueueRecord` | a queue | `max_pending` 0 is unbounded |
+| `QueueRecord` | a queue | `max_pending` 0 is unbounded; `max_deliveries`, when present, is the queue's delivery limit, 0 unlimited (below) |
 | `PendingEntry` | a pending key | `msg_id` is never empty; `delivery_count` counts earlier deliveries |
 | `StoredMessage` | a message key | the queue and msg_id are the key's, not repeated |
 | `ClaimRecord` | a claim key | the queue and msg_id are the key's; `claim_token` is never empty; `delivery_count` is at least 1 |
 | `QueueGroup` | a queue group key | the name is the key's; `partition_queues` has `num_partitions` entries |
+| `DeadLetter` | a dead letter key | the queue and msg_id are the key's; `message` is the `StoredMessage` body and is always present; `delivery_count` is at least 1; `cause` is never `DEAD_LETTER_CAUSE_UNSPECIFIED` |
 
 Protobuf leaves the order of map entries (`StoredMessage.metadata`) to the
 encoder; a reader must accept any order.
+
+`QueueRecord.max_deliveries` is a proto3 `optional` field, so its presence is
+stored apart from its value. Present, 0 included, it is the limit the queue
+set. Absent, it records only that the queue set none, which is what every
+record written before the field existed says; the limit such a queue gets is
+broker policy, the configured `default_max_deliveries`, not data. Adding the
+field changed no stored meaning, which is why it is a compatible change.
 
 ### 4.2 Totals
 
@@ -184,7 +207,8 @@ Compatible changes keep the version:
   when its absence (the proto3 default) means what the old code did;
 - adding a key family, under a fresh tag, when its absence has a defined
   meaning that matches every existing store (as an absent total reads as 0);
-- adding a protobuf message for a new family;
+- adding a protobuf message for a new family, and an enum for one of its
+  fields;
 - relaxing what a reader accepts.
 
 Every other change to what is stored is **breaking**, among them:
@@ -248,9 +272,12 @@ it cannot catch, so a reviewer must.
   state a queue can hold: pending, claimed, acked, nacked and reclaimed
   messages, a finished queue, a queue group with scattered partitions, state
   with `:` and NUL, a bounded queue, and acked entries inside and past
-  retention. The verifier (`format_compat_verify`) opens such a store and
-  checks counts, contents and behaviour: claims, acks with the writer's
-  tokens, redelivery, completion, GC and the bound. CI runs the writer of
+  retention; from scenario 2 on, dead letters of every cause, a queue with a
+  delivery limit and one with an unlimited one. The verifier
+  (`format_compat_verify`) opens such a store and checks counts, contents and
+  behaviour: claims, acks with the writer's tokens, redelivery, completion,
+  GC and the bound; that a queue without a limit of its own takes the
+  verifier's default; and the dead letters, their redrive and purge. CI runs the writer of
   every release tag that ships `src/format_compat.rs`, and of the current
   code, and the current verifier against each store.
 

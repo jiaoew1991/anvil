@@ -32,10 +32,16 @@ runs as the per-job broker embedded in the Ray driver.
   once: expect acks of claims made before the restart to fail with
   `FAILED_PRECONDITION`.
 - **Drain signal.** `claim` reports `upstream_drained` once a queue is marked
-  finished and empty.
+  finished and empty; dead letters count as settled.
 - **Delivery count.** Every claimed message carries `delivery_count`: 1 on
-  first delivery, plus one for each nack or reclaimed lease, so a worker can
-  park a poison message instead of retrying it forever.
+  first delivery, plus one for each nack or reclaimed lease.
+- **Dead letters.** A nack or reclaim that settles the last delivery a queue
+  allows (`max_deliveries` on `CreateQueue`, else the broker's
+  `default_max_deliveries`, 20; 0 is unlimited) moves the message to the
+  queue's dead letters instead, with its body, the cause and the last nack's
+  reason. A nack with `dead_letter=True` does so at once. Dead letters are
+  listed, redriven to pending with a fresh delivery count, or purged, which
+  counts them acked.
 
 See [docs/semantics.md](docs/semantics.md) for the full consistency and
 recovery model and the error codes of every RPC.
@@ -74,6 +80,11 @@ for message in messages:
         # Each chunk restarts the claim_age_timeout_secs window.
         client.renew("work", [message.msg_id], [message.claim_token])
     client.ack("work", [message.msg_id], claim_tokens=[message.claim_token])
+
+# Messages that failed every delivery wait as dead letters.
+for letter in client.list_dead_letters("work"):
+    print(letter.msg_id, letter.cause, letter.reason)
+client.redrive_dead_letters("work", [letter.msg_id])  # or purge_dead_letters
 ```
 
 ## Metrics
@@ -88,11 +99,13 @@ either variable, every instrument is a no-op. `service.name` defaults to
 | --- | --- | --- | --- |
 | `anvil.queue.pending` | gauge | `queue` | Messages waiting to be claimed |
 | `anvil.queue.claimed` | gauge | `queue` | Messages claimed, not yet acked or returned |
+| `anvil.queue.dead` | gauge | `queue` | Dead letters waiting for a redrive or a purge |
 | `anvil.queue.pushed` | counter | `queue` | Messages pushed since the queue was created |
-| `anvil.queue.acked` | counter | `queue` | Messages acked since the queue was created |
+| `anvil.queue.acked` | counter | `queue` | Messages acked since the queue was created, dead letters purged included |
 | `anvil.leases.active` | gauge | | Worker leases currently registered |
 | `anvil.messages.redelivered` | counter | `queue` | Claims of a message delivered before |
-| `anvil.claims.reclaimed` | counter | `queue` | Claims returned after a dead or aged-out lease |
+| `anvil.claims.reclaimed` | counter | `queue` | Claims taken back after a dead or aged-out lease, returned or dead-lettered |
+| `anvil.messages.dead_lettered` | counter | `queue`, `cause` | Messages dead-lettered; `cause` is `nack_limit`, `reclaim_limit` or `rejected` |
 | `anvil.gc.deleted` | counter | | Expired acked entries deleted |
 | `rpc.server.call.duration` | histogram (s) | `rpc.method`, `rpc.grpc.status_code` | Server-side RPC latency |
 
