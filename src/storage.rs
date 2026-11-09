@@ -425,6 +425,15 @@ impl AnvilStorage {
         let db_root = store_url.path().to_string();
         store_url.set_path("");
         let object_store = Db::resolve_object_store(store_url.as_str())?;
+        Self::open(db_root, object_store).await
+    }
+
+    /// Opens the database at `db_root` inside `object_store`. Tests reach the
+    /// store through this to put a fault-injecting one under the broker.
+    pub(crate) async fn open(
+        db_root: String,
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+    ) -> Result<Self, StorageError> {
         let db = Db::builder(db_root, object_store)
             .with_merge_operator(Arc::new(TotalSumMergeOperator))
             .build()

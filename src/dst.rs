@@ -48,7 +48,7 @@ pub(crate) mod tests {
 
     /// The operation types the simulator can execute.
     #[derive(Debug, Clone)]
-    enum Op {
+    pub(crate) enum Op {
         Push {
             queue_idx: usize,
         },
@@ -79,17 +79,17 @@ pub(crate) mod tests {
         },
     }
 
-    struct DstSimulator {
+    pub(crate) struct DstSimulator {
         storage: AnvilStorage,
         rng: StdRng,
-        queues: Vec<String>,
+        pub(crate) queues: Vec<String>,
         num_workers: usize,
         workers: Vec<WorkerState>,
         lease_ids: Vec<String>,
         /// Every (queue, msg_id) whose push or forward returned success.
-        pushed: HashSet<(String, String)>,
+        pub(crate) pushed: HashSet<(String, String)>,
         /// Every (queue, msg_id) whose ack returned success.
-        acked: HashSet<(String, String)>,
+        pub(crate) acked: HashSet<(String, String)>,
     }
 
     impl DstSimulator {
@@ -98,7 +98,7 @@ pub(crate) mod tests {
             Self::with_storage(storage, seed, num_queues, num_workers).await
         }
 
-        async fn with_storage(
+        pub(crate) async fn with_storage(
             storage: AnvilStorage,
             seed: u64,
             num_queues: usize,
@@ -145,7 +145,7 @@ pub(crate) mod tests {
             set_sim_time_nanos(1_735_689_600_000_000_000);
         }
 
-        fn generate_ops(&mut self, count: usize) -> Vec<Op> {
+        pub(crate) fn generate_ops(&mut self, count: usize) -> Vec<Op> {
             let mut ops = Vec::with_capacity(count);
             for _ in 0..count {
                 let op = match self.rng.random_range(0u32..10) {
@@ -192,7 +192,7 @@ pub(crate) mod tests {
             ops
         }
 
-        async fn execute(&mut self, op: Op) {
+        pub(crate) async fn execute(&mut self, op: Op) {
             match op {
                 Op::Push { queue_idx } => {
                     let queue = &self.queues[queue_idx];
