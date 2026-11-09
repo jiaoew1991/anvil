@@ -601,7 +601,7 @@ impl AnvilRustClient {
     /// Returns messages for retry, or dead-letters them: at once with
     /// `dead_letter=True`, or when this was the last delivery their queue
     /// allows. `reason` is kept with any message dead-lettered.
-    #[pyo3(signature = (queue, msg_ids, claim_tokens=None, reason="processing_failed".to_string(), delay_ms=0, state_namespace=None, state_puts=None, state_deletes=None, dead_letter=false))]
+    #[pyo3(signature = (queue, msg_ids, claim_tokens=None, reason="processing_failed".to_string(), state_namespace=None, state_puts=None, state_deletes=None, dead_letter=false))]
     #[allow(clippy::too_many_arguments)]
     fn nack(
         &self,
@@ -610,7 +610,6 @@ impl AnvilRustClient {
         msg_ids: Vec<String>,
         claim_tokens: Option<Vec<String>>,
         reason: String,
-        #[allow(unused_variables)] delay_ms: i32,
         state_namespace: Option<String>,
         state_puts: Option<HashMap<String, Vec<u8>>>,
         state_deletes: Option<Vec<String>>,
