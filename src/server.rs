@@ -96,6 +96,7 @@ impl AnvilBrokerInner {
 
     /// Start the gRPC server
     pub async fn start(&mut self) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+        self.config.validate()?;
         // No startup recovery needed - storage is the source of truth!
         // Just start background tasks.
 
@@ -108,7 +109,11 @@ impl AnvilBrokerInner {
         self.gauges = BrokerGauges::register(&self.storage, &self.state);
 
         // Create gRPC service
-        let service = AnvilService::new(self.state.clone(), self.storage.clone());
+        let service = AnvilService::new(
+            self.state.clone(),
+            self.storage.clone(),
+            self.config.lease_timeout_secs,
+        );
 
         // Bind to address
         let addr: SocketAddr = format!("{}:{}", self.config.host, self.config.port)
@@ -141,7 +146,11 @@ impl AnvilBrokerInner {
         // Spawn server task with HTTP2 keepalive settings
         tokio::spawn(async move {
             if let Err(e) = Server::builder()
-                // HTTP2 keepalive: ping every 10s, timeout after 20s without response
+                // HTTP2 keepalive: ping every 10s, timeout after 20s without
+                // response. It only frees connections to dead peers: a worker
+                // whose connection it drops reconnects and keeps its lease
+                // (see `heartbeat_stream`), so it need not track
+                // `lease_timeout_secs`.
                 .http2_keepalive_interval(Some(Duration::from_secs(10)))
                 .http2_keepalive_timeout(Some(Duration::from_secs(20)))
                 // Allow keepalive pings even without active streams

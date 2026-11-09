@@ -22,7 +22,15 @@ runs as the per-job broker embedded in the Ray driver.
   claim neither taken nor renewed within `claim_age_timeout_secs` under a live
   lease is treated as stuck. A task that may run longer renews its claim from
   its processing loop (`renew`), so it is reclaimed only once it stops making
-  progress.
+  progress. A worker whose stream or connection drops keeps its lease, and its
+  claims, if it reconnects within `lease_timeout_secs`; later, it is given a
+  new lease. Both timeouts run on the broker's monotonic clock, so a wall-clock
+  step neither revives a dead lease nor kills a live one.
+- **Broker restarts reclaim every claim.** Leases live in the broker's memory.
+  After a broker restart, every claim in flight is returned to pending and
+  redelivered with `delivery_count + 1`, even to a worker that reconnects at
+  once: expect acks of claims made before the restart to fail with
+  `FAILED_PRECONDITION`.
 - **Drain signal.** `claim` reports `upstream_drained` once a queue is marked
   finished and empty.
 - **Delivery count.** Every claimed message carries `delivery_count`: 1 on

@@ -37,8 +37,17 @@ pending:{queue}:{seq:020d}            → PendingEntry protobuf {msg_id, deliver
 msg:{queue}:{msg_id}                  → StoredMessage protobuf (deleted on ack)
 claimed:{queue}:{msg_id}              → ClaimInfo JSON
 acked:{queue}:{ts:020d}:{msg_id}      → ""
-state:{namespace}:{key}               → value bytes
+state:{namespace}:{key}               → value bytes (namespace has no ':')
+max_pending:{queue}                   → u64 LE, bound of a bounded queue
 ```
+
+A state namespace with ':' is refused rather than escaped: `job:a`/`k` and
+`job`/`a:k` would share a key, and escaping would move existing keys.
+
+`max_pending:{queue}` is written with the queue (or by an idempotent create
+that names a bound) and loaded with its counters, so a restart keeps the bound.
+Its prefix is distinct from `seq_push:` and `pending:`, so `list_queues` and
+the pending scans never see it.
 
 `meta:{queue}`, `seq_claim:{queue}`, `cnt_total_claimed:{queue}` and
 `cnt_total_unclaimed:{queue}` are legacy: read for migration or deleted with
@@ -64,7 +73,31 @@ Ack, nack and reclaim each read a claim and then write its outcome. Every one
 must hold the claim between the two (`validate_claims` returns the
 `SettlementHold`; `reclaim_messages` takes it and re-reads the token), so a
 second settlement of the same message is fenced instead of acking it twice or
-requeueing it after its ack.
+requeueing it after its ack. The hold is keyed by the claim and the token
+presented: only settlements presenting the current token can pass the check,
+so they are the ones that must exclude each other, and a stale token never
+holds the claim its owner is settling.
+
+A forward or scatter reserves its downstream seqs only after the claims it
+settles are verified: a refused one must leave the downstream queue as it was.
+
+### Cancellation and deletion
+
+A client deadline drops the request's future at any await, so no operation may
+leave memory and keys apart when it stops at one. Every write goes through
+`commit`, which runs `Db::write` in a task of its own together with what the
+write releases (`Landing`): the settlement hold, the push reservation, and the
+retirement of what it settled, which happens only once the batch is applied
+(visible to every read; the caller then waits for durability).
+Work-adding counters move when the work is reserved, so a queue never looks
+drained while a write is in flight. A claim cancelled before its write returns
+its seqs (`QueueState::returned`) for the next claim to take.
+
+Every write to a queue is admitted first (`QueueWrite`), and `delete_queue`
+waits for the admitted ones while it holds `counters_loading`, so no write of
+an operation that loaded the old counters lands after the delete. An admitted
+write must therefore never wait for `counters_loading`: an operation that
+writes several queues loads all their counters before admitting any write.
 
 ### Errors
 
@@ -72,10 +105,18 @@ A failure the caller caused is a `storage::Rejection`, never a
 `SlateError::invalid` string: `Fenced` for a claim the caller no longer holds
 (token, lease or worker mismatch, not claimed, settling), `NotFound`,
 `InvalidArgument` and `QueueFull`. `service::storage_status` is the one place a
-storage error becomes a gRPC status; it recognizes a `Rejection` by type and
-maps everything else to `INTERNAL`. A worker drops a message on
-`FAILED_PRECONDITION` and retries on `INTERNAL`, so a new fencing check that
-returns anything but `Rejection::Fenced` makes it retry what cannot succeed.
+storage error becomes a gRPC status; it recognizes a `Rejection` by type, maps
+a closed database (`storage::is_closed`: fenced by a newer broker, or stopped
+by a failed background task) to `UNAVAILABLE`, and everything else to
+`INTERNAL`. A worker drops a message on `FAILED_PRECONDITION`, fails over on
+`UNAVAILABLE` and retries on `INTERNAL`, so a new fencing check that returns
+anything but `Rejection::Fenced` makes it retry what cannot succeed.
+
+A request malformed on its face (empty queue name, unpaired or repeated
+msg_ids, a bad state namespace) is refused in `service.rs` before it reaches
+storage. `AnvilConfig::validate` is the one check of a broker config; the
+Python `BrokerConfig`, `AnvilBroker.start` and `AnvilBrokerInner::start` all
+call it, so a bad duration is refused before any background task starts.
 
 ### Queue creation
 

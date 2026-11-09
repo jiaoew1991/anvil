@@ -389,7 +389,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("[{queue}] stats did not settle within {WAIT_DEADLINE:?}"))
         }
 
-        fn lease_last_seen(&self, lease_id: &str) -> Option<f64> {
+        fn lease_last_seen(&self, lease_id: &str) -> Option<Instant> {
             self.inner.state.lease_snapshot().get(lease_id).copied()
         }
     }
@@ -761,14 +761,7 @@ mod tests {
     /// `HeartbeatStream` within 50 ms, naming its lease in the pings. It
     /// then pings without a gap for three lease timeouts and acks with the
     /// lease it holds.
-    ///
-    /// The broker mints a new lease for every `HeartbeatStream` and ignores
-    /// the lease a ping names (`service.rs`, `heartbeat_stream`). The worker
-    /// adopts the new lease from the first pong, so its ack is refused with
-    /// `lease_id mismatch`, and the old lease, no longer pinged, expires and
-    /// takes the claim back although the worker never missed a heartbeat.
     #[tokio::test]
-    #[ignore = "bug: a heartbeat reconnect mints a new lease, fencing every claim the live worker holds"]
     async fn test_heartbeat_reconnect_keeps_lease() {
         let _clock = real_clock();
         let lease_timeout = Duration::from_millis(800);
@@ -809,17 +802,11 @@ mod tests {
     /// keeps the lease, as the contract promises, whatever the stall's
     /// length. Method: with a 60 s lease timeout, stall a worker's upstream
     /// for 31 s, heal it, and check the worker still holds its lease and its
-    /// claim.
-    ///
-    /// The broker ends a `HeartbeatStream` that is silent for a fixed 30 s
-    /// (`HEARTBEAT_TIMEOUT` in `service.rs`), and its HTTP/2 keepalive drops
-    /// the connection after 10 s + 20 s without a ping ack, whatever
-    /// `lease_timeout_secs` is. The worker reconnects to a new lease (see
-    /// `test_heartbeat_reconnect_keeps_lease`), so any stall between 30 s and
-    /// the lease timeout, the default 60 s included, loses every claim. Takes
-    /// 35 s.
+    /// claim. The stall outlasts the broker's HTTP/2 keepalive (10 s + 20 s
+    /// without a ping ack), which drops the connection, so the worker keeps
+    /// its lease only because a reconnect within the lease timeout does.
     #[tokio::test]
-    #[ignore = "bug: a heartbeat stall over 30 s ends the stream and its lease, even under a longer lease_timeout_secs"]
+    #[ignore = "slow: stalls a heartbeat for 31 s while holding the global clock lock; run with --ignored"]
     async fn test_heartbeat_stall_within_lease_timeout_keeps_lease() {
         let _clock = real_clock();
         let broker = Broker::start(60.0, LONG_TIMEOUT_SECS).await;
@@ -854,42 +841,43 @@ mod tests {
     }
 
     /// Goal: the broker forgets a lease once it has expired, so workers that
-    /// come and go, or reconnect, do not grow its lease table without bound.
-    /// Method: one worker's heartbeat connection is reset 20 times, each
-    /// reconnect registering a lease; once every replaced lease is several
-    /// lease timeouts old, at most the live lease may remain.
-    ///
-    /// `AnvilState::leases` only ever gains entries: nothing removes a lease,
-    /// so the table, every recovery tick's `lease_snapshot` copy of it and
-    /// the `anvil.leases.active` gauge grow with every heartbeat stream ever
-    /// opened.
+    /// come and go do not grow its lease table, its recovery tick's copy of
+    /// it or the `anvil.leases.active` gauge without bound, while a worker
+    /// that keeps reconnecting keeps its one lease. Method: reset a live
+    /// worker's heartbeat connection 20 times while 20 other workers each
+    /// open a lease and die; once the dead leases are several lease timeouts
+    /// old, only the live worker's lease may remain.
     #[tokio::test]
-    #[ignore = "bug: expired leases are never removed, so the lease table grows with every heartbeat stream"]
     async fn test_expired_leases_are_forgotten() {
         let _clock = real_clock();
         let lease_timeout = Duration::from_millis(300);
         let broker = Broker::start(lease_timeout.as_secs_f64(), LONG_TIMEOUT_SECS).await;
         let proxy = FaultProxy::start(broker.addr, 15).await;
-        let heartbeat = Heartbeat::start(
-            channel(&proxy.url()),
-            "worker",
-            Duration::from_millis(50),
-            Duration::from_millis(10),
-        )
-        .await;
+        let interval = Duration::from_millis(50);
+        let reconnect_delay = Duration::from_millis(10);
+        let live =
+            Heartbeat::start(channel(&proxy.url()), "worker", interval, reconnect_delay).await;
+        let lease_id = live.lease_id();
+        let direct = channel(&format!("http://{}", broker.addr));
         for reconnects in 1..=20 {
             proxy.reset();
-            wait_until("heartbeat reconnected", || heartbeat.streams() > reconnects).await;
-            wait_until("new lease", || {
-                broker.inner.state.lease_snapshot().len() as u64 > reconnects
-            })
-            .await;
+            wait_until("heartbeat reconnected", || live.streams() > reconnects).await;
+            Heartbeat::start(
+                direct.clone(),
+                &format!("dead-{reconnects}"),
+                interval,
+                reconnect_delay,
+            )
+            .await
+            .kill();
         }
         tokio::time::sleep(lease_timeout * 4).await;
 
+        assert_eq!(live.lease_id(), lease_id, "a reconnect changed the lease");
         let leases = broker.inner.state.lease_snapshot();
-        assert!(
-            leases.len() <= 1,
+        assert_eq!(
+            leases.keys().collect::<Vec<_>>(),
+            [&lease_id],
             "{} leases registered for one live worker",
             leases.len()
         );

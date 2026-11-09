@@ -20,15 +20,26 @@
 
 use dashmap::DashMap;
 use std::collections::HashMap;
+use std::time::Instant;
 
-use crate::types::now_secs;
+use crate::types::mono_now;
+
+/// Whether a lease last seen at `last_seen` has gone more than
+/// `lease_timeout_secs` without a heartbeat. The one liveness rule shared by
+/// recovery, which reclaims a dead lease's claims, and pruning, which forgets
+/// the lease.
+pub fn lease_expired(last_seen: Instant, now: Instant, lease_timeout_secs: f64) -> bool {
+    now.saturating_duration_since(last_seen).as_secs_f64() > lease_timeout_secs
+}
 
 /// Anvil coordination state - minimal, no message storage
 pub struct AnvilState {
     /// Known queue names (for stats listing)
     queues: DashMap<String, ()>,
-    /// Lease last-seen timestamps (seconds since epoch)
-    leases: DashMap<String, f64>,
+    /// When each lease was last seen, on the monotonic clock. Only the broker
+    /// mints lease ids, and a lease absent from this table is dead: recovery
+    /// reclaims its claims, and a worker presenting it gets a new lease.
+    leases: DashMap<String, Instant>,
 }
 
 impl AnvilState {
@@ -60,13 +71,51 @@ impl AnvilState {
         self.queues.iter().map(|e| e.key().clone()).collect()
     }
 
-    /// Update lease heartbeat timestamp.
+    /// The lease for a heartbeat stream whose first ping presents
+    /// `presented`: the same lease while the table still holds it, so a
+    /// worker that reconnects keeps its claims, else a new one. A lease the
+    /// table no longer holds stays dead: after recovery prunes it, or after a
+    /// broker restart empties the table, its claims are reclaimed whatever
+    /// the worker presents.
+    pub fn open_lease(&self, presented: &str) -> String {
+        if self.renew_lease(presented) {
+            return presented.to_string();
+        }
+        let lease_id = uuid::Uuid::now_v7().to_string();
+        let replaced = self.leases.insert(lease_id.clone(), mono_now());
+        assert!(replaced.is_none(), "minted lease {lease_id} twice");
+        lease_id
+    }
+
+    /// Records a heartbeat for `lease_id`. Returns false, and records
+    /// nothing, once the lease has been pruned: a stray ping must not revive
+    /// it. Takes no allocation, as it runs on every ping.
+    pub fn renew_lease(&self, lease_id: &str) -> bool {
+        let Some(mut last_seen) = self.leases.get_mut(lease_id) else {
+            return false;
+        };
+        *last_seen = mono_now();
+        true
+    }
+
+    /// Registers `lease_id` as seen now, for tests that drive leases with
+    /// their own ids and without a heartbeat stream.
+    #[cfg(test)]
     pub fn update_lease(&self, lease_id: &str) {
-        self.leases.insert(lease_id.to_string(), now_secs());
+        self.leases.insert(lease_id.to_string(), mono_now());
+    }
+
+    /// Forgets every expired lease. Safe at any time: recovery treats a
+    /// lease missing from the table as dead, so its claims are still
+    /// reclaimed, and `renew_lease` never brings it back.
+    pub fn prune_leases(&self, lease_timeout_secs: f64) {
+        let now = mono_now();
+        self.leases
+            .retain(|_, last_seen| !lease_expired(*last_seen, now, lease_timeout_secs));
     }
 
     /// Get a snapshot of all leases (lease_id -> last_seen).
-    pub fn lease_snapshot(&self) -> HashMap<String, f64> {
+    pub fn lease_snapshot(&self) -> HashMap<String, Instant> {
         self.leases
             .iter()
             .map(|entry| (entry.key().clone(), *entry.value()))
@@ -106,6 +155,44 @@ mod tests {
         let deleted = state.delete_queue("test-queue");
         assert!(deleted);
         assert!(!state.queue_exists("test-queue"));
+    }
+
+    /// A reconnect presenting a held lease keeps it; an unknown or pruned
+    /// lease gets a new one; pruning forgets only expired leases, and a
+    /// pruned lease cannot be renewed back to life.
+    #[test]
+    fn test_lease_lifecycle() {
+        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SIM_TIME_LOCK};
+        const LEASE_TIMEOUT_SECS: f64 = 5.0;
+
+        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        set_sim_time_nanos(1_735_689_600_000_000_000);
+        let state = AnvilState::new();
+
+        let held = state.open_lease("");
+        assert_eq!(state.open_lease(&held), held);
+        let unknown = state.open_lease("from-before-a-restart");
+        assert_ne!(unknown, "from-before-a-restart");
+
+        advance_sim_time_secs(LEASE_TIMEOUT_SECS);
+        assert!(state.renew_lease(&held));
+        state.prune_leases(LEASE_TIMEOUT_SECS);
+        assert_eq!(
+            state.lease_snapshot().len(),
+            2,
+            "pruned a lease at its timeout"
+        );
+
+        advance_sim_time_secs(0.001);
+        state.prune_leases(LEASE_TIMEOUT_SECS);
+        assert_eq!(state.lease_snapshot().keys().collect::<Vec<_>>(), [&held]);
+        assert!(!state.renew_lease(&unknown), "renewed a pruned lease");
+        assert_ne!(
+            state.open_lease(&unknown),
+            unknown,
+            "reopened a pruned lease"
+        );
+        set_sim_time_nanos(0);
     }
 
     #[test]
