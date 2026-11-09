@@ -27,39 +27,22 @@ A single `scan_claimed()` call with 1M claimed messages can block the server for
 
 ## 2. Current Data Model
 
-### Key Schema
+### Storage Format
 
-```
-seq_push:{queue}                      → u64 LE, marks the queue as created
-cnt_total_pushed:{queue}              → u64 LE, lifetime total (merge-summed)
-cnt_total_acked:{queue}               → u64 LE, lifetime total (merge-summed)
-pending:{queue}:{seq:020d}            → PendingEntry protobuf {msg_id, delivery_count}
-msg:{queue}:{msg_id}                  → StoredMessage protobuf (deleted on ack)
-claimed:{queue}:{msg_id}              → ClaimInfo JSON
-acked:{queue}:{ts:020d}:{msg_id}      → ""
-state:{namespace}:{key}               → value bytes (namespace has no ':')
-max_pending:{queue}                   → u64 LE, bound of a bounded queue
-```
-
-A state namespace with ':' is refused rather than escaped: `job:a`/`k` and
-`job`/`a:k` would share a key, and escaping would move existing keys.
-
-`max_pending:{queue}` is written with the queue (or by an idempotent create
-that names a bound) and loaded with its counters, so a restart keeps the bound.
-Its prefix is distinct from `seq_push:` and `pending:`, so `list_queues` and
-the pending scans never see it.
-
-`meta:{queue}`, `seq_claim:{queue}`, `cnt_total_claimed:{queue}` and
-`cnt_total_unclaimed:{queue}` are legacy: read for migration or deleted with
-the queue, never written.
+[docs/storage-format.md](docs/storage-format.md) is the normative spec of
+every key and value in the store: the format version and the open-time
+rules, the key families and their byte layout, the value schemas, which
+changes are compatible, and how a breaking one is made. `src/keys.rs` is the
+only code that builds or parses a key, and `src/format.rs` with
+`proto/storage.proto` the only code that encodes a value; a change to either
+is a format change and follows the spec.
 
 ### Counters and restart
 
 Queue counters live in memory (`QueueState`) and are authoritative while the
 broker runs. On load, `load_or_init_counters` derives what must be exact from
-the keys: `claim_seq` is the oldest pending key, `push_seq` is past both the
-newest pending key and `seq_push`, and the in-flight count is the number of
-claimed keys. Only the lifetime totals are read as persisted.
+the keys: `claim_seq` is the oldest pending key, `push_seq` is past the
+newest one, and the in-flight count is the number of claimed keys. Only the lifetime totals are read as persisted.
 
 Never persist a counter as an absolute value. Concurrent writers compute their
 values under a lock but reach the WAL in any order, so an older value can land
@@ -129,10 +112,10 @@ an unknown queue cannot bring it into existence; a new read path must too.
 
 | Operation | How | Complexity |
 |-----------|-----|------------|
-| `push` | Increment `push_seq`, write to `pending:{queue}:{seq}` | O(1) |
+| `push` | Increment `push_seq`, write the pending key at `seq` | O(1) |
 | `claim` | Read from `claim_seq` to `claim_seq + batch_size`, increment `claim_seq` | O(batch_size) |
-| `ack` | Delete `claimed:{queue}:{msg_id}`, write `acked:{queue}:{ts}:{msg_id}` | O(batch_size) |
-| `nack` | Delete `claimed:{queue}:{msg_id}`, append to `pending:{queue}:{push_seq}` | O(batch_size) |
+| `ack` | Delete the claim and the body, write the acked key at `ts` | O(batch_size) |
+| `nack` | Delete the claim, append a pending key at `push_seq` | O(batch_size) |
 | `state_get` | Direct key lookup | O(keys) |
 | `state_put` | Direct key write | O(keys) |
 
@@ -204,14 +187,17 @@ The following operations use scan but run infrequently, so O(n) is acceptable:
 
 ## 5. Key Schema Design Principles
 
+Keys below are written as `family(field, ...)`, the tuples of
+[docs/storage-format.md](docs/storage-format.md).
+
 ### Principle 1: Hot Path Keys Support Direct Access
 
 ```
 # Good: Direct lookup by known key
-msg:{queue}:{msg_id} → Message
+message(queue, msg_id) → StoredMessage
 
 # Bad: Requires scan to find
-msg:{queue}:{timestamp}:{msg_id} → Message  # Can't lookup by msg_id directly
+message(queue, timestamp, msg_id) → StoredMessage  # Can't lookup by msg_id directly
 ```
 
 ### Principle 2: Secondary Indexes for Query Patterns
@@ -220,20 +206,20 @@ If you need to query by multiple dimensions, add secondary indexes:
 
 ```
 # Primary: lookup by msg_id
-claimed:{queue}:{msg_id} → ClaimInfo
+claim(queue, msg_id) → ClaimRecord
 
 # Secondary: query by expiry time (for recovery)
-claim_exp:{queue}:{expires_at}:{msg_id} → ""
+claim_exp(queue, expires_at, msg_id) → empty
 ```
 
 ### Principle 3: Time-Ordered Keys Enable Range Deletion
 
 ```
 # Good: can range-delete old entries
-acked:{queue}:{timestamp}:{msg_id} → ""
+acked(queue, timestamp, msg_id) → empty
 
 # Bad: can't efficiently delete old entries
-acked:{queue}:{msg_id} → {timestamp, ...}
+acked(queue, msg_id) → {timestamp, ...}
 ```
 
 ### Principle 4: Counters for Cardinality
@@ -325,7 +311,7 @@ pub async fn push_with_dedup(
     business_key: &str,
     msg: &Message,
 ) -> Result<(Option<String>, bool), StorageError> {
-    let dedup_key = Self::dedup_key(queue, business_key);
+    let dedup_key = keys::dedup(queue, business_key);
 
     // O(1) check: does this business_key already exist?
     if self.db.get(&dedup_key).await?.is_some() {
@@ -341,9 +327,8 @@ pub async fn push_with_dedup(
     Ok((Some(msg.msg_id.clone()), false))
 }
 
-fn dedup_key(queue: &str, business_key: &str) -> Vec<u8> {
-    format!("dedup:{}:{}", queue, business_key).into_bytes()
-}
+// In src/keys.rs, as a new family (a compatible format change):
+// a fresh tag, then str(queue) str(business_key).
 ```
 
 **Design considerations:**

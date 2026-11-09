@@ -2,14 +2,22 @@
 
 Exercises the Python bindings end to end: start a broker on a temporary
 file:// store, push, claim, check the delivery count, renew, ack, see a
-second ack fenced, and stop.
+second ack fenced, stop, and reopen the store, which now carries the format
+marker, directly.
 """
 
 import sys
 import tempfile
 import time
 
-from anvil_py import AnvilBroker, AnvilRustClient, BrokerConfig, ClaimLostError
+from anvil_py import (
+    AnvilBroker,
+    AnvilRustClient,
+    AnvilStorageReader,
+    BrokerConfig,
+    ClaimLostError,
+    StorageFormatError,
+)
 
 DEADLINE_SECS = 30.0
 
@@ -56,6 +64,12 @@ def main():
 
         client.stop()
         broker.stop()
+
+        reader = AnvilStorageReader(f"file://{db_dir}")
+        assert reader.list_queues() == ["work"], reader.list_queues()
+    # A store this release cannot read raises a RuntimeError like any other
+    # failure to open, so existing handlers still catch it.
+    assert issubclass(StorageFormatError, RuntimeError)
     print("smoke ok")
 
 

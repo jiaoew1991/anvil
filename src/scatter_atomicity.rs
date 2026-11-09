@@ -67,7 +67,7 @@ mod tests {
                 "{}/{}/{}/{}",
                 self.upstream_id, self.count, self.index, self.queue
             );
-            Message::new(self.queue.clone(), payload.into_bytes())
+            Message::new(payload.into_bytes())
         }
 
         fn decode(payload: &[u8]) -> Self {
@@ -108,8 +108,6 @@ mod tests {
     #[test]
     fn test_ack_and_scatter_commits_every_effect_across_reopen() {
         let (dir, db_path) = crash_test_db_path("scatter_reopen");
-        let to_partition =
-            |pid: u32, payload: &[u8]| Message::new(partition_queue(pid), payload.to_vec());
 
         let crashed = tokio::runtime::Runtime::new().unwrap();
         let (storage, scattered_id, held_id) = crashed.block_on(async {
@@ -125,9 +123,7 @@ mod tests {
                 .state_put_batch(DONE_NAMESPACE, &stale, &[])
                 .await
                 .unwrap();
-            let inputs: Vec<Message> = (0u8..2)
-                .map(|i| Message::new(UPSTREAM.to_string(), vec![i]))
-                .collect();
+            let inputs: Vec<Message> = (0u8..2).map(|i| Message::new(vec![i])).collect();
             storage.push_messages(UPSTREAM, &inputs).await.unwrap();
             let claimed = storage
                 .claim_messages(UPSTREAM, 2, "worker", "lease")
@@ -145,8 +141,14 @@ mod tests {
                     "lease",
                     GROUP,
                     &[
-                        (0, vec![to_partition(0, b"p0-a"), to_partition(0, b"p0-b")]),
-                        (2, vec![to_partition(2, b"p2-a")]),
+                        (
+                            0,
+                            vec![
+                                Message::new(b"p0-a".to_vec()),
+                                Message::new(b"p0-b".to_vec()),
+                            ],
+                        ),
+                        (2, vec![Message::new(b"p2-a".to_vec())]),
                     ],
                     Some(DONE_NAMESPACE),
                     Some(&puts),
@@ -166,8 +168,8 @@ mod tests {
                     "lease",
                     GROUP,
                     &[
-                        (1, vec![to_partition(1, b"refused")]),
-                        (PARTITIONS, vec![to_partition(1, b"refused")]),
+                        (1, vec![Message::new(b"refused".to_vec())]),
+                        (PARTITIONS, vec![Message::new(b"refused".to_vec())]),
                     ],
                     Some(DONE_NAMESPACE),
                     Some(&refused_puts),
@@ -183,7 +185,7 @@ mod tests {
                     "worker",
                     "lease",
                     GROUP,
-                    &[(1, vec![to_partition(1, b"refused")])],
+                    &[(1, vec![Message::new(b"refused".to_vec())])],
                     Some(DONE_NAMESPACE),
                     Some(&refused_puts),
                     None,
@@ -309,7 +311,7 @@ mod tests {
                     tokio::spawn(async move {
                         loop {
                             let batch: Vec<Message> = (0..PUSH_BATCH)
-                                .map(|_| Message::new(UPSTREAM.to_string(), b"in".to_vec()))
+                                .map(|_| Message::new(b"in".to_vec()))
                                 .collect();
                             storage.push_messages(UPSTREAM, &batch).await.unwrap();
                             pushed.lock().unwrap().extend(

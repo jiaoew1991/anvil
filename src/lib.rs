@@ -22,6 +22,8 @@ use std::thread::JoinHandle;
 use tokio::runtime::Runtime;
 
 pub mod client;
+mod format;
+mod keys;
 mod metrics;
 mod recovery;
 mod server;
@@ -45,6 +47,8 @@ mod dst;
 #[cfg(test)]
 mod fault_store;
 #[cfg(test)]
+mod format_compat;
+#[cfg(test)]
 mod gc_passes;
 #[cfg(test)]
 mod grpc_e2e;
@@ -53,9 +57,30 @@ mod scatter_atomicity;
 #[cfg(test)]
 mod storage_faults;
 
+use format::FormatError;
 use server::AnvilBrokerInner;
-use storage::AnvilStorage;
+use storage::{AnvilStorage, StorageError};
 use types::AnvilConfig;
+
+pyo3::create_exception!(
+    anvil_py,
+    StorageFormatError,
+    pyo3::exceptions::PyRuntimeError,
+    "The store has a storage format this release cannot open: it was written \
+     by an unversioned release (0.3.0 or earlier) or by a newer one. Nothing \
+     was changed in it. A RuntimeError, like every other failure to open."
+);
+
+/// The exception for a store that failed to open, telling a format this
+/// release cannot read from a store it could not reach.
+fn open_error(db_path: &str, e: StorageError) -> PyErr {
+    let message = format!("Failed to open storage {db_path}: {e}");
+    if e.is::<FormatError>() {
+        StorageFormatError::new_err(message)
+    } else {
+        pyo3::exceptions::PyRuntimeError::new_err(message)
+    }
+}
 
 /// Broker error type exposed to Python
 #[pyclass]
@@ -222,6 +247,10 @@ impl AnvilBroker {
         let actual_port = self.actual_port.clone();
         // Storage will be created inside the broker thread and shared back via this Arc<Mutex<>>
         let storage_slot = self.storage.clone();
+        // The thread reports whether the storage opened, so a store that
+        // cannot be opened raises from `start` rather than only reaching an
+        // event handler.
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel::<PyResult<()>>();
 
         let handle = std::thread::spawn(move || {
             // Initialize tracing
@@ -236,15 +265,9 @@ impl AnvilBroker {
                 Ok(rt) => rt,
                 Err(e) => {
                     running.store(false, Ordering::SeqCst);
-                    if let Some(h) = &handler {
-                        Python::with_gil(|py| {
-                            let error = BrokerError::new(
-                                "runtime_error".to_string(),
-                                format!("Failed to create runtime: {}", e),
-                            );
-                            let _ = h.call_method1(py, "on_fatal", (error,));
-                        });
-                    }
+                    let _ = opened_tx.send(Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("Failed to create runtime: {e}"),
+                    )));
                     return;
                 }
             };
@@ -258,21 +281,14 @@ impl AnvilBroker {
                     Ok(s) => Arc::new(s),
                     Err(e) => {
                         running.store(false, Ordering::SeqCst);
-                        if let Some(h) = &handler {
-                            Python::with_gil(|py| {
-                                let error = BrokerError::new(
-                                    "storage_error".to_string(),
-                                    format!("Failed to open storage {}: {}", config.db_path, e),
-                                );
-                                let _ = h.call_method1(py, "on_fatal", (error,));
-                            });
-                        }
+                        let _ = opened_tx.send(Err(open_error(&config.db_path, e)));
                         return;
                     }
                 };
 
                 // Share storage reference back to the main struct for get_storage_reader()
                 *storage_slot.lock().unwrap() = Some(storage.clone());
+                let _ = opened_tx.send(Ok(()));
 
                 match AnvilBrokerInner::new_with_storage(config, storage.clone()).await {
                     Ok(mut broker) => {
@@ -331,8 +347,24 @@ impl AnvilBroker {
             });
         });
 
-        self.handle = Some(handle);
-        Ok(())
+        let opened = py.allow_threads(move || opened_rx.recv());
+        match opened {
+            Ok(Ok(())) => {
+                self.handle = Some(handle);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                let _ = py.allow_threads(|| handle.join());
+                Err(e)
+            }
+            Err(std::sync::mpsc::RecvError) => {
+                let _ = py.allow_threads(|| handle.join());
+                self.running.store(false, Ordering::SeqCst);
+                Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "the broker thread exited before opening its storage",
+                ))
+            }
+        }
     }
 
     /// Create a storage reader backed by the broker's storage instance
@@ -405,12 +437,9 @@ impl AnvilStorageReader {
         let runtime = Runtime::new().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to create runtime: {}", e))
         })?;
-        let storage = runtime.block_on(AnvilStorage::new(&db_path)).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Failed to open storage {}: {}",
-                db_path, e
-            ))
-        })?;
+        let storage = runtime
+            .block_on(AnvilStorage::new(&db_path))
+            .map_err(|e| open_error(&db_path, e))?;
         Ok(Self {
             db_path,
             runtime,
@@ -620,6 +649,10 @@ fn anvil_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "ClaimLostError",
         m.py().get_type::<client::ClaimLostError>(),
+    )?;
+    m.add(
+        "StorageFormatError",
+        m.py().get_type::<StorageFormatError>(),
     )?;
     Ok(())
 }

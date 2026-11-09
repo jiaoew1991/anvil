@@ -43,6 +43,22 @@ jobs:
       # flushes, and the debug build makes them several times slower.
       - run: cargo test --release --locked
 
+  # Every release with a versioned storage format writes a store, and this
+  # code must read each one (docs/storage-format.md, "Testing"). A debug
+  # build: the stores are small, and it compiles faster than a release one.
+  format-compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The release tags, whose writers the check runs.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+      - run: scripts/format-compat.sh
+
   wheel:
     runs-on: ubuntu-latest
     timeout-minutes: 30

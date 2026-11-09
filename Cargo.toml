@@ -29,12 +29,8 @@ object_store = { version = "0.11", features = ["aws"] }
 dashmap = "6"
 parking_lot = "0.12"
 
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-bytes = "1"
-
 # Utilities
+bytes = "1"
 uuid = { version = "1", features = ["v7"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

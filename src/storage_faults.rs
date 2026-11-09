@@ -186,7 +186,7 @@ mod tests {
         // Bodies span several blocks, so reading one is not served by the
         // blocks the reload of the queue's counters caches.
         let messages: Vec<Message> = (0..MESSAGES)
-            .map(|_| Message::new(queue.to_string(), vec![7u8; 8 * 1024]))
+            .map(|_| Message::new(vec![7u8; 8 * 1024]))
             .collect();
         storage.push_messages(queue, &messages).await.unwrap();
         storage.close().await.unwrap();
@@ -239,13 +239,13 @@ mod tests {
         let storage = crashed.block_on(async {
             let storage = open(&store).await;
             storage
-                .push_message(up, &Message::new(up.to_string(), b"in".to_vec()))
+                .push_message(up, &Message::new(b"in".to_vec()))
                 .await
                 .unwrap();
             storage.create_queue(down, 0).await.unwrap();
             let claimed = storage.claim_messages(up, 1, "w", "l").await.unwrap();
             let (ids, tokens) = split_claims(&claimed);
-            let output = [Message::new(down.to_string(), b"out".to_vec())];
+            let output = [Message::new(b"out".to_vec())];
 
             store.set_faults(slow_puts(Duration::from_millis(400)));
             let cut_off = tokio::time::timeout(
@@ -293,7 +293,7 @@ mod tests {
         storage.create_queue(queue, 0).await.unwrap();
 
         store.set_faults(slow_puts(Duration::from_millis(400)));
-        let message = Message::new(queue.to_string(), b"x".to_vec());
+        let message = Message::new(b"x".to_vec());
         let cut_off = tokio::time::timeout(
             Duration::from_millis(100),
             storage.push_message(queue, &message),
@@ -434,7 +434,7 @@ mod tests {
             let storage = Arc::new(open(&store).await);
             // Claimed under a lease nobody heartbeats, so recovery reclaims
             // it during the outage.
-            let orphan = Message::new(queue.to_string(), b"orphan".to_vec());
+            let orphan = Message::new(b"orphan".to_vec());
             storage.push_message(queue, &orphan).await.unwrap();
             let claimed = storage
                 .claim_messages(queue, 1, "dead", "dead")
@@ -458,7 +458,7 @@ mod tests {
             let requests_before = store.counts().requests.load(Ordering::Relaxed);
             recovery.start();
             gc.start();
-            let pushed = Message::new(queue.to_string(), b"during".to_vec());
+            let pushed = Message::new(b"during".to_vec());
             let pushed_id = pushed.msg_id.clone();
             let in_flight = {
                 let storage = storage.clone();
@@ -489,7 +489,7 @@ mod tests {
             recovery.stop_async().await;
             gc.stop_async().await;
             check_invariants(&storage, &[queue.to_string()]).await;
-            let fresh = Message::new(queue.to_string(), b"after".to_vec());
+            let fresh = Message::new(b"after".to_vec());
             storage.push_message(queue, &fresh).await.unwrap();
             (
                 storage,

@@ -48,8 +48,6 @@ dependencies = [
  "prost 0.13.5",
  "pyo3",
  "rand 0.9.2",
- "serde",
- "serde_json",
  "slatedb",
  "tokio",
  "tokio-stream",

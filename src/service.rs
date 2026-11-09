@@ -243,7 +243,7 @@ impl AnvilService {
                 let downstream_messages: Vec<Message> = fwd
                     .payloads
                     .iter()
-                    .map(|payload| Message::new(fwd.downstream_queue.clone(), payload.clone()))
+                    .map(|payload| Message::new(payload.clone()))
                     .collect();
                 let new_msg_ids: Vec<String> = downstream_messages
                     .iter()
@@ -299,10 +299,7 @@ impl AnvilService {
                     let messages: Vec<Message> = pp
                         .payloads
                         .iter()
-                        .map(|payload| {
-                            let queue_name = format!("{}_p{}", sct.group_name, pp.partition_id);
-                            Message::new(queue_name, payload.clone())
-                        })
+                        .map(|payload| Message::new(payload.clone()))
                         .collect();
                     partition_msgs.push((pp.partition_id as u32, messages));
                 }
@@ -525,9 +522,9 @@ impl Anvil for AnvilService {
             .iter()
             .map(|payload| {
                 if req.metadata.is_empty() {
-                    Message::new(req.queue.clone(), payload.clone())
+                    Message::new(payload.clone())
                 } else {
-                    Message::with_metadata(req.queue.clone(), payload.clone(), req.metadata.clone())
+                    Message::with_metadata(payload.clone(), req.metadata.clone())
                 }
             })
             .collect();

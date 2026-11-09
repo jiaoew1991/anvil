@@ -1,0 +1,72 @@
+// Persisted values of anvil's storage format, apart from the wire API in
+// anvil.proto: a change here changes data on disk, which every later release
+// must still read. docs/storage-format.md is the normative spec; read its
+// compatibility rules before touching a field.
+syntax = "proto3";
+
+package anvil.storage;
+
+// Value of the format marker.
+message StoreFormat {
+  uint32 version = 1;
+}
+
+// Value of a queue record. The queue exists while its record does.
+message QueueRecord {
+  // Bound on the queue's in-flight messages (pushed, not yet acked); 0 is
+  // unbounded.
+  uint64 max_pending = 1;
+}
+
+// Value of a pending key: the message waiting at that seq.
+message PendingEntry {
+  string msg_id = 1;
+  // Deliveries before this one: 0 for a new message, carried over by a nack
+  // or a reclaim so redeliveries keep counting.
+  uint32 delivery_count = 2;
+}
+
+// Value of a message key: the body of a pushed message. Its queue and
+// msg_id are the key's.
+message StoredMessage {
+  bytes payload = 1;
+  // Wall-clock push time, seconds since the Unix epoch.
+  double created_at = 2;
+  map<string, string> metadata = 3;
+}
+
+// Value of a claim key: who holds the message. Its queue and msg_id are the
+// key's.
+message ClaimRecord {
+  string worker_id = 1;
+  string lease_id = 2;
+  // Wall-clock claim time, seconds since the Unix epoch. Informational:
+  // claim ages are timed on the broker's monotonic clock.
+  double claimed_at = 3;
+  // Presented by every settlement; a claim taken anew gets a new token.
+  string claim_token = 4;
+  // Deliveries including this one, so at least 1.
+  uint32 delivery_count = 5;
+}
+
+// Value of a queue group key. Its name is the key's.
+message QueueGroup {
+  uint32 num_partitions = 1;
+  uint32 version = 2;
+  // One queue per partition, in partition order.
+  repeated string partition_queues = 3;
+  // Wall-clock creation time, seconds since the Unix epoch.
+  double created_at = 4;
+}
+
+// Value of a reclaim event, which recovery writes as a state value when it
+// returns a claim to pending.
+message ReclaimEvent {
+  uint64 timestamp_ns = 1;
+  string queue = 2;
+  string msg_id = 3;
+  string worker_id = 4;
+  string lease_id = 5;
+  double claimed_at = 6;
+  uint32 delivery_count = 7;
+}

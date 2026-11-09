@@ -196,7 +196,7 @@ pub(crate) mod tests {
             match op {
                 Op::Push { queue_idx } => {
                     let queue = &self.queues[queue_idx];
-                    let msg = Message::new(queue.clone(), b"dst-payload".to_vec());
+                    let msg = Message::new(b"dst-payload".to_vec());
                     self.storage.push_message(queue, &msg).await.unwrap();
                     self.pushed.insert((queue.clone(), msg.msg_id));
                 }
@@ -204,7 +204,7 @@ pub(crate) mod tests {
                 Op::PushBatch { queue_idx, count } => {
                     let queue = &self.queues[queue_idx];
                     let msgs: Vec<Message> = (0..count)
-                        .map(|_| Message::new(queue.clone(), b"dst-batch".to_vec()))
+                        .map(|_| Message::new(b"dst-batch".to_vec()))
                         .collect();
                     self.storage.push_messages(queue, &msgs).await.unwrap();
                     self.pushed
@@ -297,8 +297,8 @@ pub(crate) mod tests {
                     let downstream = &self.queues[downstream_idx];
 
                     let out_msgs: Vec<Message> = vec![
-                        Message::new(downstream.clone(), b"fwd-1".to_vec()),
-                        Message::new(downstream.clone(), b"fwd-2".to_vec()),
+                        Message::new(b"fwd-1".to_vec()),
+                        Message::new(b"fwd-2".to_vec()),
                     ];
 
                     let worker_id = format!("w{}", worker_idx);
@@ -476,7 +476,7 @@ pub(crate) mod tests {
         set_sim_time_nanos(1_735_689_600_000_000_000);
 
         for _ in 0..50 {
-            let msg = Message::new("upstream".to_string(), b"data".to_vec());
+            let msg = Message::new(b"data".to_vec());
             storage.push_message("upstream", &msg).await.unwrap();
         }
 
@@ -490,10 +490,7 @@ pub(crate) mod tests {
                 break;
             }
             for c in &claimed {
-                let out = vec![
-                    Message::new("downstream".to_string(), b"o1".to_vec()),
-                    Message::new("downstream".to_string(), b"o2".to_vec()),
-                ];
+                let out = vec![Message::new(b"o1".to_vec()), Message::new(b"o2".to_vec())];
                 storage
                     .ack_and_forward(
                         "upstream",
@@ -532,7 +529,7 @@ pub(crate) mod tests {
         set_sim_time_nanos(1_735_689_600_000_000_000);
 
         for _ in 0..10 {
-            let msg = Message::new("q".to_string(), b"data".to_vec());
+            let msg = Message::new(b"data".to_vec());
             storage.push_message("q", &msg).await.unwrap();
         }
 
@@ -612,7 +609,7 @@ pub(crate) mod tests {
         set_sim_time_nanos(1_735_689_600_000_000_000);
 
         for _ in 0..5 {
-            let msg = Message::new("q".to_string(), b"data".to_vec());
+            let msg = Message::new(b"data".to_vec());
             storage.push_message("q", &msg).await.unwrap();
         }
 
@@ -673,10 +670,7 @@ pub(crate) mod tests {
         // Push 10000 messages
         let mut msgs = Vec::new();
         for i in 0..10000u64 {
-            msgs.push(Message::new(
-                queue.to_string(),
-                format!("msg_{i}").into_bytes(),
-            ));
+            msgs.push(Message::new(format!("msg_{i}").into_bytes()));
         }
         for chunk in msgs.chunks(100) {
             storage.push_messages(queue, chunk).await.unwrap();
@@ -743,7 +737,7 @@ pub(crate) mod tests {
             let tp = total_pushed.clone();
             push_handles.push(tokio::spawn(async move {
                 for i in 0..100u32 {
-                    let msg = Message::new(queue.to_string(), format!("p{pid}_m{i}").into_bytes());
+                    let msg = Message::new(format!("p{pid}_m{i}").into_bytes());
                     s.push_message(queue, &msg).await.unwrap();
                     tp.fetch_add(1, Ordering::Relaxed);
                 }
@@ -802,7 +796,7 @@ pub(crate) mod tests {
         for pid in 0..4u32 {
             let q = format!("{group}_p{pid}");
             let msgs: Vec<Message> = (0..500)
-                .map(|i| Message::new(q.clone(), format!("p{pid}_m{i}").into_bytes()))
+                .map(|i| Message::new(format!("p{pid}_m{i}").into_bytes()))
                 .collect();
             for chunk in msgs.chunks(50) {
                 storage.push_messages(&q, chunk).await.unwrap();
@@ -853,12 +847,12 @@ pub(crate) mod tests {
 
         // Push 3 messages — should succeed
         for i in 0..3 {
-            let msg = Message::new("bounded".to_string(), format!("data-{i}").into_bytes());
+            let msg = Message::new(format!("data-{i}").into_bytes());
             storage.push_messages("bounded", &[msg]).await.unwrap();
         }
 
         // Push 4th — should fail with QueueFull
-        let msg = Message::new("bounded".to_string(), b"data-3".to_vec());
+        let msg = Message::new(b"data-3".to_vec());
         let result = storage.push_messages("bounded", &[msg]).await;
         assert!(result.is_err());
         assert!(
@@ -880,7 +874,7 @@ pub(crate) mod tests {
             .unwrap();
 
         // Now push should succeed again
-        let msg4 = Message::new("bounded".to_string(), b"data-4".to_vec());
+        let msg4 = Message::new(b"data-4".to_vec());
         storage.push_messages("bounded", &[msg4]).await.unwrap();
 
         // Verify stats: 4 pushed, 1 acked, 3 in-flight
@@ -1052,7 +1046,7 @@ pub(crate) mod tests {
                     tokio::spawn(async move {
                         loop {
                             let batch: Vec<Message> = (0..PUSH_BATCH)
-                                .map(|_| Message::new(queue.clone(), b"x".to_vec()))
+                                .map(|_| Message::new(b"x".to_vec()))
                                 .collect();
                             storage.push_messages(&queue, &batch).await.unwrap();
                             pushed

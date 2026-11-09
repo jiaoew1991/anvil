@@ -104,22 +104,10 @@ PENDING ──claim()──▶ CLAIMED ──ack()──▶ ACKED ──GC──
 
 ### 2.3 Storage Model (SlateDB)
 
-```
-Key Schema:
-  meta:{queue}                          → {claim_seq, push_seq}
-  pending:{queue}:{seq:020d}            → msg_id
-  msg:{queue}:{msg_id}                  → Message JSON
-  claimed:{queue}:{msg_id}              → ClaimInfo JSON
-  acked:{queue}:{timestamp_ns}:{msg_id} → ""
-  state:{namespace}:{key}               → value bytes
-  max_pending:{queue}                   → u64 LE, bound of a bounded queue
-```
-
-All operations use `WriteBatch` for atomicity.
-
-A state namespace may not be empty or contain ':', so `state:{namespace}:{key}`
-splits at its first ':' after the prefix and no two (namespace, key) pairs
-share a key; a key may contain ':'.
+Each queue keeps its pending entries in seq order, message bodies and claims
+by msg_id, and acked entries in time order; state is kept by namespace and
+key. [storage-format.md](storage-format.md) specifies every key and value.
+Every operation writes one `WriteBatch`, so its effects land together.
 
 ### 2.4 Error Contract
 
@@ -129,7 +117,7 @@ A failed RPC's status code tells the caller what to do next:
 |------|---------|-------------------|
 | `FAILED_PRECONDITION` | The caller no longer holds a claim it acks, nacks, forwards, scatters or renews: its token, lease or worker does not match, the message is no longer claimed, or another settlement holds it | Drop the message; another worker owns it or it is done |
 | `NOT_FOUND` | The queue or queue group does not exist | Create it first |
-| `INVALID_ARGUMENT` | The request is malformed: claim tokens that do not pair up with message ids, a message id listed twice in one ack, nack or renewal, an empty queue name (push, claim, create, forward target), a state update with an empty namespace or one containing ':', a negative `steal_pending_threshold` | Fix the request |
+| `INVALID_ARGUMENT` | The request is malformed: claim tokens that do not pair up with message ids, a message id listed twice in one ack, nack or renewal, an empty queue name (push, claim, create, forward target), a state update with an empty namespace, a negative `steal_pending_threshold` | Fix the request |
 | `RESOURCE_EXHAUSTED` | A bounded queue is full (message starts with `QueueFull`) | Back off and retry |
 | `UNAVAILABLE` | The broker's database is closed for good: a newer broker opened it and fenced this one, or a storage background task failed | Fail over to the current broker; do not retry this one |
 | `INTERNAL` | The broker's storage failed | Retry |

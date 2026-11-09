@@ -14,7 +14,6 @@
 
 // Core data structures for Anvil
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -130,22 +129,19 @@ pub fn now_nanos() -> u64 {
 }
 
 /// Message stored in the queue
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Message {
     pub msg_id: String,
-    pub queue: String,
     pub payload: Vec<u8>,
     pub created_at: f64,
-    #[serde(default)]
     pub metadata: HashMap<String, String>,
 }
 
 impl Message {
     /// Create a new message with auto-generated ID
-    pub fn new(queue: String, payload: Vec<u8>) -> Self {
+    pub fn new(payload: Vec<u8>) -> Self {
         Self {
             msg_id: uuid::Uuid::now_v7().to_string(),
-            queue,
             payload,
             created_at: now_secs(),
             metadata: HashMap::new(),
@@ -153,14 +149,9 @@ impl Message {
     }
 
     /// Create a message with metadata
-    pub fn with_metadata(
-        queue: String,
-        payload: Vec<u8>,
-        metadata: HashMap<String, String>,
-    ) -> Self {
+    pub fn with_metadata(payload: Vec<u8>, metadata: HashMap<String, String>) -> Self {
         Self {
             msg_id: uuid::Uuid::now_v7().to_string(),
-            queue,
             payload,
             created_at: now_secs(),
             metadata,
@@ -169,7 +160,7 @@ impl Message {
 }
 
 /// Information about a claimed message
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ClaimInfo {
     pub msg_id: String,
     pub worker_id: String,
@@ -177,7 +168,6 @@ pub struct ClaimInfo {
     pub claimed_at: f64,
     pub claim_token: String,
     /// How many times the message has been handed out, this claim included.
-    #[serde(default)]
     pub delivery_count: u32,
 }
 
@@ -204,10 +194,9 @@ pub struct ClaimedMessage {
     pub delivery_count: u32,
 }
 
-/// Queue group metadata (stored at group_meta:{group_name})
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Queue group metadata
+#[derive(Debug, Clone)]
 pub struct QueueGroupMeta {
-    pub name: String,
     pub num_partitions: u32,
     pub version: u32,
     pub partition_queues: Vec<String>,
@@ -215,12 +204,11 @@ pub struct QueueGroupMeta {
 }
 
 impl QueueGroupMeta {
-    pub fn new(name: String, num_partitions: u32) -> Self {
+    pub fn new(name: &str, num_partitions: u32) -> Self {
         let partition_queues = (0..num_partitions)
-            .map(|i| format!("{}_p{}", name, i))
+            .map(|i| format!("{name}_p{i}"))
             .collect();
         Self {
-            name,
             num_partitions,
             version: 0,
             partition_queues,
@@ -312,8 +300,7 @@ mod tests {
 
     #[test]
     fn test_message_creation() {
-        let msg = Message::new("test-queue".to_string(), b"hello".to_vec());
-        assert_eq!(msg.queue, "test-queue");
+        let msg = Message::new(b"hello".to_vec());
         assert_eq!(msg.payload, b"hello");
         assert!(!msg.msg_id.is_empty());
         assert!(msg.created_at > 0.0);
@@ -326,7 +313,7 @@ mod tests {
         metadata.insert("key1".to_string(), "value1".to_string());
         metadata.insert("key2".to_string(), "value2".to_string());
 
-        let msg = Message::with_metadata("test-queue".to_string(), b"hello".to_vec(), metadata);
+        let msg = Message::with_metadata(b"hello".to_vec(), metadata);
         assert_eq!(msg.metadata.len(), 2);
         assert_eq!(msg.metadata.get("key1"), Some(&"value1".to_string()));
     }
@@ -358,40 +345,6 @@ mod tests {
         assert_eq!(config.claim_age_timeout_secs, 60.0);
         assert_eq!(config.recovery_interval_secs, 10.0);
         assert_eq!(config.max_queue_depth, 0);
-    }
-
-    #[test]
-    fn test_message_serialization() {
-        let msg = Message::new("test-queue".to_string(), b"hello".to_vec());
-
-        // Serialize
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("test-queue"));
-
-        // Deserialize
-        let msg2: Message = serde_json::from_str(&json).unwrap();
-        assert_eq!(msg.msg_id, msg2.msg_id);
-        assert_eq!(msg.payload, msg2.payload);
-    }
-
-    #[test]
-    fn test_claim_info_serialization() {
-        let claim = ClaimInfo::new(
-            "msg-123".to_string(),
-            "worker-1".to_string(),
-            "lease-456".to_string(),
-            1,
-        );
-
-        // Serialize
-        let json = serde_json::to_string(&claim).unwrap();
-        assert!(json.contains("msg-123"));
-
-        // Deserialize
-        let claim2: ClaimInfo = serde_json::from_str(&json).unwrap();
-        assert_eq!(claim.msg_id, claim2.msg_id);
-        assert_eq!(claim.worker_id, claim2.worker_id);
-        assert_eq!(claim.claim_token, claim2.claim_token);
     }
 
     #[test]
