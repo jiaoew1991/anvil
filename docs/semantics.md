@@ -345,21 +345,26 @@ its lease table in memory and is the only one to mint lease ids:
   the former holder's ack fails with `FAILED_PRECONDITION`. A claim made by
   an earlier broker process is different: a restart, not its worker, ended
   that delivery (see "Broker restart").
+- Lease age and claim age run on the broker's monotonic clock, not the wall
+  clock, so a clock step neither revives a dead lease nor reclaims a live
+  worker's claims. The persisted `claimed_at` is wall clock and is kept for
+  events only. A claim's age is timed from when this broker process handed it
+  out; that is enough, since a restarted broker reclaims every earlier claim
+  regardless of age.
 
-**Dead letters.** A queue allows `max_deliveries` deliveries of a message,
-set by `CreateQueue` (or `CreateQueueGroup`, per partition); a queue that
-sets none takes the broker's `default_max_deliveries` (default 20), and 0 is
+**Dead letters.** A queue allows `max_deliveries` deliveries of a message, set
+by `CreateQueue` (or `CreateQueueGroup`, per partition); a queue that sets
+none takes the broker's `default_max_deliveries` (default 20), and 0 is
 unlimited. A nack or reclaim that settles a claim with `delivery_count >=
 max_deliveries` moves the message to the queue's dead letters instead of
 pending, in the same atomic write: the claim and the pending body go, and the
 dead letter keeps the body, the delivery count, the cause (`nack_limit`,
 `reclaim_limit`), the last nack's `reason` (its first 4 KiB, cut at a
 character boundary, so a nack carrying a whole traceback still succeeds) and
-the worker. A nack with
-`dead_letter` set dead-letters its messages at once, cause `rejected`. The
-limit is read when the claim is settled, so a lowered limit applies from the
-next nack or reclaim, and a message already past it gets that one more
-delivery.
+the worker. A nack with `dead_letter` set dead-letters its messages at once,
+cause `rejected`. The limit is read when the claim is settled, so a lowered
+limit applies from the next nack or reclaim, and a message already past it
+gets that one more delivery.
 
 Dead letters are neither pending nor claimed: they count as settled for the
 drain signal and take no room in a bounded queue. So that work a pipeline
@@ -386,15 +391,10 @@ operator acts on them, at most 1000 per call:
 - `PurgeDeadLetters` deletes them and adds them to `total_purged`.
 
 Both report the msg_ids that held no dead letter instead of failing, so a
-retry after a timeout is safe. The Python client raises `QueueFinishedError`,
-not `ClaimLostError`, for a redrive refused on a finished queue; a redrive and a purge never act on one dead
-letter at once. `DeleteQueue` deletes a queue's dead letters with it.
-- Lease age and claim age run on the broker's monotonic clock, not the wall
-  clock, so a clock step neither revives a dead lease nor reclaims a live
-  worker's claims. The persisted `claimed_at` is wall clock and is kept for
-  events only. A claim's age is timed from when this broker process handed it
-  out; that is enough, since a restarted broker reclaims every earlier claim
-  regardless of age.
+retry after a timeout is safe, and a redrive and a purge never act on one
+dead letter at once. The Python client raises `QueueFinishedError`, not
+`ClaimLostError`, for a redrive refused on a finished queue. `DeleteQueue`
+deletes a queue's dead letters with it.
 
 **Broker restart.** The lease table does not survive a restart. After a broker
 restart, every claim in flight is returned to pending on the first recovery
