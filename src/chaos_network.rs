@@ -19,13 +19,12 @@
 // fault-free connection.
 
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)] // SIM_TIME_LOCK is intentionally held across awaits to serialize time-sensitive tests
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use rand::rngs::StdRng;
@@ -41,7 +40,7 @@ mod tests {
     use crate::server::AnvilBrokerInner;
     use crate::service::proto::anvil_client::AnvilClient;
     use crate::service::proto::*;
-    use crate::types::{AnvilConfig, SIM_TIME_LOCK};
+    use crate::types::{AnvilConfig, SimClock};
 
     const RECOVERY_INTERVAL: Duration = Duration::from_millis(25);
     /// Never reached within a test, for the timeout a test does not exercise.
@@ -50,13 +49,6 @@ mod tests {
     /// instead of hanging it.
     const WAIT_DEADLINE: Duration = Duration::from_secs(20);
     const POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-    /// The broker's clock is global to the test binary and other tests
-    /// simulate it, so every test here holds this lock. A poisoned lock only
-    /// means an earlier test failed, which must not fail this one too.
-    fn real_clock() -> MutexGuard<'static, ()> {
-        SIM_TIME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     // =========================================================================
     // Fault-injecting TCP proxy
@@ -646,7 +638,7 @@ mod tests {
     /// several lease timeouts, then check it was never reclaimed and acks.
     #[tokio::test]
     async fn test_slow_heartbeats_within_timeout_keep_lease() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         let lease_timeout = Duration::from_millis(1000);
         let broker = Broker::start(lease_timeout.as_secs_f64(), LONG_TIMEOUT_SECS).await;
         let queue = "slow";
@@ -698,7 +690,7 @@ mod tests {
     /// last seen at the delivery has expired.
     #[tokio::test]
     async fn test_buffered_pings_of_dead_worker_extend_lease_only_by_their_delay() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         let lease_timeout = Duration::from_millis(800);
         let broker = Broker::start(lease_timeout.as_secs_f64(), LONG_TIMEOUT_SECS).await;
         let queue = "dead";
@@ -763,7 +755,7 @@ mod tests {
     /// lease it holds.
     #[tokio::test]
     async fn test_heartbeat_reconnect_keeps_lease() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         let lease_timeout = Duration::from_millis(800);
         let broker = Broker::start(lease_timeout.as_secs_f64(), LONG_TIMEOUT_SECS).await;
         let queue = "blip";
@@ -808,7 +800,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "slow: stalls a heartbeat for 31 s while holding the global clock lock; run with --ignored"]
     async fn test_heartbeat_stall_within_lease_timeout_keeps_lease() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         let broker = Broker::start(60.0, LONG_TIMEOUT_SECS).await;
         let queue = "stall";
         broker.create_queue(queue).await;
@@ -849,7 +841,7 @@ mod tests {
     /// old, only the live worker's lease may remain.
     #[tokio::test]
     async fn test_expired_leases_are_forgotten() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         let lease_timeout = Duration::from_millis(300);
         let broker = Broker::start(lease_timeout.as_secs_f64(), LONG_TIMEOUT_SECS).await;
         let proxy = FaultProxy::start(broker.addr, 15).await;
@@ -896,7 +888,7 @@ mod tests {
     /// message again through the healed link.
     #[tokio::test]
     async fn test_lost_claim_response_redelivers_at_claim_age() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         let claim_age = Duration::from_millis(800);
         let broker = Broker::start(LONG_TIMEOUT_SECS, claim_age.as_secs_f64()).await;
         let queue = "lost-claim";
@@ -974,7 +966,7 @@ mod tests {
     /// totals and that nothing comes back after the claim age.
     #[tokio::test]
     async fn test_retried_ack_after_lost_or_delayed_response_settles_once() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         let claim_age = Duration::from_millis(1000);
         let broker = Broker::start(LONG_TIMEOUT_SECS, claim_age.as_secs_f64()).await;
         let queue = "retry";
@@ -1054,7 +1046,7 @@ mod tests {
     /// fail with `FAILED_PRECONDITION`, and B's ack must succeed.
     #[tokio::test]
     async fn test_stale_ack_held_by_partition_is_fenced_after_heal() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         let lease_timeout = Duration::from_millis(600);
         let broker = Broker::start(lease_timeout.as_secs_f64(), LONG_TIMEOUT_SECS).await;
         let queue = "partition";
@@ -1122,7 +1114,7 @@ mod tests {
     /// drained checks the broker's totals before it exits.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_drain_signal_holds_under_lost_responses() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         const MESSAGES: i64 = 60;
         let broker = Arc::new(Broker::start(LONG_TIMEOUT_SECS, 0.6).await);
         let queue = "drain";
@@ -1249,7 +1241,7 @@ mod tests {
     /// connection, retry, and finally drain every downstream queue.
     #[tokio::test]
     async fn test_forward_and_scatter_stay_atomic_when_the_rpc_dies() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         const INPUTS: usize = 30;
         const PARTITIONS: i32 = 3;
         let broker = Broker::start(LONG_TIMEOUT_SECS, LONG_TIMEOUT_SECS).await;
@@ -1665,7 +1657,7 @@ mod tests {
             counts(&broker.stats(queue).await),
             (0, 0, messages, messages)
         );
-        let log = log.lock().unwrap();
+        let log = std::mem::take(&mut *log.lock().unwrap());
         let acked: HashSet<&String> = log.acked.iter().collect();
         assert_eq!(acked.len(), log.acked.len(), "a message was acked twice");
         let deliveries: HashSet<&(String, u32)> = log.deliveries.iter().collect();
@@ -1722,7 +1714,7 @@ mod tests {
     /// proxy has. Method: a short `run_soak`; see it for the checks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_short_soak_under_random_faults() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         run_soak(0x5eed, 6, 120).await;
     }
 
@@ -1733,7 +1725,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "soak"]
     async fn test_long_soak_under_random_faults() {
-        let _clock = real_clock();
+        let _clock = SimClock::acquire();
         let secs: u64 = std::env::var("CHAOS_SOAK_SECS")
             .ok()
             .and_then(|v| v.parse().ok())

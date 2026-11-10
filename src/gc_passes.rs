@@ -18,7 +18,6 @@
 // counter as it found it.
 
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)] // SIM_TIME_LOCK is intentionally held across awaits to serialize time-sensitive tests
 mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::path::Path;
@@ -28,7 +27,7 @@ mod tests {
     use crate::dst::tests::{check_invariants, crash, crash_test_db_path};
     use crate::storage::tests::split_claims;
     use crate::storage::{AnvilStorage, GC_BATCH_KEYS_MAX};
-    use crate::types::{now_nanos, set_sim_time_nanos, ClaimedMessage, Message, SIM_TIME_LOCK};
+    use crate::types::{now_nanos, set_sim_time_nanos, ClaimedMessage, Message, SimClock};
 
     const T0_NANOS: u64 = 1_900_000_000_000_000_000;
     const SEC_NANOS: u64 = 1_000_000_000;
@@ -195,7 +194,7 @@ mod tests {
         const PASSES: u64 = 6;
         const PASSES_BEFORE_CRASH: u64 = 3;
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (dir, db_path) = crash_test_db_path("gc_passes");
         let queues = ["gc-a".to_string(), "gc-b".to_string()];
         let retention_ns = RETENTION_SECS * SEC_NANOS;
@@ -241,7 +240,6 @@ mod tests {
             check_untouched(&storage, &queues, &live, &counts_before).await;
             settle_live(&storage, &live).await;
         });
-        set_sim_time_nanos(0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -252,7 +250,7 @@ mod tests {
     /// entry, younger than the retention, must survive.
     #[tokio::test]
     async fn test_gc_spares_unexpired_entries_of_a_queue_sharing_the_prefix() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let (queue, extended) = ("gc", "gc:00");
         storage.create_queue(queue, 0).await.unwrap();
@@ -263,7 +261,6 @@ mod tests {
         storage.gc_acked_messages(SEC_NANOS).await.unwrap();
 
         let survivors = storage.scan_acked(Some(extended)).await.unwrap().len();
-        set_sim_time_nanos(0);
         assert_eq!(
             survivors, 1,
             "GC deleted an entry younger than the retention"
@@ -300,7 +297,7 @@ mod tests {
         const RETENTION_SECS: u64 = 500;
         const CRASH_FRACTIONS: [f64; 4] = [0.2, 0.4, 0.6, 0.8];
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let queue = "gc".to_string();
         let queues = [queue.clone()];
         let retention_ns = RETENTION_SECS * SEC_NANOS;
@@ -382,7 +379,6 @@ mod tests {
             });
             let _ = std::fs::remove_dir_all(&dir);
         }
-        set_sim_time_nanos(0);
         let _ = std::fs::remove_dir_all(&template_dir);
     }
 }

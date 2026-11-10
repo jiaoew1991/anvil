@@ -37,17 +37,54 @@ static SIM_MONO_NANOS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static SIM_MONO_ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
-/// Mutex to serialize tests that use simulated time.
-/// Acquire this lock before calling `set_sim_time_nanos` to prevent
-/// parallel tests from stomping on each other's sim time.
 #[cfg(test)]
-pub static SIM_TIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SIM_TIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Exclusive use of the simulated clocks, which are global to the test
+/// binary: a test holds it for its whole run if it moves the clocks, or if
+/// it needs them to keep real time while it runs. Releasing it restores
+/// real time, so a test that fails mid-simulation cannot hand its clock to
+/// the next one.
+#[cfg(test)]
+pub struct SimClock {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl SimClock {
+    /// The lock guards no data, only the right to move the clocks, and every
+    /// holder leaves them real on release. A poisoned lock therefore means
+    /// only that an earlier holder failed, which must not fail this one too.
+    pub fn acquire() -> Self {
+        let lock = SIM_TIME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            SIM_TIME_NANOS.load(Ordering::Acquire),
+            0,
+            "the wall clock was simulated without holding SimClock"
+        );
+        assert_eq!(
+            SIM_MONO_NANOS.load(Ordering::Acquire),
+            0,
+            "the monotonic clock was simulated without holding SimClock"
+        );
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(test)]
+impl Drop for SimClock {
+    fn drop(&mut self) {
+        set_sim_time_nanos(0);
+    }
+}
 
 /// Set the simulated wall clock (nanoseconds since epoch). Pass 0 to restore
 /// real time on both clocks. Any other value steps the wall clock alone, as
 /// an NTP correction does: the monotonic clock freezes when simulation starts
 /// and then moves only with `advance_sim_time_secs`.
-/// IMPORTANT: Acquire `SIM_TIME_LOCK` before calling this in tests.
+/// IMPORTANT: Hold a `SimClock` while calling this in tests.
 #[cfg(test)]
 pub fn set_sim_time_nanos(nanos: u64) {
     let was = SIM_TIME_NANOS.swap(nanos, Ordering::AcqRel);

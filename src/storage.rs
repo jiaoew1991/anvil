@@ -2394,7 +2394,6 @@ impl AnvilStorage {
 }
 
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)] // SIM_TIME_LOCK is intentionally held across awaits to serialize time-sensitive tests
 pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3393,8 +3392,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_ack_rejects_stale_token_after_reclaim() {
-        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SIM_TIME_LOCK};
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SimClock};
+        let _clock = SimClock::acquire();
         set_sim_time_nanos(1_900_000_000_000_000_000);
 
         let storage = create_temp_storage().await;
@@ -3431,14 +3430,12 @@ pub(crate) mod tests {
             .ack_messages(queue, &msg_ids, &claim_tokens, "worker-1", "lease-1")
             .await;
         assert!(result.is_err());
-
-        set_sim_time_nanos(0);
     }
 
     #[tokio::test]
     async fn test_recover_respects_active_leases() {
-        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SIM_TIME_LOCK};
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SimClock};
+        let _clock = SimClock::acquire();
         set_sim_time_nanos(2_100_000_000_000_000_000);
 
         let storage = create_temp_storage().await;
@@ -3473,8 +3470,6 @@ pub(crate) mod tests {
         let still_claimed = storage.scan_claimed(Some(queue)).await.unwrap();
         assert_eq!(still_claimed.len(), 1);
         assert_eq!(still_claimed[0].1, claimed[0].message.msg_id);
-
-        set_sim_time_nanos(0);
     }
 
     /// A claim under a live lease survives `claim_age_timeout_secs` for as
@@ -3483,8 +3478,8 @@ pub(crate) mod tests {
     /// on the usual schedule.
     #[tokio::test]
     async fn test_renewal_keeps_claim_past_claim_age() {
-        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SIM_TIME_LOCK};
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SimClock};
+        let _clock = SimClock::acquire();
         set_sim_time_nanos(2_200_000_000_000_000_000);
 
         let storage = create_temp_storage().await;
@@ -3544,8 +3539,6 @@ pub(crate) mod tests {
             renew().await.is_err(),
             "a reclaimed claim cannot be renewed"
         );
-
-        set_sim_time_nanos(0);
     }
 
     /// Renewal is fenced like an ack, and all or none: a stale token, or
@@ -3701,8 +3694,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_gc_acked_messages() {
-        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SIM_TIME_LOCK};
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SimClock};
+        let _clock = SimClock::acquire();
         set_sim_time_nanos(1_800_000_000_000_000_000);
 
         let storage = create_temp_storage().await;
@@ -3735,8 +3728,6 @@ pub(crate) mod tests {
 
         let acked = storage.scan_acked(Some(queue)).await.unwrap();
         assert!(acked.is_empty());
-
-        set_sim_time_nanos(0);
     }
 
     /// Stopping GC must not wait out the pass in flight. A full pass takes
@@ -3947,8 +3938,8 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_recover_expired_claims() {
-        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SIM_TIME_LOCK};
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SimClock};
+        let _clock = SimClock::acquire();
         set_sim_time_nanos(2_000_000_000_000_000_000);
 
         let storage = create_temp_storage().await;
@@ -3977,8 +3968,6 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
-
-        set_sim_time_nanos(0);
     }
 
     #[tokio::test]

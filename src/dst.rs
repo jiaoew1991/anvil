@@ -26,7 +26,6 @@
 //   5. ack_and_forward atomicity: downstream push_seq increases iff upstream ack succeeds
 
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)] // SIM_TIME_LOCK is intentionally held across awaits to serialize time-sensitive tests
 pub(crate) mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::Ordering;
@@ -37,7 +36,7 @@ pub(crate) mod tests {
     use rand::SeedableRng;
 
     use crate::storage::AnvilStorage;
-    use crate::types::{advance_sim_time_secs, set_sim_time_nanos, Message, SIM_TIME_LOCK};
+    use crate::types::{advance_sim_time_secs, set_sim_time_nanos, Message, SimClock};
 
     /// What a simulated worker currently holds (claimed messages).
     #[derive(Default, Clone)]
@@ -435,12 +434,6 @@ pub(crate) mod tests {
         }
     }
 
-    impl Drop for DstSimulator {
-        fn drop(&mut self) {
-            set_sim_time_nanos(0);
-        }
-    }
-
     // =====================================================================
     // Test cases
     // =====================================================================
@@ -448,7 +441,7 @@ pub(crate) mod tests {
     /// Core DST: 20 seeds × 200 ops, reusing one storage instance.
     #[tokio::test]
     async fn test_dst_random_seeds() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let mut sim = DstSimulator::new(0, 3, 4).await;
         for seed in 0..20 {
             sim.run_seed(seed, 200).await;
@@ -458,7 +451,7 @@ pub(crate) mod tests {
     /// Stress: 5 seeds × 1000 ops with more workers.
     #[tokio::test]
     async fn test_dst_long_sequence() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let mut sim = DstSimulator::new(100, 4, 8).await;
         for seed in 100..105 {
             sim.run_seed(seed, 1000).await;
@@ -468,7 +461,7 @@ pub(crate) mod tests {
     /// ack_and_forward atomicity: 50 upstream → 100 downstream (1:2 fan-out).
     #[tokio::test]
     async fn test_dst_forward_heavy() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
         storage.create_queue("upstream", 0).await.unwrap();
         storage.create_queue("downstream", 0).await.unwrap();
@@ -515,14 +508,12 @@ pub(crate) mod tests {
         assert_eq!(down.total_pushed, 100);
         assert_eq!(total_forwarded, 100);
         assert_eq!(down.claimed_count, 0);
-
-        set_sim_time_nanos(0);
     }
 
     /// Recovery: claims expire → re-enqueue → new worker claims → stale tokens rejected.
     #[tokio::test]
     async fn test_dst_recovery_cycle() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
         storage.create_queue("q", 0).await.unwrap();
 
@@ -595,14 +586,12 @@ pub(crate) mod tests {
         let meta = storage.get_queue_stats("q").await.unwrap();
         assert_eq!(meta.total_acked, 10);
         assert_eq!(meta.claimed_count, 0);
-
-        set_sim_time_nanos(0);
     }
 
     /// Nack storm: 5 messages bounce 20× between pending and claimed.
     #[tokio::test]
     async fn test_dst_nack_storm() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
         storage.create_queue("q", 0).await.unwrap();
 
@@ -649,8 +638,6 @@ pub(crate) mod tests {
         assert_eq!(meta.total_acked, 5);
         assert_eq!(meta.total_pushed, 5);
         assert_eq!(meta.push_seq, 105); // 5 + 5*20 nack re-pushes
-
-        set_sim_time_nanos(0);
     }
 
     // =====================================================================
@@ -983,7 +970,7 @@ pub(crate) mod tests {
     /// must have survived.
     #[test]
     fn test_dst_crash_recovery() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         for seed in 300..304 {
             let (dir, db_path) = crash_test_db_path("dst_crash");
 
@@ -1009,7 +996,6 @@ pub(crate) mod tests {
             });
             let _ = std::fs::remove_dir_all(&dir);
         }
-        set_sim_time_nanos(0);
     }
 
     /// Concurrent producers, workers acking and nacking, and a reclaimer
