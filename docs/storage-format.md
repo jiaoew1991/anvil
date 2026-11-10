@@ -88,6 +88,9 @@ A tag, once assigned, is never reused for another layout.
 | `0x09` | queue group | `str(group)` | `QueueGroup` |
 | `0x0A` | state | `str(namespace) str(key)` | the caller's bytes |
 | `0x0B` | dead letter | `str(queue) str(msg_id)` | `DeadLetter` |
+| `0x0C` | total dead-lettered | `str(queue)` | total (section 4.2) |
+| `0x0D` | total redriven | `str(queue)` | total (section 4.2) |
+| `0x0E` | total purged | `str(queue)` | total (section 4.2) |
 
 For example, the pending key of seq 258 in queue `q:1` is
 `04 71 3a 31 00 01 00 00 00 00 00 00 01 02`, and the state key of namespace
@@ -108,7 +111,7 @@ named and no key of any other queue, group or namespace:
 - **A queue's acked entries in timestamp order**, and those acked before a
   cutoff (GC): from `0x07 str(queue)` up to, excluding,
   `0x07 str(queue) u64(cutoff_ns)`: one contiguous range.
-- **A queue's dead letters in msg_id order** (load, `ListDeadLetters`,
+- **A queue's dead letters in msg_id order** (`ListDeadLetters`,
   `delete_queue`): `0x0B str(queue)` as a prefix. Those after a msg_id start
   at that msg_id's key followed by `0x00`, the first key past it, since
   strings are prefix-free.
@@ -137,19 +140,22 @@ named and no key of any other queue, group or namespace:
 - **Dead letter.** One key per message of the queue taken out of
   circulation: a nack or reclaim settled its last allowed delivery, or a nack
   asked for it. A message has at most one of a pending key, a claim key or a
-  dead letter key. A redrive deletes the dead letter and writes a pending key
-  and the body; a purge deletes it and merges one into the queue's total
-  acked, so that every message pushed is pending, claimed, acked or dead. A
-  store without the family has no dead letters, as every store written
-  before it existed.
+  dead letter key. Dead-lettering merges one into the queue's total
+  dead-lettered; a redrive deletes the dead letter, writes a pending key and
+  the body and merges one into its total redriven; a purge deletes it and
+  merges one into its total purged. The queue holds dead-lettered − redriven
+  − purged dead letters, exactly its dead letter keys, and every message
+  pushed is pending, claimed, acked, dead or purged. A store without the
+  family and these totals has no dead letters, as every store written before
+  they existed.
 - **Queue group.** The group's partitions; its partition queues are ordinary
   queues.
 - **State.** The caller's key-value state, by namespace.
 
 No cursor or in-flight count is persisted: a loaded queue derives its claim
 cursor and push cursor from its oldest and newest pending keys, its
-claimed count from its claim keys and its dead count from its dead letter
-keys. A persisted absolute value could be
+claimed count from its claim keys, and its dead count from its totals, so
+loading it reads no dead letter. A persisted absolute value could be
 overtaken by an older one written by a concurrent writer, so only totals,
 which are merged, are persisted.
 
@@ -182,6 +188,13 @@ record written before the field existed says; the limit such a queue gets is
 broker policy, the configured `default_max_deliveries`, not data. Adding the
 field changed no stored meaning, which is why it is a compatible change.
 
+`ClaimRecord.incarnation`, also `optional`, names the broker process that
+made the claim: a number the process picks when it opens the store. A claim
+whose incarnation is absent (made before the field existed) or not the
+reclaiming process's own was abandoned by a restart, so its reclaim gives
+the delivery back instead of counting it. Absent therefore reads as "made
+by an earlier process", which every such claim was.
+
 ### 4.2 Totals
 
 A total is a u64, 8 bytes **little-endian**, not protobuf, so that SlateDB's
@@ -189,7 +202,8 @@ merge operator can sum it. Every operation that changes a total merges its
 increment (8 bytes little-endian) in the batch of the operation, never an
 absolute value. The merge operator sums the existing value and every operand
 and refuses, failing the write, a merge on any key whose tag is not one of
-the totals (`0x02`, `0x03`) or an operand that is not 8 bytes.
+the totals (`0x02`, `0x03`, `0x0C`, `0x0D`, `0x0E`) or an operand that is not
+8 bytes.
 
 ### 4.3 Empty and opaque values
 

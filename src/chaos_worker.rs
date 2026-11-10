@@ -531,7 +531,8 @@ mod tests {
         );
         storage.mark_queue_finished(downstream).await.unwrap();
         let completion = storage.check_queue_completion(downstream).await.unwrap();
-        assert_eq!(completion, (true, true, 0, 0));
+        assert!(completion.drained);
+        assert_eq!(completion.dead_count, 0);
     }
 
     /// Goal: a worker whose heartbeat stream breaks and reconnects within
@@ -675,7 +676,7 @@ mod tests {
             let redelivered = claim(&client, queue, &worker, 10).await.messages;
             assert_eq!(ids_of(&redelivered), ids_of(&held));
             assert!(ids_of(&redelivered).is_disjoint(&ids_of(&acked)));
-            assert!(redelivered.iter().all(|c| c.delivery_count == 2));
+            assert!(redelivered.iter().all(|c| c.delivery_count == 1));
             complete(&client, queue, &redelivered, &worker, ack_action())
                 .await
                 .unwrap();
@@ -703,7 +704,8 @@ mod tests {
     /// the README documents, even for a worker that reconnects at once
     /// presenting its old lease: the lease table is in memory, so the
     /// restarted broker knows no lease from before. The claim is redelivered
-    /// with `delivery_count + 1`, and an ack of the claim made before the
+    /// with the delivery count it had, the restart taking no delivery from
+    /// it, and an ack of the claim made before the
     /// restart fails with `FAILED_PRECONDITION`. Method: claim under a long
     /// lease timeout, kill and restart the broker, reconnect the worker's
     /// heartbeat with its old lease id, then check the lease it gets, the
@@ -744,7 +746,7 @@ mod tests {
             );
             let redelivered = claim(&client, queue, &worker, 1).await.messages;
             assert_eq!(ids_of(&redelivered), ids_of(&held));
-            assert!(redelivered.iter().all(|c| c.delivery_count == 2));
+            assert!(redelivered.iter().all(|c| c.delivery_count == 1));
             complete(&client, queue, &redelivered, &worker, ack_action())
                 .await
                 .unwrap();
@@ -1231,7 +1233,8 @@ mod tests {
     // =====================================================================
 
     /// Goal: counters stay exact, nothing is lost or acked twice, every
-    /// redelivery raises `delivery_count` by exactly one, and the finished
+    /// redelivery after a nack raises `delivery_count` by exactly one while
+    /// one after a crash gives the abandoned delivery back, and the finished
     /// and drained state survives, across many crash and restart cycles
     /// with work in flight at each crash. Method: seeded cycles on one
     /// file:// store; each reopens it, checks the counters against what was
@@ -1294,7 +1297,11 @@ mod tests {
                         rng.random_range(1..=claimed.len())
                     };
                     let (to_ack, rest) = claimed.split_at(ack_count);
-                    let (to_nack, _left_claimed) = rest.split_at(rng.random_range(0..=rest.len()));
+                    let (to_nack, left_claimed) = rest.split_at(rng.random_range(0..=rest.len()));
+                    // The crash, not the worker, ends these deliveries.
+                    for message in left_claimed {
+                        *last_delivery.get_mut(&message.message.msg_id).unwrap() -= 1;
+                    }
                     let (ids, tokens) = split_claims(to_ack);
                     storage
                         .ack_messages(queue, &ids, &tokens, "worker", &lease)
@@ -1329,7 +1336,8 @@ mod tests {
                 let storage = AnvilStorage::new(&db_path).await.unwrap();
                 check_invariants(&storage, &queues).await;
                 let completion = storage.check_queue_completion(queue).await.unwrap();
-                assert_eq!(completion, (true, true, 0, 0), "seed {seed}");
+                assert!(completion.drained, "seed {seed}");
+                assert_eq!(completion.dead_count, 0, "seed {seed}");
                 let meta = storage.get_queue_stats(queue).await.unwrap();
                 assert_eq!(meta.total_acked, pushed.len() as u64, "seed {seed}");
             });

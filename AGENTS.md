@@ -42,8 +42,9 @@ is a format change and follows the spec.
 Queue counters live in memory (`QueueState`) and are authoritative while the
 broker runs. On load, `load_or_init_counters` derives what must be exact from
 the keys: `claim_seq` is the oldest pending key, `push_seq` is past the
-newest one, the in-flight count is the number of claimed keys, and the dead
-count the number of dead letter keys. Only the lifetime totals are read as persisted.
+newest one, and the in-flight count is the number of claimed keys. The dead
+count is dead-lettered − redriven − purged, three merged totals, so a load
+never scans dead letters. Only the lifetime totals are read as persisted.
 
 Never persist a counter as an absolute value. Concurrent writers compute their
 values under a lock but reach the WAL in any order, so an older value can land
@@ -128,7 +129,7 @@ an unknown queue cannot bring it into existence; a new read path must too.
 | `recover_expired_claims` | `scan_claimed(None)` | Background (every 10s default) | ✅ Acceptable |
 | `gc_acked_messages` | `scan_acked(None)` | Background (every 60s default) | ✅ Acceptable |
 | `delete_queue` | Multiple scans | Admin (rare, on job cleanup) | ✅ Acceptable |
-| Queue load | Counts the claim and dead letter keys | Once per queue per broker process | ✅ Acceptable |
+| Queue load | Counts the claim keys | Once per queue per broker process | ✅ Acceptable |
 | `list_dead_letters` | Bounded range scan from a cursor, at most 1000 | Admin | ✅ Acceptable |
 
 **Design Decision**: Low-frequency background/admin operations can use scan. Only hot-path operations (claim, ack, push, stats) must be O(1).

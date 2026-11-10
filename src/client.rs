@@ -423,6 +423,10 @@ impl AnvilRustClient {
     // Consumer API (uses unified Claim RPC)
     // ========================================================================
 
+    /// Claims up to `batch_size` messages. Returns `(messages, drained,
+    /// dead_count)`: `drained` once the queue is finished and empty, the
+    /// worker's signal to exit, and the dead letters left in the queue,
+    /// whose work was not done, reported when no message is returned.
     #[pyo3(signature = (queue, batch_size=1, timeout_ms=5000))]
     fn claim(
         &self,
@@ -430,7 +434,7 @@ impl AnvilRustClient {
         queue: String,
         batch_size: i32,
         timeout_ms: i32,
-    ) -> PyResult<(Vec<RustMessage>, bool)> {
+    ) -> PyResult<(Vec<RustMessage>, bool, i64)> {
         let inner = self.inner.clone();
         let q = queue.clone();
         py.allow_threads(move || {
@@ -453,11 +457,14 @@ impl AnvilRustClient {
                     .iter()
                     .map(|m| RustMessage::from_claim_message(m, &q))
                     .collect();
-                Ok((messages, resp.upstream_drained))
+                Ok((messages, resp.upstream_drained, resp.dead_count))
             })
         })
     }
 
+    /// Claims from a queue group, like `claim`. Returns `(messages,
+    /// source_queue, source_partition, drained, dead_count)`, the last two
+    /// for the whole group.
     #[pyo3(signature = (group_name, batch_size=1, timeout_ms=5000, assigned_partitions=None, allow_steal=false, steal_pending_threshold=0))]
     #[allow(clippy::too_many_arguments)]
     fn claim_from_group(
@@ -469,7 +476,7 @@ impl AnvilRustClient {
         assigned_partitions: Option<Vec<i32>>,
         allow_steal: bool,
         steal_pending_threshold: i64,
-    ) -> PyResult<(Vec<RustMessage>, String, i32, bool)> {
+    ) -> PyResult<(Vec<RustMessage>, String, i32, bool, i64)> {
         let inner = self.inner.clone();
         py.allow_threads(move || {
             inner.runtime.block_on(async {
@@ -508,6 +515,7 @@ impl AnvilRustClient {
                     resp.source_queue,
                     resp.source_partition,
                     resp.upstream_drained,
+                    resp.dead_count,
                 ))
             })
         })
@@ -986,6 +994,7 @@ impl AnvilRustClient {
             qd.set_item("total_pushed", s.total_pushed)?;
             qd.set_item("total_acked", s.total_acked)?;
             qd.set_item("dead_count", s.dead_count)?;
+            qd.set_item("total_purged", s.total_purged)?;
             queues_dict.set_item(q, qd)?;
         }
         let result = PyDict::new(py);
@@ -999,16 +1008,20 @@ impl AnvilRustClient {
     // Dead Letter API
     // ========================================================================
 
-    /// Up to `limit` dead letters of `queue` in msg_id order, after the
-    /// msg_id `start_after` when given: page on with the last one returned.
-    #[pyo3(signature = (queue, start_after=None, limit=100))]
+    /// One page of the dead letters of `queue` in msg_id order: up to
+    /// `limit`, and at most 1 MiB of them, after the msg_id `start_after`
+    /// when given. Returns `(letters, next_start_after)`; pass
+    /// `next_start_after` back for the next page, until it is `None`. With
+    /// `ids_only`, the letters come without payload or metadata.
+    #[pyo3(signature = (queue, start_after=None, limit=100, ids_only=false))]
     fn list_dead_letters(
         &self,
         py: Python<'_>,
         queue: String,
         start_after: Option<String>,
         limit: u32,
-    ) -> PyResult<Vec<DeadLetter>> {
+        ids_only: bool,
+    ) -> PyResult<(Vec<DeadLetter>, Option<String>)> {
         let inner = self.inner.clone();
         let resp = py.allow_threads(move || {
             inner.runtime.block_on(async {
@@ -1017,6 +1030,7 @@ impl AnvilRustClient {
                     queue,
                     start_after: start_after.unwrap_or_default(),
                     limit,
+                    ids_only,
                 };
                 client
                     .list_dead_letters(request)
@@ -1025,7 +1039,7 @@ impl AnvilRustClient {
                     .map(|r| r.into_inner())
             })
         })?;
-        Ok(resp
+        let letters = resp
             .dead_letters
             .into_iter()
             .map(|letter| DeadLetter {
@@ -1038,24 +1052,33 @@ impl AnvilRustClient {
                 worker_id: letter.worker_id,
                 dead_at_ms: letter.dead_at_ms,
             })
-            .collect())
+            .collect();
+        let next_start_after = Some(resp.next_start_after).filter(|id| !id.is_empty());
+        Ok((letters, next_start_after))
     }
 
     /// Returns dead letters to their queue with a fresh delivery count.
     /// Returns `{"redriven": [...], "missing": [...]}`; a msg_id that holds
-    /// no dead letter is missing, so a retry is safe. Raises
-    /// `QueueFinishedError` for a queue marked finished.
+    /// no dead letter is missing, so a retry is safe. A queue marked finished
+    /// raises `QueueFinishedError`, unless `reopen` clears the mark with the
+    /// redrive; its consumers that already exited must be started again.
+    #[pyo3(signature = (queue, msg_ids, reopen=false))]
     fn redrive_dead_letters(
         &self,
         py: Python<'_>,
         queue: String,
         msg_ids: Vec<String>,
+        reopen: bool,
     ) -> PyResult<PyObject> {
         let inner = self.inner.clone();
         let resp = py.allow_threads(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
-                let request = proto::RedriveDeadLettersRequest { queue, msg_ids };
+                let request = proto::RedriveDeadLettersRequest {
+                    queue,
+                    msg_ids,
+                    reopen,
+                };
                 // The only claim-free FAILED_PRECONDITION: no ClaimLostError.
                 client
                     .redrive_dead_letters(request)
@@ -1075,7 +1098,7 @@ impl AnvilRustClient {
         Ok(dict.into())
     }
 
-    /// Deletes dead letters, which then count as acked. Returns
+    /// Deletes dead letters, which then count as purged. Returns
     /// `{"purged": [...], "missing": [...]}`.
     fn purge_dead_letters(
         &self,
@@ -1140,6 +1163,7 @@ impl AnvilRustClient {
         dict.set_item("safe_to_exit", resp.safe_to_exit)?;
         dict.set_item("pending_count", resp.pending_count)?;
         dict.set_item("claimed_count", resp.claimed_count)?;
+        dict.set_item("dead_count", resp.dead_count)?;
         Ok(dict.into())
     }
 
@@ -1200,6 +1224,7 @@ impl AnvilRustClient {
             pd.set_item("pending_count", p.pending_count)?;
             pd.set_item("claimed_count", p.claimed_count)?;
             pd.set_item("finished", p.finished)?;
+            pd.set_item("dead_count", p.dead_count)?;
             partitions.append(pd)?;
         }
         let dict = PyDict::new(py);
@@ -1207,6 +1232,7 @@ impl AnvilRustClient {
         dict.set_item("all_drained", resp.all_drained)?;
         dict.set_item("safe_to_exit", resp.safe_to_exit)?;
         dict.set_item("partitions", partitions)?;
+        dict.set_item("dead_count", resp.dead_count)?;
         Ok(dict.into())
     }
 

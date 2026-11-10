@@ -305,6 +305,7 @@ mod tests {
                 queue: queue.to_string(),
                 start_after: String::new(),
                 limit: 10,
+                ids_only: false,
             })
             .await
             .unwrap()
@@ -335,6 +336,7 @@ mod tests {
             let request = RedriveDeadLettersRequest {
                 queue: queue.to_string(),
                 msg_ids,
+                reopen: false,
             };
             let refused = client.clone().redrive_dead_letters(request).await;
             assert_eq!(refused.unwrap_err().code(), tonic::Code::InvalidArgument);
@@ -345,6 +347,7 @@ mod tests {
                 queue: queue.to_string(),
                 start_after: String::new(),
                 limit: 1001,
+                ids_only: false,
             })
             .await;
         assert_eq!(bad_limit.unwrap_err().code(), tonic::Code::InvalidArgument);
@@ -362,6 +365,7 @@ mod tests {
             .redrive_dead_letters(RedriveDeadLettersRequest {
                 queue: queue.to_string(),
                 msg_ids: vec![pushed[0].clone()],
+                reopen: false,
             })
             .await
             .unwrap()
@@ -397,9 +401,35 @@ mod tests {
             .redrive_dead_letters(RedriveDeadLettersRequest {
                 queue: queue.to_string(),
                 msg_ids: vec![pushed[0].clone()],
+                reopen: false,
             })
             .await;
         assert_eq!(refused.unwrap_err().code(), tonic::Code::FailedPrecondition);
+
+        // The drain signal says what it leaves behind.
+        let drained = client
+            .clone()
+            .claim(ClaimRequest {
+                source: Some(claim_request::Source::Queue(queue.to_string())),
+                worker_id: "worker".to_string(),
+                lease_id: lease.lease_id.clone(),
+                batch_size: 1,
+                timeout_ms: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((drained.upstream_drained, drained.dead_count), (true, 1));
+        let finished = client
+            .clone()
+            .is_queue_finished(IsQueueFinishedRequest {
+                queue: queue.to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((finished.drained, finished.dead_count), (true, 1));
+
         let purged = client
             .clone()
             .purge_dead_letters(PurgeDeadLettersRequest {
@@ -414,7 +444,10 @@ mod tests {
             (vec![pushed[0].clone()], vec!["unknown".to_string()])
         );
         let s = stats(&client, queue).await;
-        assert_eq!((s.total_pushed, s.total_acked, s.dead_count), (2, 2, 0));
+        assert_eq!(
+            (s.total_pushed, s.total_acked, s.dead_count, s.total_purged),
+            (2, 1, 0, 1)
+        );
     }
 
     /// Goal: the basic worker cycle works over the wire. Method: push three

@@ -349,7 +349,8 @@ mod tests {
         assert_eq!(counts(&storage, "pending").await, (5, 5, 0, 0));
 
         // The writer's claims, settled with the tokens it handed out: one
-        // acked, the other reclaimed and redelivered.
+        // acked, the other reclaimed and redelivered. The writer's process
+        // made that claim, so its reclaim gives the delivery back.
         assert_eq!(counts(&storage, "claimed").await, (3, 0, 2, 1));
         let held = storage.scan_claimed(Some("claimed")).await.unwrap();
         assert_eq!(held.len(), 2);
@@ -380,7 +381,7 @@ mod tests {
         let redelivered = claim(&storage, "claimed", 10).await;
         let mut deliveries: Vec<u32> = redelivered.iter().map(|c| c.delivery_count).collect();
         deliveries.sort();
-        assert_eq!(deliveries, [1, 2]);
+        assert_eq!(deliveries, [1, 1]);
         ack(&storage, "claimed", &redelivered).await;
         assert_eq!(counts(&storage, "claimed").await, (3, 3, 0, 0));
 
@@ -411,7 +412,7 @@ mod tests {
         ack(&storage, "redelivered", &redelivered[1..]).await;
         assert_eq!(counts(&storage, "redelivered").await, (2, 1, 0, 0));
         let letters = storage
-            .list_dead_letters("redelivered", None, 10)
+            .list_dead_letters("redelivered", None, 10, false)
             .await
             .unwrap()
             .0;
@@ -423,9 +424,12 @@ mod tests {
             verify_dead_letters(&storage).await;
         }
 
-        assert_eq!(
-            storage.check_queue_completion("finished").await.unwrap(),
-            (true, true, 0, 0)
+        assert!(
+            storage
+                .check_queue_completion("finished")
+                .await
+                .unwrap()
+                .drained
         );
 
         let group = storage.get_group_meta(GROUP).await.unwrap().unwrap();
@@ -487,7 +491,10 @@ mod tests {
     /// redrives, purges and settles them.
     async fn verify_dead_letters(storage: &AnvilStorage) {
         assert_eq!(counts(storage, "dead").await, (3, 0, 0, 0));
-        let (mut letters, _) = storage.list_dead_letters("dead", None, 10).await.unwrap();
+        let (mut letters, _) = storage
+            .list_dead_letters("dead", None, 10, false)
+            .await
+            .unwrap();
         letters.sort_by(|a, b| a.message.payload.cmp(&b.message.payload));
         let found: Vec<(Vec<u8>, DeadLetterCause, &str, u32, &str)> = letters
             .iter()
@@ -529,7 +536,7 @@ mod tests {
         );
         let ids: Vec<String> = letters.iter().map(|l| l.message.msg_id.clone()).collect();
         let (redriven, _) = storage
-            .redrive_dead_letters("dead", &ids[..1])
+            .redrive_dead_letters("dead", &ids[..1], false)
             .await
             .unwrap();
         assert_eq!(redriven, ids[..1]);
@@ -539,8 +546,9 @@ mod tests {
         ack(storage, "dead", &claimed).await;
         let (purged, _) = storage.purge_dead_letters("dead", &ids[1..]).await.unwrap();
         assert_eq!(purged, ids[1..]);
-        assert_eq!(counts(storage, "dead").await, (3, 3, 0, 0));
-        assert_eq!(storage.get_meta("dead").await.unwrap().dead_count, 0);
+        assert_eq!(counts(storage, "dead").await, (3, 1, 0, 0));
+        let meta = storage.get_meta("dead").await.unwrap();
+        assert_eq!((meta.dead_count, meta.total_purged), (0, 2));
 
         // Its own limit of 0 outranks the verifier's default of 2.
         let claimed = claim(storage, "unlimited", 1).await;

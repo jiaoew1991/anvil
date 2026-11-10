@@ -164,6 +164,7 @@ pub(crate) fn encode_claim(claim: &ClaimInfo) -> Vec<u8> {
         claimed_at: claim.claimed_at,
         claim_token: claim.claim_token.clone(),
         delivery_count: claim.delivery_count,
+        incarnation: claim.incarnation,
     }
     .encode_to_vec()
 }
@@ -183,6 +184,7 @@ pub(crate) fn decode_claim(msg_id: &str, bytes: &[u8]) -> Result<ClaimInfo, Corr
         claimed_at: record.claimed_at,
         claim_token: record.claim_token,
         delivery_count: record.delivery_count,
+        incarnation: record.incarnation,
     })
 }
 
@@ -303,6 +305,7 @@ mod tests {
             claimed_at: 1_700_000_001.25,
             claim_token: "t".to_string(),
             delivery_count: 2,
+            incarnation: None,
         }
     }
 
@@ -341,6 +344,9 @@ mod tests {
             ("key group", keys::group("g")),
             ("key state", keys::state("ns:x", "k\0")),
             ("key dead_letter", keys::dead_letter("q:1", "m")),
+            ("key total_dead_lettered", keys::total_dead_lettered("q:1")),
+            ("key total_redriven", keys::total_redriven("q:1")),
+            ("key total_purged", keys::total_purged("q:1")),
             ("value format", encode_format(1)),
             ("value queue", encode_queue(5, None)),
             ("value queue max_deliveries", encode_queue(5, Some(0))),
@@ -348,6 +354,13 @@ mod tests {
             ("value pending", encode_pending("m", 3)),
             ("value message", encode_message(&message)),
             ("value claim", encode_claim(&claim)),
+            (
+                "value claim incarnation",
+                encode_claim(&ClaimInfo {
+                    incarnation: Some(0x0102_0304_0506_0708),
+                    ..claim.clone()
+                }),
+            ),
             ("value group", encode_group(&group)),
             (
                 "value dead_letter",
@@ -368,6 +381,9 @@ mod tests {
             ("key group", "09670001"),
             ("key state", "0a6e733a7800016b00ff0001"),
             ("key dead_letter", "0b713a3100016d0001"),
+            ("key total_dead_lettered", "0c713a310001"),
+            ("key total_redriven", "0d713a310001"),
+            ("key total_purged", "0e713a310001"),
             ("value format", "0801"),
             ("value queue", "0805"),
             ("value queue max_deliveries", "08051000"),
@@ -378,6 +394,10 @@ mod tests {
                 "0a030001ff1100002040fc54d9411a060a016b120176",
             ),
             ("value claim", "0a017712016c1900005040fc54d9412201742802"),
+            (
+                "value claim incarnation",
+                "0a017712016c1900005040fc54d941220174280230888e98a8c0e0808101",
+            ),
             (
                 "value group",
                 "08021a04675f70301a04675f70312100008040fc54d941",
@@ -418,7 +438,13 @@ mod tests {
             (decoded.worker_id, decoded.lease_id, decoded.claim_token),
             (claim.worker_id, claim.lease_id, claim.claim_token)
         );
-        assert_eq!(decoded.delivery_count, 2);
+        assert_eq!((decoded.delivery_count, decoded.incarnation), (2, None));
+        let current = ClaimInfo {
+            incarnation: Some(7),
+            ..sample_claim()
+        };
+        let decoded = decode_claim(&current.msg_id, &encode_claim(&current)).unwrap();
+        assert_eq!(decoded.incarnation, Some(7));
         let pending = decode_pending(&encode_pending("m", 3)).unwrap();
         assert_eq!((pending.msg_id.as_str(), pending.delivery_count), ("m", 3));
         let queue = decode_queue(&encode_queue(5, None)).unwrap();

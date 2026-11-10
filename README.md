@@ -28,20 +28,23 @@ runs as the per-job broker embedded in the Ray driver.
   step neither revives a dead lease nor kills a live one.
 - **Broker restarts reclaim every claim.** Leases live in the broker's memory.
   After a broker restart, every claim in flight is returned to pending and
-  redelivered with `delivery_count + 1`, even to a worker that reconnects at
-  once: expect acks of claims made before the restart to fail with
-  `FAILED_PRECONDITION`.
+  redelivered, even to a worker that reconnects at once: expect acks of
+  claims made before the restart to fail with `FAILED_PRECONDITION`. The
+  restart gives those deliveries back, so it neither raises a message's
+  `delivery_count` nor dead-letters it.
 - **Drain signal.** `claim` reports `upstream_drained` once a queue is marked
-  finished and empty; dead letters count as settled.
+  finished and empty; dead letters count as settled, and `claim` reports how
+  many are left beside the signal.
 - **Delivery count.** Every claimed message carries `delivery_count`: 1 on
-  first delivery, plus one for each nack or reclaimed lease.
+  first delivery, plus one for each nack or reclaimed lease of a worker.
 - **Dead letters.** A nack or reclaim that settles the last delivery a queue
   allows (`max_deliveries` on `CreateQueue`, else the broker's
   `default_max_deliveries`, 20; 0 is unlimited) moves the message to the
   queue's dead letters instead, with its body, the cause and the last nack's
   reason. A nack with `dead_letter=True` does so at once. Dead letters are
-  listed, redriven to pending with a fresh delivery count, or purged, which
-  counts them acked.
+  listed, redriven to pending with a fresh delivery count, or purged. See
+  the runbook in [docs/semantics.md](docs/semantics.md) section 5.6 for
+  recovering from a downstream outage.
 
 See [docs/semantics.md](docs/semantics.md) for the full consistency and
 recovery model and the error codes of every RPC.
@@ -73,7 +76,7 @@ client.start()
 client.create_queue("work")
 client.push("work", b"payload")
 
-messages, drained = client.claim("work", batch_size=1)
+messages, drained, dead_count = client.claim("work", batch_size=1)
 for message in messages:
     for chunk in work_in_chunks(message.payload):
         process(chunk)
@@ -81,10 +84,17 @@ for message in messages:
         client.renew("work", [message.msg_id], [message.claim_token])
     client.ack("work", [message.msg_id], claim_tokens=[message.claim_token])
 
-# Messages that failed every delivery wait as dead letters.
-for letter in client.list_dead_letters("work"):
-    print(letter.msg_id, letter.cause, letter.reason)
-client.redrive_dead_letters("work", [letter.msg_id])  # or purge_dead_letters
+# Messages that failed every delivery wait as dead letters: redrive them,
+# a page at a time (or purge_dead_letters).
+start_after = None
+while True:
+    letters, start_after = client.list_dead_letters(
+        "work", start_after=start_after, limit=1000, ids_only=True
+    )
+    if letters:
+        client.redrive_dead_letters("work", [letter.msg_id for letter in letters])
+    if start_after is None:
+        break
 ```
 
 ## Metrics
@@ -101,7 +111,7 @@ either variable, every instrument is a no-op. `service.name` defaults to
 | `anvil.queue.claimed` | gauge | `queue` | Messages claimed, not yet acked or returned |
 | `anvil.queue.dead` | gauge | `queue` | Dead letters waiting for a redrive or a purge |
 | `anvil.queue.pushed` | counter | `queue` | Messages pushed since the queue was created |
-| `anvil.queue.acked` | counter | `queue` | Messages acked since the queue was created, dead letters purged included |
+| `anvil.queue.acked` | counter | `queue` | Messages acked since the queue was created |
 | `anvil.leases.active` | gauge | | Worker leases currently registered |
 | `anvil.messages.redelivered` | counter | `queue` | Claims of a message delivered before |
 | `anvil.claims.reclaimed` | counter | `queue` | Claims taken back after a dead or aged-out lease, returned or dead-lettered |

@@ -114,7 +114,7 @@ message ClaimMessage {
   bytes payload = 2;
   map<string, string> metadata = 3;
   string claim_token = 4;               // inline with message (was separate list)
-  uint32 delivery_count = 5;            // 1 on first delivery; +1 per nack or reclaimed lease; 1 again after a redrive
+  uint32 delivery_count = 5;            // 1 on first delivery; +1 per nack or reclaimed lease (not a broker restart); 1 again after a redrive
 }
 
 message ClaimResponse {
@@ -127,6 +127,9 @@ message ClaimResponse {
   // finished + fully drained (pending=0, claimed=0; dead letters are settled).
   // Workers use this as the sole exit signal — no master notification needed.
   bool upstream_drained = 5;
+  // Dead letters left in the source queue/group, whose work was not done;
+  // reported when messages is empty, 0 otherwise.
+  int64 dead_count = 6;
 }
 
 // ============================================================================
@@ -308,8 +311,9 @@ message QueueStats {
   int64 pending_count = 2;
   int64 claimed_count = 3;
   int64 total_pushed = 4;
-  int64 total_acked = 5;                 // dead letters purged included
+  int64 total_acked = 5;
   int64 dead_count = 6;                  // dead letters waiting for a redrive or a purge
+  int64 total_purged = 7;                // dead letters purged; pushed = pending + claimed + acked + dead + purged
 }
 
 // ============================================================================
@@ -324,6 +328,9 @@ message ListDeadLettersRequest {
   string queue = 1;
   string start_after = 2;                // msg_id to list after; empty = from the first
   uint32 limit = 3;                      // 1..=1000
+  // Letters without payload or metadata, so a page holds up to `limit` ids
+  // whatever the bodies weigh: for paging through letters to redrive or purge.
+  bool ids_only = 4;
 }
 
 // A page holds at most `limit` letters and, unless a single letter is
@@ -346,10 +353,14 @@ message DeadLetter {
 }
 
 // Returns dead letters to the tail of pending with a fresh delivery count.
-// A finished queue refuses it with FAILED_PRECONDITION.
+// A finished queue refuses it with FAILED_PRECONDITION, unless `reopen`:
+// then the redrive clears the finished mark in the same write, so
+// upstream_drained is false again. Consumers that already exited on it must
+// be started again.
 message RedriveDeadLettersRequest {
   string queue = 1;
   repeated string msg_ids = 2;
+  bool reopen = 3;
 }
 
 message RedriveDeadLettersResponse {
@@ -357,7 +368,7 @@ message RedriveDeadLettersResponse {
   repeated string missing = 2;
 }
 
-// Deletes dead letters; they count toward total_acked.
+// Deletes dead letters; they count toward total_purged.
 message PurgeDeadLettersRequest {
   string queue = 1;
   repeated string msg_ids = 2;
@@ -390,6 +401,7 @@ message IsQueueFinishedResponse {
   bool safe_to_exit = 3;
   int64 pending_count = 4;
   int64 claimed_count = 5;
+  int64 dead_count = 6;                  // dead letters left, settled but not done
 }
 
 // ============================================================================
@@ -423,6 +435,7 @@ message IsGroupFinishedResponse {
   bool all_drained = 2;
   bool safe_to_exit = 3;
   repeated PartitionStatus partitions = 4;
+  int64 dead_count = 5;                  // dead letters left over every partition
 }
 
 message PartitionStatus {
@@ -430,6 +443,7 @@ message PartitionStatus {
   int64 pending_count = 2;
   int64 claimed_count = 3;
   bool finished = 4;
+  int64 dead_count = 5;
 }
 
 message GetGroupStatsRequest {
@@ -454,6 +468,7 @@ message PartitionStats {
   int64 total_pushed = 4;
   int64 total_acked = 5;
   int64 dead_count = 6;
+  int64 total_purged = 7;
 }
 
 message MarkGroupFinishedRequest {

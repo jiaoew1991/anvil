@@ -471,6 +471,7 @@ impl AnvilStorageReader {
         dict.set_item("total_pushed", meta.total_pushed)?;
         dict.set_item("total_acked", meta.total_acked)?;
         dict.set_item("dead_count", meta.dead_count)?;
+        dict.set_item("total_purged", meta.total_purged)?;
         Ok(dict.into())
     }
 

@@ -206,10 +206,19 @@ pub struct ClaimInfo {
     pub claim_token: String,
     /// How many times the message has been handed out, this claim included.
     pub delivery_count: u32,
+    /// The broker process that made the claim (`AnvilStorage::incarnation`);
+    /// `None` for a claim stored before claims recorded it.
+    pub incarnation: Option<u64>,
 }
 
 impl ClaimInfo {
-    pub fn new(msg_id: String, worker_id: String, lease_id: String, delivery_count: u32) -> Self {
+    pub fn new(
+        msg_id: String,
+        worker_id: String,
+        lease_id: String,
+        delivery_count: u32,
+        incarnation: u64,
+    ) -> Self {
         assert!(delivery_count >= 1);
         Self {
             msg_id,
@@ -218,6 +227,7 @@ impl ClaimInfo {
             claimed_at: now_secs(),
             claim_token: uuid::Uuid::now_v7().to_string(),
             delivery_count,
+            incarnation: Some(incarnation),
         }
     }
 }
@@ -410,6 +420,7 @@ mod tests {
             "worker-1".to_string(),
             "lease-456".to_string(),
             1,
+            7,
         );
 
         assert_eq!(claim.msg_id, "msg-123");
@@ -417,6 +428,7 @@ mod tests {
         assert_eq!(claim.lease_id, "lease-456");
         assert!(claim.claimed_at > 0.0);
         assert!(!claim.claim_token.is_empty());
+        assert_eq!(claim.incarnation, Some(7));
     }
 
     #[test]

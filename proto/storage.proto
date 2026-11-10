@@ -51,6 +51,11 @@ message ClaimRecord {
   string claim_token = 4;
   // Deliveries including this one, so at least 1.
   uint32 delivery_count = 5;
+  // The broker process that made the claim, a number it picks at open.
+  // Absent in claims made before the field existed. A reclaim of a claim
+  // made by another process, which a restart abandoned rather than the
+  // worker failing it, gives the delivery back.
+  optional uint64 incarnation = 6;
 }
 
 // Value of a queue group key. Its name is the key's.

@@ -219,7 +219,7 @@ mod tests {
             MESSAGES,
             "messages stranded behind the claim cursor: {meta:?}"
         );
-        let (_, drained_flag, _, _) = storage.check_queue_completion(queue).await.unwrap();
+        let drained_flag = storage.check_queue_completion(queue).await.unwrap().drained;
         assert!(drained_flag, "a finished, empty queue never drains");
     }
 

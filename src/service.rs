@@ -391,22 +391,22 @@ impl AnvilService {
                 };
 
                 // When empty, check if upstream is finished + fully drained
-                let upstream_drained = if messages.is_empty() {
+                let (upstream_drained, dead_count) = if messages.is_empty() {
                     match self.storage.check_queue_completion(&queue).await {
-                        Ok((finished, drained, _pending, _claimed)) => {
-                            if finished && drained {
+                        Ok(completion) => {
+                            if completion.drained {
                                 tracing::info!(
                                     "upstream_drained=true for queue={}, worker={}",
                                     queue,
                                     req.worker_id
                                 );
                             }
-                            finished && drained
+                            (completion.drained, completion.dead_count as i64)
                         }
-                        Err(_) => false,
+                        Err(_) => (false, 0),
                     }
                 } else {
-                    false
+                    (false, 0)
                 };
 
                 Ok(ClaimResponse {
@@ -415,6 +415,7 @@ impl AnvilService {
                     source_queue: String::new(),
                     source_partition: 0,
                     upstream_drained,
+                    dead_count,
                 })
             }
 
@@ -457,9 +458,9 @@ impl AnvilService {
                     claimed.iter().map(Self::to_claim_message).collect();
 
                 // When empty, check if upstream group is finished + fully drained
-                let upstream_drained = if messages.is_empty() {
+                let (upstream_drained, dead_count) = if messages.is_empty() {
                     match self.storage.check_group_completion(&group.group_name).await {
-                        Ok((all_finished, all_drained, _partitions)) => {
+                        Ok((all_finished, all_drained, partitions)) => {
                             if all_finished && all_drained {
                                 tracing::info!(
                                     "upstream_drained=true for group={}, worker={}",
@@ -467,12 +468,13 @@ impl AnvilService {
                                     req.worker_id
                                 );
                             }
-                            all_finished && all_drained
+                            let dead_count = partitions.iter().map(|p| p.dead_count as i64).sum();
+                            (all_finished && all_drained, dead_count)
                         }
-                        Err(_) => false,
+                        Err(_) => (false, 0),
                     }
                 } else {
-                    false
+                    (false, 0)
                 };
 
                 Ok(ClaimResponse {
@@ -481,6 +483,7 @@ impl AnvilService {
                     source_queue,
                     source_partition: source_partition as i32,
                     upstream_drained,
+                    dead_count,
                 })
             }
 
@@ -764,6 +767,7 @@ impl Anvil for AnvilService {
                             total_pushed: meta.total_pushed as i64,
                             total_acked: meta.total_acked as i64,
                             dead_count: meta.dead_count as i64,
+                            total_purged: meta.total_purged as i64,
                         },
                     );
                 }
@@ -805,7 +809,7 @@ impl Anvil for AnvilService {
         let start_after = Some(req.start_after.as_str()).filter(|id| !id.is_empty());
         let (letters, more) = self
             .storage
-            .list_dead_letters(&req.queue, start_after, limit)
+            .list_dead_letters(&req.queue, start_after, limit, req.ids_only)
             .await
             .map_err(|e| storage_status("ListDeadLetters", e))?;
         let next_start_after = match letters.last() {
@@ -840,7 +844,7 @@ impl Anvil for AnvilService {
         check_dead_letter_ids(&req.msg_ids)?;
         let (redriven, missing) = self
             .storage
-            .redrive_dead_letters(&req.queue, &req.msg_ids)
+            .redrive_dead_letters(&req.queue, &req.msg_ids, req.reopen)
             .await
             .map_err(|e| storage_status("RedriveDeadLetters", e))?;
         Ok(Response::new(RedriveDeadLettersResponse {
@@ -891,15 +895,14 @@ impl Anvil for AnvilService {
             return Err(Status::invalid_argument("queue is required"));
         }
         match self.storage.check_queue_completion(&req.queue).await {
-            Ok((finished, drained, pending_count, claimed_count)) => {
-                Ok(Response::new(IsQueueFinishedResponse {
-                    finished,
-                    drained,
-                    safe_to_exit: finished && drained,
-                    pending_count: pending_count as i64,
-                    claimed_count: claimed_count as i64,
-                }))
-            }
+            Ok(completion) => Ok(Response::new(IsQueueFinishedResponse {
+                finished: completion.finished,
+                drained: completion.drained,
+                safe_to_exit: completion.drained,
+                pending_count: completion.pending_count as i64,
+                claimed_count: completion.claimed_count as i64,
+                dead_count: completion.dead_count as i64,
+            })),
             Err(e) => Err(storage_status("IsQueueFinished", e)),
         }
     }
@@ -954,14 +957,16 @@ impl Anvil for AnvilService {
         }
 
         match self.storage.check_group_completion(&req.group_name).await {
-            Ok((all_finished, all_drained, partition_statuses)) => {
-                let partitions = partition_statuses
+            Ok((all_finished, all_drained, completions)) => {
+                let partitions = completions
                     .iter()
-                    .map(|(pid, pending, claimed, finished)| PartitionStatus {
-                        partition_id: *pid as i32,
-                        pending_count: *pending as i64,
-                        claimed_count: *claimed as i64,
-                        finished: *finished,
+                    .enumerate()
+                    .map(|(pid, completion)| PartitionStatus {
+                        partition_id: pid as i32,
+                        pending_count: completion.pending_count as i64,
+                        claimed_count: completion.claimed_count as i64,
+                        finished: completion.finished,
+                        dead_count: completion.dead_count as i64,
                     })
                     .collect();
                 Ok(Response::new(IsGroupFinishedResponse {
@@ -969,6 +974,7 @@ impl Anvil for AnvilService {
                     all_drained,
                     safe_to_exit: all_finished && all_drained,
                     partitions,
+                    dead_count: completions.iter().map(|c| c.dead_count as i64).sum(),
                 }))
             }
             Err(e) => Err(storage_status("IsGroupFinished", e)),
@@ -1009,6 +1015,7 @@ impl Anvil for AnvilService {
                             total_pushed: meta.total_pushed as i64,
                             total_acked: meta.total_acked as i64,
                             dead_count: meta.dead_count as i64,
+                            total_purged: meta.total_purged as i64,
                         }
                     })
                     .collect();

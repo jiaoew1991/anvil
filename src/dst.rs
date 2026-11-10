@@ -21,7 +21,7 @@
 // Invariants checked:
 //   1. Counter consistency: meta.claimed_count == actual claimed keys
 //   2. Pending consistency: push_seq - claim_seq == actual pending keys
-//   3. Message conservation: every msg_id is in exactly one of pending/claimed/acked/dead
+//   3. Message conservation: every msg_id is in exactly one of pending/claimed/acked/dead/purged
 //   4. No overlap: no msg_id appears in both claimed and acked
 //   5. ack_and_forward atomicity: downstream push_seq increases iff upstream ack succeeds
 
@@ -361,7 +361,7 @@ pub(crate) mod tests {
                     let queue = &self.queues[queue_idx];
                     let (letters, _) = self
                         .storage
-                        .list_dead_letters(queue, None, 3)
+                        .list_dead_letters(queue, None, 3, false)
                         .await
                         .unwrap();
                     if letters.is_empty() {
@@ -371,7 +371,7 @@ pub(crate) mod tests {
                         letters.into_iter().map(|l| l.message.msg_id).collect();
                     let (redriven, missing) = self
                         .storage
-                        .redrive_dead_letters(queue, &msg_ids)
+                        .redrive_dead_letters(queue, &msg_ids, false)
                         .await
                         .unwrap();
                     assert_eq!((redriven, missing), (msg_ids, Vec::new()));
@@ -381,7 +381,7 @@ pub(crate) mod tests {
                     let queue = &self.queues[queue_idx];
                     let (letters, _) = self
                         .storage
-                        .list_dead_letters(queue, None, 2)
+                        .list_dead_letters(queue, None, 2, false)
                         .await
                         .unwrap();
                     if letters.is_empty() {
@@ -451,7 +451,12 @@ pub(crate) mod tests {
         let mut start_after: Option<String> = None;
         loop {
             let (page, more) = storage
-                .list_dead_letters(queue, start_after.as_deref(), DEAD_LETTERS_PER_CALL_MAX)
+                .list_dead_letters(
+                    queue,
+                    start_after.as_deref(),
+                    DEAD_LETTERS_PER_CALL_MAX,
+                    false,
+                )
                 .await
                 .unwrap();
             start_after = page.last().map(|l| l.message.msg_id.clone());
@@ -491,20 +496,18 @@ pub(crate) mod tests {
                 meta
             );
 
-            // Invariant 3: conservation — pending + claimed + acked + dead >=
-            // total_pushed (excess = cumulative nack count, always >= 0)
-            let lhs = pending_from_meta + meta.claimed_count + meta.total_acked + meta.dead_count;
+            // Invariant 3: conservation — pending + claimed + acked + dead +
+            // purged >= total_pushed (excess = cumulative nack count, always
+            // >= 0)
+            let lhs = pending_from_meta
+                + meta.claimed_count
+                + meta.total_acked
+                + meta.dead_count
+                + meta.total_purged;
             assert!(
                 lhs >= meta.total_pushed,
-                "[{}] conservation: {} + {} + {} + {} = {} < total_pushed={} (meta={:?})",
-                queue,
-                pending_from_meta,
-                meta.claimed_count,
-                meta.total_acked,
-                meta.dead_count,
-                lhs,
+                "[{queue}] conservation: {lhs} < total_pushed={} (meta={meta:?})",
                 meta.total_pushed,
-                meta
             );
 
             // Invariant 3b: dead_count == actual dead letter keys, none of

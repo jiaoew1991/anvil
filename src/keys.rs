@@ -49,6 +49,9 @@ const FINISHED: u8 = 0x08;
 const GROUP: u8 = 0x09;
 const STATE: u8 = 0x0a;
 const DEAD_LETTER: u8 = 0x0b;
+const TOTAL_DEAD_LETTERED: u8 = 0x0c;
+const TOTAL_REDRIVEN: u8 = 0x0d;
+const TOTAL_PURGED: u8 = 0x0e;
 
 const ESCAPE: u8 = 0x00;
 const ESCAPED_NUL: u8 = 0xff;
@@ -198,10 +201,30 @@ pub(crate) fn total_acked(queue: &str) -> Vec<u8> {
     Key::new(TOTAL_ACKED, queue.len() + 2).string(queue).0
 }
 
+/// The lifetime count of messages of `queue` dead-lettered, merge-summed.
+pub(crate) fn total_dead_lettered(queue: &str) -> Vec<u8> {
+    Key::new(TOTAL_DEAD_LETTERED, queue.len() + 2)
+        .string(queue)
+        .0
+}
+
+/// The lifetime count of dead letters of `queue` redriven, merge-summed.
+pub(crate) fn total_redriven(queue: &str) -> Vec<u8> {
+    Key::new(TOTAL_REDRIVEN, queue.len() + 2).string(queue).0
+}
+
+/// The lifetime count of dead letters of `queue` purged, merge-summed.
+pub(crate) fn total_purged(queue: &str) -> Vec<u8> {
+    Key::new(TOTAL_PURGED, queue.len() + 2).string(queue).0
+}
+
 /// Whether `key` holds a merge-summed total, the only keys the merge
 /// operator may combine.
 pub(crate) fn is_total(key: &[u8]) -> bool {
-    matches!(key.first(), Some(&(TOTAL_PUSHED | TOTAL_ACKED)))
+    matches!(
+        key.first(),
+        Some(&(TOTAL_PUSHED | TOTAL_ACKED | TOTAL_DEAD_LETTERED | TOTAL_REDRIVEN | TOTAL_PURGED))
+    )
 }
 
 /// The message waiting at `seq` in `queue`.
@@ -463,6 +486,9 @@ mod tests {
         assert!(parse_queue(&[QUEUE, b'q', 0x00, 0x02]).is_err());
         assert!(parse_queue(&[QUEUE, 0xc3, 0x28, 0x00, 0x01]).is_err());
         assert!(is_total(&total_pushed("q")) && is_total(&total_acked("q")));
+        assert!(is_total(&total_dead_lettered("q")) && is_total(&total_redriven("q")));
+        assert!(is_total(&total_purged("q")));
+        assert!(!is_total(&dead_letter("q", "m")));
         assert!(!is_total(&queue("q")) && !is_total(FORMAT));
     }
 }

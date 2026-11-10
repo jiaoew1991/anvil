@@ -84,7 +84,7 @@ PENDING ──claim()──▶ CLAIMED ──ack()──▶ ACKED ──GC──
  │  │ timeout/nack()     │ │ timeout/nack() at the delivery limit,
  │  └────────────────────┘ │ or nack(dead_letter)
  │                         ▼
- └──────redrive()────── DEAD ──purge()──▶ ACKED (counted, no entry)
+ └──────redrive()────── DEAD ──purge()──▶ PURGED (counted, no entry)
 ```
 
 | State | Description | Visibility |
@@ -95,8 +95,10 @@ PENDING ──claim()──▶ CLAIMED ──ack()──▶ ACKED ──GC──
 | DEAD | Failed every delivery its queue allows, or rejected by a worker | Listed by `ListDeadLetters`; no worker can claim it |
 | DELETED | Garbage collected | Removed from storage |
 
-Every message pushed is pending, claimed, acked or dead: `total_pushed =
-pending + claimed + total_acked + dead_count`, once in-flight writes land.
+Every message pushed is pending, claimed, acked, dead or purged:
+`total_pushed = pending + claimed + total_acked + dead_count + total_purged`,
+once in-flight writes land. Acked means a worker succeeded; a purged dead
+letter is counted apart.
 
 ### 2.2 Key Operations
 
@@ -108,7 +110,7 @@ pending + claimed + total_acked + dead_count`, once in-flight writes land.
 | `ack_and_forward(...)` | Atomic | Ack upstream + push downstream + update state |
 | `nack(queue, msg_ids)` | Atomic | Return messages to pending (at tail), or dead-letter them (section 4.1) |
 | `redrive_dead_letters(queue, msg_ids)` | Atomic | Move dead letters to pending (at tail), delivery count reset |
-| `purge_dead_letters(queue, msg_ids)` | Atomic | Delete dead letters, counting them acked |
+| `purge_dead_letters(queue, msg_ids)` | Atomic | Delete dead letters, counting them purged |
 
 ### 2.3 Storage Model (SlateDB)
 
@@ -340,7 +342,9 @@ its lease table in memory and is the only one to mint lease ids:
   taken nor renewed within `claim_age_timeout_secs`. A reclaimed claim returns
   to the tail of pending, to be delivered with `delivery_count + 1`, unless
   it was its queue's last delivery (below). Either way the claim is gone, so
-  the former holder's ack fails with `FAILED_PRECONDITION`.
+  the former holder's ack fails with `FAILED_PRECONDITION`. A claim made by
+  an earlier broker process is different: a restart, not its worker, ended
+  that delivery (see "Broker restart").
 
 **Dead letters.** A queue allows `max_deliveries` deliveries of a message,
 set by `CreateQueue` (or `CreateQueueGroup`, per partition); a queue that
@@ -358,20 +362,28 @@ next nack or reclaim, and a message already past it gets that one more
 delivery.
 
 Dead letters are neither pending nor claimed: they count as settled for the
-drain signal and take no room in a bounded queue. A queue reported drained
-while it holds dead letters logs a warning, once, so work a pipeline skipped
-does not go unnoticed. They stay until an operator
-acts on them, at most 1000 per call:
+drain signal and take no room in a bounded queue. So that work a pipeline
+skipped does not go unnoticed, the drain signal reports them: `ClaimResponse`
+carries `dead_count` beside `upstream_drained`, as do `IsQueueFinished` and
+`IsGroupFinished`, and the broker logs a warning whenever it reports a queue
+drained with dead letters it has not warned about yet. They stay until an
+operator acts on them, at most 1000 per call:
 
 - `ListDeadLetters` pages through them in msg_id order. A page holds at
   most `limit` letters and, unless one letter alone is larger, at most 1 MiB
   of them, payloads included; `next_start_after` continues the listing.
+  With `ids_only`, letters come without payload or metadata, and only their
+  ids count toward the 1 MiB.
 - `RedriveDeadLetters` returns them to the tail of pending as messages
-  delivered no time before, so each gets a full set of deliveries again. A
-  queue marked finished refuses it with `FAILED_PRECONDITION`, since its
-  consumers may already have been told it drained; a redrive is not refused
-  by a bound, its messages having counted against it before they died.
-- `PurgeDeadLetters` deletes them and adds them to `total_acked`.
+  delivered no time before, so each gets a full set of deliveries again; a
+  redrive is not refused by a bound, its messages having counted against it
+  before they died. A queue marked finished may already have told its
+  consumers it drained, so it refuses a redrive with `FAILED_PRECONDITION`,
+  unless the redrive sets `reopen`: the finished mark is then deleted in the
+  redrive's own write, and `upstream_drained` is false again. Consumers that
+  already exited on the drain signal must be started again; the producer
+  marks the queue finished again when it is done.
+- `PurgeDeadLetters` deletes them and adds them to `total_purged`.
 
 Both report the msg_ids that held no dead letter instead of failing, so a
 retry after a timeout is safe. The Python client raises `QueueFinishedError`,
@@ -386,10 +398,14 @@ letter at once. `DeleteQueue` deletes a queue's dead letters with it.
 
 **Broker restart.** The lease table does not survive a restart. After a broker
 restart, every claim in flight is returned to pending on the first recovery
-tick and redelivered with `delivery_count + 1`, even to a worker that
-reconnects at once presenting its old lease, which the restarted broker does
-not know. Workers should expect their acks of claims made before the restart
-to fail with `FAILED_PRECONDITION`, and drop those messages.
+tick, even to a worker that reconnects at once presenting its old lease,
+which the restarted broker does not know. Workers should expect their acks of
+claims made before the restart to fail with `FAILED_PRECONDITION`, and drop
+those messages. The restart, not the worker, ended those deliveries, so
+their reclaim gives the delivery back: each message is redelivered with the
+`delivery_count` of the claim the restart abandoned, and none is
+dead-lettered, however many restarts it lives through. Each claim records the
+broker process that made it to tell the two apart.
 
 **Configuration:**
 - `lease_timeout_secs`: Default 60s - how long a lease may miss heartbeats before its worker is considered dead and all its claims are reclaimed
@@ -560,6 +576,36 @@ Timeline:
 Result: Message processed twice
         → Same as crash scenario, need deduplication
 ```
+
+### 5.6 Runbook: A Downstream Outage Dead-Lettered a Lot of Work
+
+When the service the workers call goes down, every message fails until it
+comes back, and each one is dead-lettered once it has used up its
+deliveries. The messages are not lost; recover them in three steps.
+
+1. **Stop the bleeding.** While the outage lasts, lift the limit of the live
+   queues so nothing more dies: `create_queue(q, max_deliveries=0)`, or
+   `create_queue_group(g, n, max_deliveries=0)` for a group's partitions.
+   Creating an existing queue changes only the settings it is given. Set the
+   limit back the same way once the downstream is healthy.
+2. **Redrive.** Once the downstream has recovered, page through the dead
+   letters with `list_dead_letters(q, ids_only=True, limit=1000)` and pass
+   each page's msg_ids to `redrive_dead_letters`. A finished queue needs
+   `reopen=True`; start again the consumers that exited on its drain
+   signal. Each redriven message gets a full set of deliveries again.
+3. **Or purge** the letters not worth retrying with `purge_dead_letters`;
+   they count in `total_purged`.
+
+Dead letters live in the store like any message: a `memory://` store loses
+them, with everything else, when its broker stops.
+
+To find out early, alert on any increase of `anvil.messages.dead_lettered`,
+and on a queue that drains with `dead_count > 0` (in `ClaimResponse`,
+`IsQueueFinished` and `GetStats`; the broker also logs a warning).
+
+A worker that sets `dead_letter` on a nack sent to a broker older than dead
+letters is not refused: that broker ignores the field it does not know and
+requeues the message as before.
 
 ---
 
