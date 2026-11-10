@@ -162,10 +162,10 @@ mod tests {
     /// pruned lease cannot be renewed back to life.
     #[test]
     fn test_lease_lifecycle() {
-        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SIM_TIME_LOCK};
+        use crate::types::{advance_sim_time_secs, set_sim_time_nanos, SimClock};
         const LEASE_TIMEOUT_SECS: f64 = 5.0;
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         set_sim_time_nanos(1_735_689_600_000_000_000);
         let state = AnvilState::new();
 
@@ -192,7 +192,6 @@ mod tests {
             unknown,
             "reopened a pruned lease"
         );
-        set_sim_time_nanos(0);
     }
 
     #[test]

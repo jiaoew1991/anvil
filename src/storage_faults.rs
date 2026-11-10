@@ -21,7 +21,6 @@
 // exactly as `tokio::time::timeout` does here.
 
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)] // SIM_TIME_LOCK is intentionally held across awaits to serialize time-sensitive tests
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::Ordering;
@@ -41,7 +40,7 @@ mod tests {
     use crate::state::AnvilState;
     use crate::storage::tests::split_claims;
     use crate::storage::AnvilStorage;
-    use crate::types::{set_sim_time_nanos, AnvilConfig, Message, SIM_TIME_LOCK};
+    use crate::types::{AnvilConfig, Message, SimClock};
 
     /// Bounds every wait, so a wedged broker fails the test instead of
     /// hanging it. Generous: SlateDB backs off up to a second per retry.
@@ -129,7 +128,7 @@ mod tests {
     /// faults still on, and check every acknowledged push and ack.
     #[test]
     fn test_flaky_store_keeps_every_acknowledged_effect() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         for seed in [11u64, 12] {
             let inner = memory();
             let store = FaultStore::new(inner.clone(), seed);
@@ -168,7 +167,6 @@ mod tests {
                 .expect("recovery check wedged on the flaky store");
             });
         }
-        set_sim_time_nanos(0);
     }
 
     /// Goal: a claim cancelled mid-flight, as a client deadline cancels it
@@ -315,7 +313,7 @@ mod tests {
     /// timeout, with recovery running often.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_slow_writes_do_not_expire_live_leases() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         const WORKERS: usize = 3;
         const MESSAGES: usize = 3;
         const LEASE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -423,7 +421,7 @@ mod tests {
     /// and GC running hot, count the requests, then restore the store.
     #[test]
     fn test_outage_stalls_then_broker_recovers() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         const OUTAGE: Duration = Duration::from_secs(2);
         let inner = memory();
         let store = FaultStore::new(inner.clone(), 6);

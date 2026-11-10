@@ -31,7 +31,7 @@ pub(crate) mod tests {
     use crate::service::AnvilService;
     use crate::state::AnvilState;
     use crate::storage::AnvilStorage;
-    use crate::types::{AnvilConfig, ClaimInfo, SIM_TIME_LOCK};
+    use crate::types::{AnvilConfig, ClaimInfo, SimClock};
 
     /// Bounds every wait on a racing task, so a deadlock fails the test
     /// instead of hanging the suite.
@@ -670,7 +670,7 @@ pub(crate) mod tests {
     // =====================================================================
 
     /// The ways one claim can end.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Settlement {
         Ack,
         Nack,
@@ -678,13 +678,21 @@ pub(crate) mod tests {
         Reclaim,
     }
 
-    /// Goal: a claim is settled exactly once, whatever races for it.
+    /// Goal: a claim is settled exactly once, whatever races for it, and
+    /// each kind of settlement can be the one.
     /// Method: two acks with the same token, a nack, a forward, a recovery
-    /// reclaim and a renewal race on one claim, 150 times. Exactly one
-    /// settlement wins and its effect alone is visible: an ack counts once,
-    /// a forward delivers one output, a nack or reclaim redelivers the input
-    /// once with delivery_count 2. Downstream is checked by draining it,
-    /// not by stats, which a fenced forward inflates
+    /// reclaim and a renewal race on one claim, 150 times. Each trial
+    /// rotates which settlement is spawned first, its leader. The runtime
+    /// has one thread, so spawn order and await points alone decide the
+    /// interleaving: the leader takes the settlement hold before it first
+    /// suspends, and the others make their checks while it writes. A
+    /// work-stealing runtime would leave the winner to chance: there too
+    /// the first-spawned task runs first unless an idle worker steals a
+    /// later one, which under load is rare. The leader wins every trial and
+    /// its effect alone is visible: an ack counts once, a forward delivers
+    /// one output, a nack or reclaim redelivers the input once with
+    /// delivery_count 2. Downstream is checked by draining it, not by
+    /// stats, which a fenced forward inflates
     /// (test_fenced_forward_leaves_no_phantom_pending).
     #[test]
     fn test_settlements_racing_on_one_claim_settle_it_once() {
@@ -698,20 +706,29 @@ pub(crate) mod tests {
         ];
         // A reclaim skips a claim renewed at or after its read time, so a
         // test moving the simulated clock meanwhile would skew the race.
-        let _clock = SIM_TIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        race_runtime().block_on(async {
+        let _clock = SimClock::acquire();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
             // Trials run side by side: each durable write waits out a WAL
             // flush, so serial trials would spend the suite's time budget.
             let trials: Vec<_> = (0..TRIALS)
                 .map(|trial| {
                     tokio::spawn(async move {
                         let (service, storage) = service().await;
+                        // A forward to a queue not yet loaded suspends to
+                        // load it before it reaches the hold.
+                        storage.create_queue("down", 0).await.unwrap();
                         let message = push_and_claim(&service, "up").await;
                         let (_, msg_id, info) =
                             storage.scan_claimed(Some("up")).await.unwrap().remove(0);
                         let claim_info = ClaimInfo { msg_id, ..info };
                         let read_at = crate::types::mono_now();
-                        let attempts: Vec<_> = ATTEMPTS
+                        let mut order = ATTEMPTS;
+                        order.rotate_left(trial % ATTEMPTS.len());
+                        let attempts: Vec<_> = order
                             .iter()
                             .map(|&settlement| {
                                 let (service, storage) = (service.clone(), storage.clone());
@@ -780,7 +797,7 @@ pub(crate) mod tests {
                             .await
                             .unwrap()
                             .unwrap();
-                        assert_eq!(won.len(), 1, "trial {trial}: settled by {won:?}");
+                        assert_eq!(won, [order[0]], "trial {trial}: settled by {won:?}");
                         let winner = won[0];
 
                         let acked =
@@ -804,19 +821,15 @@ pub(crate) mod tests {
                             "trial {trial}: {winner:?}"
                         );
                         assert!(redelivered.iter().all(|m| m.delivery_count == 2));
-                        winner
                     })
                 })
                 .collect();
-            let mut winners: HashMap<Settlement, usize> = HashMap::new();
             for trial in trials {
-                let winner = tokio::time::timeout(TASK_DEADLINE, trial)
+                tokio::time::timeout(TASK_DEADLINE, trial)
                     .await
                     .unwrap()
                     .unwrap();
-                *winners.entry(winner).or_default() += 1;
             }
-            assert!(winners.len() >= 2, "the winner never varied: {winners:?}");
         });
     }
 

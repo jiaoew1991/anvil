@@ -27,14 +27,13 @@
 // for alongside every earlier one.
 
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)] // SIM_TIME_LOCK is held across awaits to keep the clock this harness's own
 mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::path::Path;
 
     use crate::storage::tests::split_claims;
     use crate::storage::{AnvilStorage, Rejection};
-    use crate::types::{now_nanos, set_sim_time_nanos, ClaimedMessage, Message, SIM_TIME_LOCK};
+    use crate::types::{now_nanos, set_sim_time_nanos, ClaimedMessage, Message, SimClock};
 
     /// Names the scenario a writer wrote, so the verifier knows what to
     /// expect. Bumped whenever the writer adds to the scenario.
@@ -91,7 +90,7 @@ mod tests {
 
     /// Writes scenario 1 into an empty store at `dir`.
     async fn write(dir: &Path) {
-        let _clock = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let storage = open(dir).await;
 
         // Redelivered: one message nacked and one reclaimed from a dead
@@ -220,7 +219,7 @@ mod tests {
     /// wrote at `dir`, settling and collecting what it holds as it goes.
     async fn verify(dir: &Path) {
         // GC reads the wall clock, which a test elsewhere must not move.
-        let _clock = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let storage = open(dir).await;
         let scenario = storage
             .state_get_batch(COMPAT, &["scenario".to_string()])

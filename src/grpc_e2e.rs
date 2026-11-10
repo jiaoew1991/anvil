@@ -17,7 +17,6 @@
 // so leases come from real `HeartbeatStream`s and expire on the real clock.
 
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)] // SIM_TIME_LOCK is intentionally held across awaits to serialize time-sensitive tests
 mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -31,7 +30,7 @@ mod tests {
     use crate::server::AnvilBrokerInner;
     use crate::service::proto::anvil_client::AnvilClient;
     use crate::service::proto::*;
-    use crate::types::{AnvilConfig, SIM_TIME_LOCK};
+    use crate::types::{AnvilConfig, SimClock};
 
     /// Short enough that a test waits a fraction of a second for a lease or
     /// a claim to expire, long enough that a heartbeat or renewal every
@@ -237,7 +236,7 @@ mod tests {
     /// tokens, and check the claim order, the delivery counts and the stats.
     #[tokio::test]
     async fn test_grpc_push_claim_ack() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (_broker, client) = start_broker(LONG_TIMEOUT_SECS, LONG_TIMEOUT_SECS).await;
         let queue = "e2e";
         create_queue(&client, queue).await;
@@ -280,7 +279,7 @@ mod tests {
     /// still acks.
     #[tokio::test]
     async fn test_grpc_open_heartbeat_keeps_claims() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (_broker, client) = start_broker(SHORT_TIMEOUT_SECS, LONG_TIMEOUT_SECS).await;
         let queue = "e2e";
         create_queue(&client, queue).await;
@@ -305,7 +304,7 @@ mod tests {
     /// second worker's lease, then ack with the old and the new token.
     #[tokio::test]
     async fn test_grpc_dropped_heartbeat_reclaims_claims() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (_broker, client) = start_broker(SHORT_TIMEOUT_SECS, LONG_TIMEOUT_SECS).await;
         let queue = "e2e";
         create_queue(&client, queue).await;
@@ -359,7 +358,7 @@ mod tests {
     /// must stay claimed through several more claim-age windows and then ack.
     #[tokio::test]
     async fn test_grpc_renew_claims_keeps_claim_past_claim_age() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (_broker, client) = start_broker(LONG_TIMEOUT_SECS, SHORT_TIMEOUT_SECS).await;
         let queue = "e2e";
         create_queue(&client, queue).await;
@@ -410,7 +409,7 @@ mod tests {
     /// different payloads and state and check none of them landed.
     #[tokio::test]
     async fn test_grpc_scatter_complete_writes_all_effects_once() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (_broker, client) = start_broker(LONG_TIMEOUT_SECS, LONG_TIMEOUT_SECS).await;
         let (upstream, group) = ("src", "fanout");
         create_queue(&client, upstream).await;

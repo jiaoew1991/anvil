@@ -36,7 +36,7 @@ mod tests {
     use crate::service::proto::*;
     use crate::service::AnvilService;
     use crate::storage::AnvilStorage;
-    use crate::types::SIM_TIME_LOCK;
+    use crate::types::SimClock;
 
     /// Queue names with separators other than ':' and unicode, so the model
     /// also checks that queues sharing a name prefix stay apart.
@@ -423,7 +423,7 @@ mod tests {
     fn run_seeds(fenced_forwards: bool) {
         // Recovery compares claim and renewal times with its own clock, so a
         // test moving the simulated clock meanwhile would skew them.
-        let _clock = SIM_TIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _clock = SimClock::acquire();
         race_runtime().block_on(run_seeds_async(fenced_forwards));
     }
 

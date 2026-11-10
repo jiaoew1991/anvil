@@ -25,7 +25,6 @@
 // `file://` path, as a restarted process would.
 
 #[cfg(test)]
-#[allow(clippy::await_holding_lock)] // SIM_TIME_LOCK is intentionally held across awaits to serialize time-sensitive tests
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::future::Future;
@@ -49,7 +48,7 @@ mod tests {
     use crate::storage::tests::split_claims;
     use crate::storage::{AnvilStorage, Rejection, StorageError};
     use crate::types::{advance_sim_time_secs, set_sim_time_nanos, AnvilConfig, Message};
-    use crate::types::{ClaimedMessage, SIM_TIME_LOCK};
+    use crate::types::{ClaimedMessage, SimClock};
 
     /// A lease timeout a test waits out: a fraction of a second, yet many
     /// heartbeat intervals, so a live worker never lapses on a loaded runner.
@@ -297,7 +296,7 @@ mod tests {
     /// response were lost, then dies. A survivor drains the queue.
     #[tokio::test]
     async fn test_worker_death_at_each_protocol_step() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (_broker, client) = start_broker(broker_config("memory://", SHORT_TIMEOUT_SECS)).await;
         let queue = "steps";
         push(&client, queue, 3).await;
@@ -372,7 +371,7 @@ mod tests {
         const LARGE_BATCH: usize = 200;
         const MESSAGES: usize = SMALL_WORKERS * SMALL_BATCH + LARGE_BATCH;
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (_broker, client) = start_broker(broker_config("memory://", SHORT_TIMEOUT_SECS)).await;
         let queue = "mass";
         let pushed: HashSet<String> = push(&client, queue, MESSAGES).await.into_iter().collect();
@@ -437,7 +436,7 @@ mod tests {
     /// and a claim it takes under the old lease must be reclaimed.
     #[tokio::test]
     async fn test_zombie_cannot_settle_renew_or_revive_a_lost_claim() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (_broker, client) = start_broker(broker_config("memory://", SHORT_TIMEOUT_SECS)).await;
         let queue = "zombie";
         push(&client, queue, 1).await;
@@ -499,7 +498,7 @@ mod tests {
     /// the claim, and the reservation is closed with no key behind it.
     #[tokio::test]
     async fn test_fenced_forward_leaves_downstream_untouched() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let (queue, downstream) = ("upstream", "downstream");
         storage.create_queue(queue, 0).await.unwrap();
@@ -545,7 +544,7 @@ mod tests {
     /// sends with every later request.
     #[tokio::test]
     async fn test_reconnected_heartbeat_keeps_in_flight_claims() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (_broker, client) = start_broker(broker_config("memory://", SHORT_TIMEOUT_SECS)).await;
         let queue = "reconnect";
         push(&client, queue, 1).await;
@@ -579,7 +578,7 @@ mod tests {
     /// broker's lease table.
     #[tokio::test]
     async fn test_dead_leases_leave_the_lease_table() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (broker, client) = start_broker(broker_config("memory://", SHORT_TIMEOUT_SECS)).await;
         for i in 0..4 {
             drop(Heartbeat::open(&client, &format!("worker-{i}")).await);
@@ -628,7 +627,7 @@ mod tests {
     /// path, and the worker reconnects and carries on.
     #[test]
     fn test_broker_restart_under_running_workers() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (dir, db_path) = crash_test_db_path("chaos_restart");
         let config = broker_config(&db_path, LONG_TIMEOUT_SECS);
         let (queue, finished) = ("work", "finished");
@@ -711,7 +710,7 @@ mod tests {
     /// redelivery and the old claim's ack.
     #[test]
     fn test_restart_reclaims_claims_of_workers_that_reconnect() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (dir, db_path) = crash_test_db_path("chaos_restart_lease");
         let config = broker_config(&db_path, LONG_TIMEOUT_SECS);
         let queue = "work";
@@ -836,7 +835,7 @@ mod tests {
         const PARK_AT: u32 = 4;
         const ROUNDS_MAX: usize = 30;
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let (queue, dlq) = ("poison", "poison-dlq");
         storage.create_queue(queue, 0).await.unwrap();
@@ -932,7 +931,7 @@ mod tests {
         const BATCH: usize = 8;
         const ROUNDS: u32 = 5;
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let queue = "storm";
         let queues = [queue.to_string()];
@@ -998,7 +997,7 @@ mod tests {
     async fn test_shared_lease_lives_and_dies_as_one() {
         const LEASE_TIMEOUT_SECS: f64 = 5.0;
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         set_sim_time_nanos(SIM_EPOCH_NANOS);
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let leases = AnvilState::new();
@@ -1062,7 +1061,6 @@ mod tests {
             "renewal after the reclaim",
         );
         check_invariants(&storage, &[queue.to_string()]).await;
-        set_sim_time_nanos(0);
     }
 
     // =====================================================================
@@ -1080,7 +1078,7 @@ mod tests {
         const TIMEOUT_SECS: f64 = 5.0;
         const PAST_SECS: f64 = 0.001;
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         set_sim_time_nanos(SIM_EPOCH_NANOS);
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let leases = AnvilState::new();
@@ -1144,7 +1142,6 @@ mod tests {
         let meta = storage.get_queue_stats(queue).await.unwrap();
         assert_eq!((meta.claimed_count, meta.push_seq - meta.claim_seq), (1, 1));
         check_invariants(&storage, &[queue.to_string()]).await;
-        set_sim_time_nanos(0);
     }
 
     /// Goal: a dead worker's claims return once its lease has gone
@@ -1157,7 +1154,7 @@ mod tests {
     async fn test_backward_clock_step_does_not_extend_a_dead_lease() {
         const LEASE_TIMEOUT_SECS: f64 = 5.0;
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         set_sim_time_nanos(SIM_EPOCH_NANOS);
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let leases = AnvilState::new();
@@ -1180,7 +1177,6 @@ mod tests {
             )
             .await
             .unwrap();
-        set_sim_time_nanos(0);
         assert_eq!(recovered, 1, "a dead lease outlived its timeout");
     }
 
@@ -1194,7 +1190,7 @@ mod tests {
     async fn test_forward_clock_step_keeps_a_live_lease() {
         const LEASE_TIMEOUT_SECS: f64 = 5.0;
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         set_sim_time_nanos(SIM_EPOCH_NANOS);
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let leases = AnvilState::new();
@@ -1220,7 +1216,6 @@ mod tests {
             )
             .await
             .unwrap();
-        set_sim_time_nanos(0);
         assert_eq!(recovered, 0, "a live worker's claim was reclaimed");
     }
 
@@ -1241,7 +1236,7 @@ mod tests {
     fn test_counters_exact_across_crash_restart_loops() {
         const CYCLES: usize = 5;
 
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         for seed in [7_u64, 8] {
             let (dir, db_path) = crash_test_db_path("chaos_loops");
             let queue = "loop";
@@ -1335,7 +1330,7 @@ mod tests {
     /// be lost: nothing calls it again after a restart.
     #[test]
     fn test_bounded_queue_stays_bounded_across_restart() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let (dir, db_path) = crash_test_db_path("chaos_bounded");
         let queue = "bounded";
         let over = || Message::new(b"over".to_vec());
@@ -1389,7 +1384,7 @@ mod tests {
     /// attempt landed.
     #[tokio::test]
     async fn test_abandoned_complete_settles_once() {
-        let _guard = SIM_TIME_LOCK.lock().unwrap();
+        let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
         for polls in 1..=3 {
             let queue = format!("abandoned-{polls}");
