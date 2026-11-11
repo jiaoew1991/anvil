@@ -322,6 +322,18 @@ pub(crate) fn group(group: &str) -> Vec<u8> {
     Key::new(GROUP, group.len() + 2).string(group).0
 }
 
+/// Every queue group record, in group-name order.
+pub(crate) fn groups() -> Range<Vec<u8>> {
+    prefix_range(vec![GROUP])
+}
+
+pub(crate) fn parse_group(key: &[u8]) -> Result<String, MalformedKey> {
+    let mut fields = Fields::new(key, GROUP)?;
+    let group = fields.string()?;
+    fields.end()?;
+    Ok(group)
+}
+
 /// State `key` of `namespace`.
 pub(crate) fn state(namespace: &str, key: &str) -> Vec<u8> {
     Key::new(STATE, namespace.len() + key.len() + 4)

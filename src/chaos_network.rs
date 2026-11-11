@@ -1436,11 +1436,23 @@ mod tests {
         assert!(landed_first > 0, "no faulted Complete ever landed");
 
         let mut outputs_seen: HashMap<String, usize> = HashMap::new();
-        for queue in &downstream {
+        // A partition is claimed only through its group.
+        let sources = (0..PARTITIONS)
+            .map(|partition| {
+                claim_request::Source::Group(GroupClaimSource {
+                    group_name: group.to_string(),
+                    assigned_partitions: vec![partition],
+                })
+            })
+            .chain([claim_request::Source::Queue(forward.to_string())]);
+        for source in sources {
             let drained = broker
                 .admin
                 .clone()
-                .claim(claim_request(queue, "reader", &lease_id, 1000))
+                .claim(ClaimRequest {
+                    source: Some(source),
+                    ..claim_request(forward, "reader", &lease_id, 1000)
+                })
                 .await
                 .unwrap()
                 .into_inner()
