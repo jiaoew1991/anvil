@@ -112,7 +112,7 @@ impl BrokerError {
 }
 
 /// Broker configuration
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct BrokerConfig {
     #[pyo3(get, set)]
@@ -208,7 +208,7 @@ pub struct AnvilBroker {
     config: BrokerConfig,
     handle: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
-    event_handler: Option<PyObject>,
+    event_handler: Option<Py<PyAny>>,
     actual_port: Arc<Mutex<Option<u16>>>,
     // Storage is created inside the broker thread (to keep it in the same tokio runtime)
     // and shared back via this Arc<Mutex<>>
@@ -219,7 +219,7 @@ pub struct AnvilBroker {
 impl AnvilBroker {
     #[new]
     #[pyo3(signature = (config, event_handler=None))]
-    fn new(config: BrokerConfig, event_handler: Option<PyObject>) -> Self {
+    fn new(config: BrokerConfig, event_handler: Option<Py<PyAny>>) -> Self {
         Self {
             config,
             handle: None,
@@ -303,7 +303,7 @@ impl AnvilBroker {
 
                                 // Trigger on_started callback
                                 if let Some(h) = &handler {
-                                    Python::with_gil(|py| {
+                                    Python::attach(|py| {
                                         let _ = h.call_method1(py, "on_started", (port,));
                                     });
                                 }
@@ -319,7 +319,7 @@ impl AnvilBroker {
 
                                 // Trigger on_stopped callback
                                 if let Some(h) = &handler {
-                                    Python::with_gil(|py| {
+                                    Python::attach(|py| {
                                         let _ = h.call_method0(py, "on_stopped");
                                     });
                                 }
@@ -327,7 +327,7 @@ impl AnvilBroker {
                             Err(e) => {
                                 running.store(false, Ordering::SeqCst);
                                 if let Some(h) = &handler {
-                                    Python::with_gil(|py| {
+                                    Python::attach(|py| {
                                         let error = BrokerError::new(
                                             "start_failed".to_string(),
                                             e.to_string(),
@@ -341,7 +341,7 @@ impl AnvilBroker {
                     Err(e) => {
                         running.store(false, Ordering::SeqCst);
                         if let Some(h) = &handler {
-                            Python::with_gil(|py| {
+                            Python::attach(|py| {
                                 let error =
                                     BrokerError::new("init_failed".to_string(), e.to_string());
                                 let _ = h.call_method1(py, "on_fatal", (error,));
@@ -352,18 +352,18 @@ impl AnvilBroker {
             });
         });
 
-        let opened = py.allow_threads(move || opened_rx.recv());
+        let opened = py.detach(move || opened_rx.recv());
         match opened {
             Ok(Ok(())) => {
                 self.handle = Some(handle);
                 Ok(())
             }
             Ok(Err(e)) => {
-                let _ = py.allow_threads(|| handle.join());
+                let _ = py.detach(|| handle.join());
                 Err(e)
             }
             Err(std::sync::mpsc::RecvError) => {
-                let _ = py.allow_threads(|| handle.join());
+                let _ = py.detach(|| handle.join());
                 self.running.store(false, Ordering::SeqCst);
                 Err(pyo3::exceptions::PyRuntimeError::new_err(
                     "the broker thread exited before opening its storage",
@@ -388,7 +388,7 @@ impl AnvilBroker {
         self.running.store(false, Ordering::SeqCst);
 
         if let Some(handle) = self.handle.take() {
-            py.allow_threads(|| {
+            py.detach(|| {
                 let _ = handle.join();
             });
         }
@@ -453,7 +453,7 @@ impl AnvilStorageReader {
     }
 
     /// Get queue stats (pending/claimed/total)
-    fn get_queue_stats(&self, py: Python<'_>, queue: String) -> PyResult<PyObject> {
+    fn get_queue_stats(&self, py: Python<'_>, queue: String) -> PyResult<Py<PyAny>> {
         let meta = self
             .runtime
             .block_on(self.storage.get_queue_stats(&queue))
@@ -484,7 +484,7 @@ impl AnvilStorageReader {
         start_ns: Option<u64>,
         end_ns: Option<u64>,
         limit: Option<usize>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let entries = self
             .runtime
             .block_on(self.storage.scan_acked(queue.as_deref()))
@@ -529,7 +529,7 @@ impl AnvilStorageReader {
         py: Python<'_>,
         queue: Option<String>,
         limit: Option<usize>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let entries = self
             .runtime
             .block_on(self.storage.scan_claimed(queue.as_deref()))
@@ -563,7 +563,7 @@ impl AnvilStorageReader {
         py: Python<'_>,
         namespace: String,
         keys: Vec<String>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let values = self
             .runtime
             .block_on(self.storage.state_get_batch(&namespace, &keys))
@@ -588,7 +588,7 @@ impl AnvilStorageReader {
         namespace: String,
         prefix: &str,
         limit: Option<usize>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let entries = self
             .runtime
             .block_on(
@@ -612,7 +612,7 @@ impl AnvilStorageReader {
     }
 
     /// List queues from storage
-    fn list_queues(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn list_queues(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let queues = self
             .runtime
             .block_on(self.storage.list_queues())
