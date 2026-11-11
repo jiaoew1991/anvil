@@ -42,7 +42,9 @@ runs as the per-job broker embedded in the Ray driver.
   `default_max_deliveries`, 20; 0 is unlimited) moves the message to the
   queue's dead letters instead, with its body, the cause and the last nack's
   reason. A nack with `dead_letter=True` does so at once. Dead letters are
-  listed, redriven to pending with a fresh delivery count, or purged. See
+  listed, redriven to pending with a fresh delivery count, or purged.
+  `get_stats` reports a queue's own `max_deliveries` and the
+  `effective_max_deliveries` in force. See
   the runbook in [docs/semantics.md](docs/semantics.md) section 5.6 for
   recovering from a downstream outage.
 
@@ -76,8 +78,8 @@ client.start()
 client.create_queue("work")
 client.push("work", b"payload")
 
-messages, drained, dead_count = client.claim("work", batch_size=1)
-for message in messages:
+claimed = client.claim("work", batch_size=1)  # .messages, .drained, .dead_count
+for message in claimed.messages:
     for chunk in work_in_chunks(message.payload):
         process(chunk)
         # Each chunk restarts the claim_age_timeout_secs window.

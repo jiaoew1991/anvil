@@ -472,6 +472,9 @@ impl AnvilStorageReader {
         dict.set_item("total_acked", meta.total_acked)?;
         dict.set_item("dead_count", meta.dead_count)?;
         dict.set_item("total_purged", meta.total_purged)?;
+        // Only the queue's own limit is in the store. The one in effect
+        // depends on the broker's default, which a reader does not know.
+        dict.set_item("max_deliveries", meta.max_deliveries)?;
         Ok(dict.into())
     }
 
@@ -654,6 +657,7 @@ fn anvil_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::AnvilRustClient>()?;
     m.add_class::<client::RustMessage>()?;
     m.add_class::<client::DeadLetter>()?;
+    m.add_class::<client::ClaimResult>()?;
     m.add(
         "ClaimLostError",
         m.py().get_type::<client::ClaimLostError>(),

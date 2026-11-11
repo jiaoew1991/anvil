@@ -450,6 +450,74 @@ mod tests {
         );
     }
 
+    /// Goal: an operator reads from `GetStats` what a queue's delivery limit
+    /// is and whether the queue set it, so a limit lifted during an outage
+    /// can be set back. Method: on a broker whose default is 5, read the
+    /// stats of a queue created by its first push, lift its limit, set it
+    /// back to the effective value read before, and read the stats of each
+    /// partition of a group created with a limit.
+    #[tokio::test]
+    async fn test_grpc_stats_report_the_delivery_limit() {
+        const DEFAULT: u32 = 5;
+        let _clock = SimClock::acquire();
+        let config = AnvilConfig {
+            host: "127.0.0.1".to_string(),
+            db_path: "memory://".to_string(),
+            default_max_deliveries: DEFAULT,
+            ..AnvilConfig::default()
+        };
+        let mut broker = AnvilBrokerInner::new(config).await.unwrap();
+        let port = broker.start().await.unwrap();
+        let client = AnvilClient::connect(format!("http://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let queue = "limited";
+        let limits = |queue: &str| {
+            let (client, queue) = (client.clone(), queue.to_string());
+            async move {
+                let s = stats(&client, &queue).await;
+                (s.max_deliveries, s.effective_max_deliveries)
+            }
+        };
+        let set_limit = |max_deliveries| {
+            let mut client = client.clone();
+            async move {
+                let request = CreateQueueRequest {
+                    queue: queue.to_string(),
+                    max_pending: 0,
+                    max_deliveries,
+                };
+                client.create_queue(request).await.unwrap();
+            }
+        };
+
+        push(&client, queue, &[b"work"]).await;
+        let before = limits(queue).await;
+        assert_eq!(before, (None, DEFAULT));
+        set_limit(Some(0)).await;
+        assert_eq!(limits(queue).await, (Some(0), 0));
+        set_limit(None).await;
+        assert_eq!(limits(queue).await, (Some(0), 0), "no limit given keeps it");
+        set_limit(Some(before.1)).await;
+        assert_eq!(limits(queue).await, (Some(DEFAULT), DEFAULT));
+
+        let group = client
+            .clone()
+            .create_queue_group(CreateQueueGroupRequest {
+                group_name: "limited-group".to_string(),
+                num_partitions: 2,
+                max_pending_per_partition: 0,
+                max_deliveries: Some(3),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(group.queue_names.len(), 2);
+        for partition in &group.queue_names {
+            assert_eq!(limits(partition).await, (Some(3), 3), "{partition}");
+        }
+    }
+
     /// Goal: the basic worker cycle works over the wire. Method: push three
     /// payloads, claim them under a heartbeat lease, ack them with their
     /// tokens, and check the claim order, the delivery counts and the stats.

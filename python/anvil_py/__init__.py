@@ -23,6 +23,9 @@ from anvil_py.anvil_py import (
     DeadLetter as _DeadLetter,
 )
 from anvil_py.anvil_py import (
+    ClaimResult as _ClaimResult,
+)
+from anvil_py.anvil_py import (
     ClaimLostError as _ClaimLostError,
 )
 from anvil_py.anvil_py import (
@@ -40,6 +43,7 @@ AnvilStorageReader = _AnvilStorageReader
 AnvilRustClient = _AnvilRustClient
 RustMessage = _RustMessage
 DeadLetter = _DeadLetter
+ClaimResult = _ClaimResult
 ClaimLostError = _ClaimLostError
 QueueFinishedError = _QueueFinishedError
 StorageFormatError = _StorageFormatError
@@ -100,6 +104,7 @@ __all__ = [
     "AnvilRustClient",
     "RustMessage",
     "DeadLetter",
+    "ClaimResult",
     "ClaimLostError",
     "QueueFinishedError",
     "StorageFormatError",

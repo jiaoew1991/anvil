@@ -314,6 +314,12 @@ message QueueStats {
   int64 total_acked = 5;
   int64 dead_count = 6;                  // dead letters waiting for a redrive or a purge
   int64 total_purged = 7;                // dead letters purged; pushed = pending + claimed + acked + dead + purged
+  // The delivery limit the queue set for itself with CreateQueue; 0 =
+  // unlimited. Absent: it set none and follows the broker's default.
+  optional uint32 max_deliveries = 8;
+  // The limit a nack or reclaim applies now: the queue's own, else the
+  // broker's default; 0 = unlimited.
+  uint32 effective_max_deliveries = 9;
 }
 
 // ============================================================================
