@@ -78,8 +78,8 @@ client.start()
 client.create_queue("work")
 client.push("work", b"payload")
 
-messages, drained, dead_count = client.claim("work", batch_size=1)
-for message in messages:
+claimed = client.claim("work", batch_size=1)  # .messages, .drained, .dead_count
+for message in claimed.messages:
     for chunk in work_in_chunks(message.payload):
         process(chunk)
         # Each chunk restarts the claim_age_timeout_secs window.

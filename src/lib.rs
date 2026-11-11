@@ -657,6 +657,7 @@ fn anvil_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::AnvilRustClient>()?;
     m.add_class::<client::RustMessage>()?;
     m.add_class::<client::DeadLetter>()?;
+    m.add_class::<client::ClaimResult>()?;
     m.add(
         "ClaimLostError",
         m.py().get_type::<client::ClaimLostError>(),

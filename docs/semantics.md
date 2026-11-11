@@ -761,7 +761,7 @@ Want: Either both B and C receive, or neither
 **Mitigation:**
 ```python
 # Batch dedup check
-msgs = client.claim(queue, batch_size=100)
+msgs = client.claim(queue, batch_size=100).messages
 msg_ids = [m.msg_id for m in msgs]
 
 # Single RPC for all dedup checks

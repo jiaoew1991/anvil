@@ -22,7 +22,7 @@
 //!   - claim_and_complete  →  ClaimAndComplete RPC (new, halves round trips)
 
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -155,6 +155,33 @@ impl DeadLetter {
         format!(
             "DeadLetter(msg_id='{}', cause='{}', delivery_count={}, reason='{}')",
             self.msg_id, self.cause, self.delivery_count, self.reason
+        )
+    }
+}
+
+/// What `claim` returns.
+#[pyclass(frozen)]
+pub struct ClaimResult {
+    /// The messages claimed, a list of `RustMessage`.
+    #[pyo3(get)]
+    pub messages: Py<PyList>,
+    /// The queue is finished and empty: the worker's signal to exit.
+    #[pyo3(get)]
+    pub drained: bool,
+    /// Dead letters left in the queue, whose work was not done; reported
+    /// when no message is returned.
+    #[pyo3(get)]
+    pub dead_count: i64,
+}
+
+#[pymethods]
+impl ClaimResult {
+    fn __repr__(&self, py: Python<'_>) -> String {
+        format!(
+            "ClaimResult(messages=<{} messages>, drained={}, dead_count={})",
+            self.messages.bind(py).len(),
+            if self.drained { "True" } else { "False" },
+            self.dead_count
         )
     }
 }
@@ -423,10 +450,11 @@ impl AnvilRustClient {
     // Consumer API (uses unified Claim RPC)
     // ========================================================================
 
-    /// Claims up to `batch_size` messages. Returns `(messages, drained,
-    /// dead_count)`: `drained` once the queue is finished and empty, the
-    /// worker's signal to exit, and the dead letters left in the queue,
-    /// whose work was not done, reported when no message is returned.
+    /// Claims up to `batch_size` messages. Returns a `ClaimResult`: the
+    /// `messages`, `drained` once the queue is finished and empty, the
+    /// worker's signal to exit, and `dead_count`, the dead letters left in
+    /// the queue, whose work was not done, reported when no message is
+    /// returned.
     #[pyo3(signature = (queue, batch_size=1, timeout_ms=5000))]
     fn claim(
         &self,
@@ -434,10 +462,10 @@ impl AnvilRustClient {
         queue: String,
         batch_size: i32,
         timeout_ms: i32,
-    ) -> PyResult<(Vec<RustMessage>, bool, i64)> {
+    ) -> PyResult<ClaimResult> {
         let inner = self.inner.clone();
         let q = queue.clone();
-        py.detach(move || {
+        let (messages, drained, dead_count) = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::ClaimRequest {
@@ -457,8 +485,13 @@ impl AnvilRustClient {
                     .iter()
                     .map(|m| RustMessage::from_claim_message(m, &q))
                     .collect();
-                Ok((messages, resp.upstream_drained, resp.dead_count))
+                PyResult::Ok((messages, resp.upstream_drained, resp.dead_count))
             })
+        })?;
+        Ok(ClaimResult {
+            messages: PyList::new(py, messages)?.unbind(),
+            drained,
+            dead_count,
         })
     }
 

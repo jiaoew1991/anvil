@@ -17,6 +17,7 @@ from anvil_py import (
     AnvilStorageReader,
     BrokerConfig,
     ClaimLostError,
+    ClaimResult,
     QueueFinishedError,
     StorageFormatError,
 )
@@ -46,11 +47,10 @@ def main():
         client.create_queue("work")
         client.push("work", b"payload")
 
-        def claim_one():
-            messages, _drained, _dead_count = client.claim("work", batch_size=1)
-            return messages
+        def claim_one(queue):
+            return lambda: client.claim(queue, batch_size=1).messages
 
-        (message,) = wait_for(claim_one)
+        (message,) = wait_for(claim_one("work"))
         assert message.payload == b"payload", message.payload
         assert message.delivery_count == 1, message.delivery_count
         client.renew("work", [message.msg_id], [message.claim_token])
@@ -68,7 +68,7 @@ def main():
         # reason of its last nack, and is redriven as a first delivery.
         client.create_queue("poison", max_deliveries=1)
         client.push("poison", b"bad")
-        (poison,) = wait_for(lambda: client.claim("poison", batch_size=1)[0])
+        (poison,) = wait_for(claim_one("poison"))
         client.nack(
             "poison", [poison.msg_id], claim_tokens=[poison.claim_token], reason="bad input"
         )
@@ -87,7 +87,7 @@ def main():
         ), letter
         redriven = client.redrive_dead_letters("poison", [letter.msg_id, "unknown"])
         assert redriven == {"redriven": [letter.msg_id], "missing": ["unknown"]}, redriven
-        (again,) = wait_for(lambda: client.claim("poison", batch_size=1)[0])
+        (again,) = wait_for(claim_one("poison"))
         assert (again.payload, again.delivery_count) == (b"bad", 1), again
         client.nack("poison", [again.msg_id], claim_tokens=[again.claim_token], dead_letter=True)
 
@@ -95,7 +95,16 @@ def main():
         # a redrive with an error of its own, which a worker's handler for
         # lost claims does not swallow, unless the redrive reopens it.
         client.mark_queue_finished("poison")
-        assert client.claim("poison", batch_size=1) == ([], True, 1)
+        result = client.claim("poison", batch_size=1)
+        assert isinstance(result, ClaimResult), result
+        assert (result.messages, result.drained, result.dead_count) == ([], True, 1), result
+        # A claim result is read by name and cannot be changed.
+        try:
+            result.dead_count = 0
+        except AttributeError:
+            pass
+        else:
+            sys.exit("a claim result was changed in place")
         assert client.is_queue_finished("poison")["dead_count"] == 1
         try:
             client.redrive_dead_letters("poison", [again.msg_id])
@@ -108,7 +117,7 @@ def main():
         redriven = client.redrive_dead_letters("poison", [again.msg_id], reopen=True)
         assert redriven == {"redriven": [again.msg_id], "missing": []}, redriven
         assert not client.is_queue_finished("poison")["finished"]
-        (third,) = wait_for(lambda: client.claim("poison", batch_size=1)[0])
+        (third,) = wait_for(claim_one("poison"))
         client.nack("poison", [third.msg_id], claim_tokens=[third.claim_token], dead_letter=True)
         (ids,), _ = client.list_dead_letters("poison", ids_only=True)
         assert (ids.msg_id, ids.payload) == (third.msg_id, b""), ids
