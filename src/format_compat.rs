@@ -436,9 +436,10 @@ mod tests {
         assert_eq!(group.partition_queues, ["grp_p0", "grp_p1", "grp_p2"]);
         assert_eq!(counts(&storage, "scatter-src").await, (1, 1, 0, 0));
         let mut scattered = Vec::new();
+        let partitions = storage.group_partitions(GROUP, &[0, 1, 2]).await.unwrap();
         loop {
             let (claimed, queue, _) = storage
-                .claim_from_group(GROUP, 10, "worker", "lease", &[0, 1, 2])
+                .claim_from_group(GROUP, &partitions, 10, "worker", "lease")
                 .await
                 .unwrap();
             if claimed.is_empty() {

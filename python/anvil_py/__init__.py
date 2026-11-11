@@ -32,6 +32,9 @@ from anvil_py.anvil_py import (
     QueueFinishedError as _QueueFinishedError,
 )
 from anvil_py.anvil_py import (
+    PartitionOwnedError as _PartitionOwnedError,
+)
+from anvil_py.anvil_py import (
     StorageFormatError as _StorageFormatError,
 )
 
@@ -46,6 +49,7 @@ DeadLetter = _DeadLetter
 ClaimResult = _ClaimResult
 ClaimLostError = _ClaimLostError
 QueueFinishedError = _QueueFinishedError
+PartitionOwnedError = _PartitionOwnedError
 StorageFormatError = _StorageFormatError
 
 
@@ -107,6 +111,7 @@ __all__ = [
     "ClaimResult",
     "ClaimLostError",
     "QueueFinishedError",
+    "PartitionOwnedError",
     "StorageFormatError",
     "BrokerEventHandler",
 ]

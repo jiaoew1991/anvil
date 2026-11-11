@@ -56,6 +56,15 @@ pyo3::create_exception!(
      consumers may already have been told it drained and exited."
 );
 
+pyo3::create_exception!(
+    anvil_py,
+    PartitionOwnedError,
+    pyo3::exceptions::PyRuntimeError,
+    "A group claim named a partition another worker's live lease consumes. \
+     Retry later: the partition is freed once that lease is dead and its \
+     claims are reclaimed."
+);
+
 fn status_to_pyerr(status: tonic::Status) -> PyErr {
     let msg = format!("{}: {}", status.code(), status.message());
     match status.code() {
@@ -63,9 +72,8 @@ fn status_to_pyerr(status: tonic::Status) -> PyErr {
             pyo3::exceptions::PyValueError::new_err(msg)
         }
         tonic::Code::FailedPrecondition => ClaimLostError::new_err(msg),
-        tonic::Code::Unavailable | tonic::Code::Aborted => {
-            pyo3::exceptions::PyConnectionError::new_err(msg)
-        }
+        tonic::Code::Aborted => PartitionOwnedError::new_err(msg),
+        tonic::Code::Unavailable => pyo3::exceptions::PyConnectionError::new_err(msg),
         _ => pyo3::exceptions::PyRuntimeError::new_err(msg),
     }
 }
@@ -169,12 +177,13 @@ pub struct ClaimResult {
     /// plain claim and when no message is returned.
     #[pyo3(get)]
     pub source_partition: Option<i32>,
-    /// The queue or group is finished and empty: the worker's signal to
-    /// exit.
+    /// The queue, or every partition a group claim named, is finished and
+    /// empty: the worker's signal to exit.
     #[pyo3(get)]
     pub drained: bool,
-    /// Dead letters left in the queue or group, whose work was not done;
-    /// reported when no message is returned.
+    /// Dead letters left in the queue, or in the partitions a group claim
+    /// named, whose work was not done; reported when no message is
+    /// returned.
     #[pyo3(get)]
     pub dead_count: i64,
 }
@@ -504,8 +513,10 @@ impl AnvilRustClient {
     }
 
     /// Claims from the partitions of a queue group assigned to this worker,
-    /// like `claim`: `drained` and `dead_count` are for the whole group, and
-    /// `source_partition` is the partition the messages came from.
+    /// like `claim`: `drained` and `dead_count` cover those partitions, and
+    /// `source_partition` is the one the messages came from. The worker
+    /// becomes the partitions' only consumer; while another worker's live
+    /// lease consumes one of them, raises `PartitionOwnedError`.
     #[pyo3(signature = (group_name, assigned_partitions, batch_size=1, timeout_ms=5000))]
     fn claim_from_group(
         &self,

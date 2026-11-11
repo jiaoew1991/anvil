@@ -98,7 +98,7 @@ impl RecoveryTask {
 
                         state.prune_leases(lease_timeout_secs);
                         let lease_snapshot = state.lease_snapshot();
-                        if let Err(e) = storage
+                        match storage
                             .recover_expired_claims(
                                 lease_timeout_secs,
                                 claim_age_timeout_secs,
@@ -106,11 +106,14 @@ impl RecoveryTask {
                             )
                             .await
                         {
-                            tracing::error!("Recovery error: {}", e);
-                            // A closed database never reopens: every later
-                            // tick would fail the same way.
-                            if storage::is_closed(&e) {
-                                break;
+                            Ok(_) => state.release_dead_owners(&lease_snapshot),
+                            Err(e) => {
+                                tracing::error!("Recovery error: {}", e);
+                                // A closed database never reopens: every
+                                // later tick would fail the same way.
+                                if storage::is_closed(&e) {
+                                    break;
+                                }
                             }
                         }
                     }

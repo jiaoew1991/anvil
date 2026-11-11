@@ -104,7 +104,8 @@ message ClaimRequest {
 message GroupClaimSource {
   string group_name = 1;
   // The partitions this worker consumes: at least one, each within the
-  // group. The broker claims from no other partition.
+  // group. The broker claims from no other partition, and refuses the claim
+  // (ABORTED) while another live lease consumes one of them.
   repeated int32 assigned_partitions = 2;
   reserved 3, 4;
   reserved "allow_steal", "steal_pending_threshold";
@@ -125,12 +126,14 @@ message ClaimResponse {
   // Group claim info (empty for plain queue claims)
   string source_queue = 3;
   int32 source_partition = 4;
-  // True when messages is empty AND the source queue/group is
-  // finished + fully drained (pending=0, claimed=0; dead letters are settled).
+  // True when messages is empty AND the source queue, or every partition a
+  // group claim named, is finished + fully drained (pending=0, claimed=0;
+  // dead letters are settled).
   // Workers use this as the sole exit signal — no master notification needed.
   bool upstream_drained = 5;
-  // Dead letters left in the source queue/group, whose work was not done;
-  // reported when messages is empty, 0 otherwise.
+  // Dead letters left in the source queue, or in the partitions a group
+  // claim named, whose work was not done; reported when messages is empty,
+  // 0 otherwise.
   int64 dead_count = 6;
 }
 

@@ -3,7 +3,8 @@
 Exercises the Python bindings end to end: start a broker on a temporary
 file:// store, push, claim, check the delivery count, renew, ack, see a
 second ack fenced, dead-letter a poison message, redrive it (into a
-finished queue too) and purge it, claim from a queue group, stop, and
+finished queue too) and purge it, claim from a queue group, which a
+second worker is refused, stop, and
 reopen the store, which now carries the format marker, directly.
 """
 
@@ -18,6 +19,7 @@ from anvil_py import (
     BrokerConfig,
     ClaimLostError,
     ClaimResult,
+    PartitionOwnedError,
     QueueFinishedError,
     StorageFormatError,
 )
@@ -132,6 +134,19 @@ def main():
         result = client.claim_from_group("fan", [1])
         (keyed,) = result.messages
         assert (keyed.payload, keyed.queue, result.source_partition) == (b"keyed", "fan_p1", 1), result
+        # The partition is this worker's: another worker is told so, which
+        # is not a lost claim.
+        intruder = AnvilRustClient(broker.get_broker_url(), "smoke-intruder")
+        intruder.start()
+        try:
+            intruder.claim_from_group("fan", [1], timeout_ms=0)
+        except ClaimLostError:
+            sys.exit("an owned partition was reported as a lost claim")
+        except PartitionOwnedError:
+            pass
+        else:
+            sys.exit("a second worker claimed an owned partition")
+        intruder.stop()
 
         client.stop()
         broker.stop()

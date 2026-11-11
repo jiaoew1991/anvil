@@ -835,13 +835,15 @@ pub(crate) mod tests {
         });
     }
 
-    /// Goal: consumers assigned the same partition never get a message
-    /// twice. Method: a producer scatters 400 messages, ten per call,
-    /// unevenly over four partitions while four consumers claim one
-    /// partition each and two claim all four; every consumer acks and stops
-    /// on the group's drain signal. Each message is delivered exactly once.
+    /// Goal: a partition is consumed by one worker however many are
+    /// assigned to it. Method: a producer scatters 400 messages, ten per
+    /// call, unevenly over four partitions while two consumers per partition
+    /// race to claim it; a consumer stops when refused, else acks until its
+    /// partition drains. Each partition has one consumer that got all of its
+    /// messages and one that was refused, and each message is delivered
+    /// exactly once.
     #[test]
-    fn test_group_overlapping_assignments_deliver_once() {
+    fn test_group_partition_has_one_consumer() {
         const PARTITIONS: i32 = 4;
         const MESSAGES: usize = 400;
         const SCATTER_BATCH: usize = 10;
@@ -876,35 +878,35 @@ pub(crate) mod tests {
                         .unwrap();
                 })
             };
-            let consumers: Vec<_> = (0..6)
+            let consumers: Vec<_> = (0..2 * PARTITIONS)
                 .map(|c: i32| {
                     let service = service.clone();
                     let worker = format!("w{c}");
+                    let lease = format!("lease-{worker}");
+                    service.state().update_lease(&lease);
                     tokio::spawn(async move {
-                        let assigned = if c < PARTITIONS {
-                            vec![c]
-                        } else {
-                            (0..PARTITIONS).collect()
-                        };
                         let mut delivered = Vec::new();
                         loop {
                             let request = ClaimRequest {
                                 source: Some(claim_request::Source::Group(GroupClaimSource {
                                     group_name: "g".to_string(),
-                                    assigned_partitions: assigned.clone(),
+                                    assigned_partitions: vec![c % PARTITIONS],
                                 })),
                                 worker_id: worker.clone(),
-                                lease_id: format!("lease-{worker}"),
+                                lease_id: lease.clone(),
                                 batch_size: 3,
                                 timeout_ms: 0,
                             };
-                            let response = service
-                                .claim(Request::new(request))
-                                .await
-                                .unwrap()
-                                .into_inner();
+                            let response = match service.claim(Request::new(request)).await {
+                                Ok(response) => response.into_inner(),
+                                Err(status) => {
+                                    assert_eq!(status.code(), Code::Aborted, "{status:?}");
+                                    assert!(delivered.is_empty(), "{worker} lost its partition");
+                                    return None;
+                                }
+                            };
                             if response.upstream_drained {
-                                return delivered;
+                                return Some(delivered);
                             }
                             if response.messages.is_empty() {
                                 tokio::time::sleep(IDLE_POLL).await;
@@ -927,15 +929,21 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap();
             let mut delivered = HashSet::new();
-            for consumer in consumers {
+            let mut owners = [0; PARTITIONS as usize];
+            for (c, consumer) in consumers.into_iter().enumerate() {
                 let payloads = tokio::time::timeout(TASK_DEADLINE, consumer)
                     .await
                     .unwrap()
                     .unwrap();
+                let Some(payloads) = payloads else {
+                    continue;
+                };
+                owners[c % PARTITIONS as usize] += 1;
                 for payload in payloads {
                     assert!(delivered.insert(payload.clone()), "{payload:?} twice");
                 }
             }
+            assert_eq!(owners, [1; PARTITIONS as usize]);
             assert_eq!(delivered.len(), MESSAGES);
         });
     }
