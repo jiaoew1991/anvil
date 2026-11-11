@@ -37,6 +37,8 @@ mod bench;
 #[cfg(test)]
 mod chaos_api;
 #[cfg(test)]
+mod chaos_group;
+#[cfg(test)]
 mod chaos_model;
 #[cfg(test)]
 mod chaos_network;

@@ -124,6 +124,10 @@ pub struct AnvilService {
     /// How long a heartbeat stream may stay silent before it is closed:
     /// `lease_timeout_secs`, after which its lease is dead anyway.
     lease_timeout: Duration,
+    /// Taken shared by a group claim between its ownership check and its
+    /// claim, so that a test holding it exclusively stalls the claim there.
+    #[cfg(test)]
+    pub(crate) owned_claim_gate: tokio::sync::RwLock<()>,
 }
 
 impl AnvilService {
@@ -139,6 +143,8 @@ impl AnvilService {
             state,
             storage,
             lease_timeout,
+            #[cfg(test)]
+            owned_claim_gate: tokio::sync::RwLock::new(()),
         }
     }
 
@@ -456,6 +462,8 @@ impl AnvilService {
                         &req.lease_id,
                     )
                     .map_err(|e| storage_status("Claim(group)", Box::new(e)))?;
+                #[cfg(test)]
+                drop(self.owned_claim_gate.read().await);
 
                 let (claimed, source_queue, source_partition) = self
                     .storage
@@ -1497,11 +1505,12 @@ mod tests {
     }
 
     /// Goal: a dead owner's partition is not freed while one of its group
-    /// claims may still be storing a claim. Method: lease a owns partition
-    /// 0 and dies under a running recovery task while the test holds the
-    /// guard a group claim holds; for many recovery intervals lease b gets
-    /// no answer or a refusal, and once the guard is dropped it takes the
-    /// partition.
+    /// claims is between its ownership check and its claim, which the
+    /// recovery pass would otherwise miss. Method: under a running recovery
+    /// task, a group claim of lease a is stalled right after its ownership
+    /// check and the lease left to die; for many recovery intervals lease b
+    /// gets no answer or a refusal, and once the claim is let through, b
+    /// takes the partition.
     #[tokio::test]
     async fn test_recovery_waits_for_group_claims_in_flight() {
         const HANDOVER_DEADLINE: Duration = Duration::from_secs(10);
@@ -1509,6 +1518,7 @@ mod tests {
         // The lease must expire in real time.
         let _clock = SimClock::acquire();
         let (service, storage) = create_service().await;
+        let service = Arc::new(service);
         let config = AnvilConfig {
             lease_timeout_secs: 0.1,
             recovery_interval_secs: 0.02,
@@ -1517,19 +1527,33 @@ mod tests {
         let mut recovery = RecoveryTask::new(storage.clone(), service.state.clone(), config);
         recovery.start();
         storage.create_queue_group("g", 1, 0, None).await.unwrap();
-        service.state.update_lease("a");
-        group_claim(&service, "a", 0).await.unwrap();
 
-        let in_flight = service.state.group_claims.read().await;
-        let held_until = std::time::Instant::now() + Duration::from_millis(500);
-        while std::time::Instant::now() < held_until {
+        let gate = service.owned_claim_gate.write().await;
+        let stalled = tokio::spawn({
+            let service = service.clone();
+            async move { group_claim(&service, "a", 0).await }
+        });
+        // Lease a lives until its claim holds the guard of a claim in flight.
+        let started = std::time::Instant::now();
+        while service.state.group_claims.try_write().is_ok() {
+            assert!(
+                started.elapsed() < HANDOVER_DEADLINE,
+                "the stalled claim does not hold the guard of a claim in flight"
+            );
+            service.state.update_lease("a");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let stalled_until = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < stalled_until {
             service.state.update_lease("b");
             // No answer while the recovery pass queues ahead of the claim.
             if let Ok(answer) = timeout(ATTEMPT_DEADLINE, group_claim(&service, "b", 0)).await {
                 assert_status(&answer.unwrap_err(), Code::Aborted, "partition_owned");
             }
         }
-        drop(in_flight);
+        drop(gate);
+        stalled.await.unwrap().unwrap();
 
         let started = std::time::Instant::now();
         loop {
@@ -1542,6 +1566,33 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         recovery.stop_async().await;
+    }
+
+    /// Goal: a group claim takes every partition it names or none. Method:
+    /// lease a owns partition 1; lease b names partitions 0 and 1 and is
+    /// refused; partition 0 is then still free for lease c.
+    #[tokio::test]
+    async fn test_refused_group_claim_takes_no_partition() {
+        let (service, storage) = create_service().await;
+        storage.create_queue_group("g", 2, 0, None).await.unwrap();
+        for lease in ["a", "b", "c"] {
+            service.state.update_lease(lease);
+        }
+        group_claim(&service, "a", 1).await.unwrap();
+
+        let both = ClaimRequest {
+            source: Some(claim_request::Source::Group(GroupClaimSource {
+                group_name: "g".to_string(),
+                assigned_partitions: vec![0, 1],
+            })),
+            worker_id: "b".to_string(),
+            lease_id: "b".to_string(),
+            batch_size: 1,
+            timeout_ms: 0,
+        };
+        let status = service.claim(Request::new(both)).await.unwrap_err();
+        assert_status(&status, Code::Aborted, "partition_owned");
+        group_claim(&service, "c", 0).await.unwrap();
     }
 
     /// A push past a bounded queue's capacity is RESOURCE_EXHAUSTED, and the
