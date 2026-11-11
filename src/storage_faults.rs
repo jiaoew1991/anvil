@@ -48,6 +48,9 @@ mod tests {
     /// hanging it. Generous: SlateDB backs off up to a second per retry.
     const WAIT_DEADLINE: Duration = Duration::from_secs(30);
     const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    /// Rounds of 50 operations the flaky-store workload runs at most while
+    /// it waits for each kind of fault to be drawn.
+    const FLAKY_ROUNDS_MAX: usize = 8;
 
     fn memory() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
@@ -162,11 +165,22 @@ mod tests {
             let sim = crashed.block_on(async {
                 let storage = open(&store).await;
                 let mut sim = DstSimulator::with_storage(storage, seed, 2, 3).await;
-                let ops = sim.generate_ops(50);
-                for op in ops {
-                    tokio::time::timeout(WAIT_DEADLINE, sim.execute(op))
-                        .await
-                        .expect("operation wedged on the flaky store");
+                // How many requests the workload makes depends on how the
+                // store batches its writes, so 50 operations see a handful
+                // of lost put responses and now and then none: run on until
+                // both kinds of fault were drawn.
+                for _ in 0..FLAKY_ROUNDS_MAX {
+                    for op in sim.generate_ops(50) {
+                        tokio::time::timeout(WAIT_DEADLINE, sim.execute(op))
+                            .await
+                            .expect("operation wedged on the flaky store");
+                    }
+                    let counts = store.counts();
+                    if counts.failed.load(Ordering::Relaxed) > 0
+                        && counts.landed_then_failed.load(Ordering::Relaxed) > 0
+                    {
+                        break;
+                    }
                 }
                 sim
             });
