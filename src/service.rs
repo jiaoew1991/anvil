@@ -752,6 +752,15 @@ impl Anvil for AnvilService {
         request: Request<DeleteQueueRequest>,
     ) -> Result<Response<DeleteQueueResponse>, Status> {
         let req = request.into_inner();
+        // The group, its consumers' ownership and their state would outlive
+        // the partition, and the state be read by a consumer of the queue's
+        // next use.
+        if self.storage.is_partition_queue(&req.queue) {
+            return Err(Status::invalid_argument(format!(
+                "queue {} is a partition of a queue group and cannot be deleted",
+                req.queue
+            )));
+        }
         match self.storage.delete_queue(&req.queue).await {
             Ok(deleted) => {
                 self.state.delete_queue(&req.queue);
@@ -1361,12 +1370,13 @@ mod tests {
         assert!(claim("b", 0).await.unwrap().upstream_drained);
     }
 
-    /// Goal: a partition queue is consumed only through its group. Method:
-    /// a plain claim on a group's partition is INVALID_ARGUMENT, on the
-    /// broker that created the group and on one that reopened its store;
-    /// a group claim then gets the message, which no plain claim took.
+    /// Goal: a partition queue is consumed only through its group and
+    /// lives as long as it. Method: a plain claim on a group's partition is
+    /// INVALID_ARGUMENT, on the broker that created the group and on one
+    /// that reopened its store, and so is its deletion; a group claim then
+    /// gets the message, which no plain claim took and no deletion removed.
     #[tokio::test]
-    async fn test_plain_claim_of_a_partition_is_refused() {
+    async fn test_plain_claim_and_deletion_of_a_partition_are_refused() {
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
         let serve = || async {
@@ -1400,6 +1410,14 @@ mod tests {
             .unwrap();
         let status = plain_claim(&service).await.unwrap_err();
         assert_status(&status, Code::InvalidArgument, "partition of a queue group");
+        let delete = DeleteQueueRequest {
+            queue: "g_p0".to_string(),
+        };
+        let status = service
+            .delete_queue(Request::new(delete))
+            .await
+            .unwrap_err();
+        assert_status(&status, Code::InvalidArgument, "cannot be deleted");
         storage.close().await.unwrap();
 
         let (service, _storage) = serve().await;

@@ -154,6 +154,12 @@ def main():
             pass
         else:
             sys.exit("a partition was claimed as a plain queue")
+        try:
+            client.delete_queue("fan_p1")
+        except ValueError:
+            pass
+        else:
+            sys.exit("a partition of a group was deleted")
 
         client.stop()
         broker.stop()
