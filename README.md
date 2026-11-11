@@ -13,7 +13,8 @@ A **queue** is for work any worker may take: workers compete for messages
 (`claim`). A **queue group** is for work keyed so that one consumer must see
 every message of a key, such as a group-by: the producer scatters payloads
 over the group's partition queues (`ack_and_scatter`) and each worker claims
-only the partitions assigned to it (`claim_from_group`). See
+only the partitions assigned to it (`claim_from_group`), which no other
+worker consumes while its lease is live. See
 [docs/semantics.md](docs/semantics.md) section 2.5.
 
 ## Guarantees
@@ -41,9 +42,9 @@ only the partitions assigned to it (`claim_from_group`). See
   claims made before the restart to fail with `FAILED_PRECONDITION`. The
   restart gives those deliveries back, so it neither raises a message's
   `delivery_count` nor dead-letters it.
-- **Drain signal.** `claim` reports `upstream_drained` once a queue is marked
-  finished and empty; dead letters count as settled, and `claim` reports how
-  many are left beside the signal.
+- **Drain signal.** `claim` reports `upstream_drained` once a queue, or the
+  partitions a group claim names, is marked finished and empty; dead letters
+  count as settled, and `claim` reports how many are left beside the signal.
 - **Delivery count.** Every claimed message carries `delivery_count`: 1 on
   first delivery, plus one for each nack or reclaimed lease of a worker.
 - **Dead letters.** A nack or reclaim that settles the last delivery a queue

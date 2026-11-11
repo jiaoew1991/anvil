@@ -20,8 +20,10 @@
 
 use dashmap::DashMap;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::storage::Rejection;
 use crate::types::mono_now;
 
 /// Whether a lease last seen at `last_seen` has gone more than
@@ -40,6 +42,11 @@ pub struct AnvilState {
     /// mints lease ids, and a lease absent from this table is dead: recovery
     /// reclaims its claims, and a worker presenting it gets a new lease.
     leases: DashMap<String, Instant>,
+    /// The lease consuming each partition queue of a queue group, by queue
+    /// name. A consumer that keeps state per key needs its partition to
+    /// itself: two would each see part of a key. One lock over the table,
+    /// so a claim takes all the partitions it names or none.
+    partition_owners: Mutex<HashMap<String, String>>,
 }
 
 impl AnvilState {
@@ -47,6 +54,7 @@ impl AnvilState {
         Self {
             queues: DashMap::new(),
             leases: DashMap::new(),
+            partition_owners: Mutex::new(HashMap::new()),
         }
     }
 
@@ -112,6 +120,49 @@ impl AnvilState {
         let now = mono_now();
         self.leases
             .retain(|_, last_seen| !lease_expired(*last_seen, now, lease_timeout_secs));
+    }
+
+    /// Makes `lease_id` the owner of every queue in `partition_queues` it
+    /// does not own yet, or of none: a queue owned by another lease refuses
+    /// the call, and so does a lease the table no longer holds, whose worker
+    /// lost its claims and holds state that may be behind its successor's.
+    pub fn own_partitions<'a>(
+        &self,
+        partition_queues: impl Iterator<Item = &'a str> + Clone,
+        lease_id: &str,
+    ) -> Result<(), Rejection> {
+        let mut owners = self.partition_owners.lock().unwrap();
+        if !self.leases.contains_key(lease_id) {
+            return Err(Rejection::Fenced(format!(
+                "lease_not_live: lease={lease_id}"
+            )));
+        }
+        for queue in partition_queues.clone() {
+            if let Some(owner) = owners.get(queue) {
+                if owner != lease_id {
+                    return Err(Rejection::PartitionOwned(format!(
+                        "partition_owned: queue={queue}, owner_lease={owner}"
+                    )));
+                }
+            }
+        }
+        for queue in partition_queues {
+            if !owners.contains_key(queue) {
+                owners.insert(queue.to_string(), lease_id.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Frees the partitions of dead leases: those absent from `recovered`,
+    /// the leases the recovery pass just run took for live, and not opened
+    /// since. That pass reclaimed every claim of such a lease, so its worker
+    /// can settle no message behind the next owner's back. Until then the
+    /// partition stays owned, as an ack of the dead lease may still land.
+    pub fn release_dead_owners(&self, recovered: &HashMap<String, Instant>) {
+        self.partition_owners.lock().unwrap().retain(|_, lease_id| {
+            recovered.contains_key(lease_id) || self.leases.contains_key(lease_id)
+        });
     }
 
     /// Get a snapshot of all leases (lease_id -> last_seen).

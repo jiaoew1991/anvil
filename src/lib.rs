@@ -667,6 +667,10 @@ fn anvil_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.py().get_type::<client::QueueFinishedError>(),
     )?;
     m.add(
+        "PartitionOwnedError",
+        m.py().get_type::<client::PartitionOwnedError>(),
+    )?;
+    m.add(
         "StorageFormatError",
         m.py().get_type::<StorageFormatError>(),
     )?;

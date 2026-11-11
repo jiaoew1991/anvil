@@ -125,9 +125,10 @@ A failed RPC's status code tells the caller what to do next:
 
 | Code | Meaning | Caller's response |
 |------|---------|-------------------|
-| `FAILED_PRECONDITION` | The caller no longer holds a claim it acks, nacks, forwards, scatters or renews: its token, lease or worker does not match, the message is no longer claimed, or another settlement holds it. Or a redrive into a queue marked finished | Drop the message; another worker owns it or it is done. A redrive: the queue's consumers may have exited |
+| `FAILED_PRECONDITION` | The caller no longer holds a claim it acks, nacks, forwards, scatters or renews: its token, lease or worker does not match, the message is no longer claimed, or another settlement holds it. Or a redrive into a queue marked finished. Or a group claim on a lease the broker no longer holds (`lease_not_live`) | Drop the message; another worker owns it or it is done. A redrive: the queue's consumers may have exited. A group claim: the worker's claims are lost, so it reloads its state and claims on its new lease |
 | `NOT_FOUND` | The queue or queue group does not exist | Create it first |
 | `INVALID_ARGUMENT` | The request is malformed: claim tokens that do not pair up with message ids, a message id listed twice in one ack, nack, renewal, redrive or purge, an empty queue name (push, claim, create, forward target, dead letter calls), a state update with an empty namespace, a group claim that names no partition or one outside the group, a redrive or purge of no or more than 1000 dead letters, a list limit outside 1 to 1000 | Fix the request |
+| `ABORTED` | A group claim named a partition another worker's live lease consumes (message starts with `partition_owned`) | Retry later: the partition is freed once that lease is dead and its claims are reclaimed. If the other worker is alive, the assignment gives one partition to two workers |
 | `RESOURCE_EXHAUSTED` | A bounded queue is full (message starts with `QueueFull`) | Back off and retry |
 | `UNAVAILABLE` | The broker's database is closed for good: a newer broker opened it and fenced this one, or a storage background task failed | Fail over to the current broker; do not retry this one |
 | `INTERNAL` | The broker's storage failed | Retry |
@@ -138,7 +139,8 @@ update is refused fails whole: nothing is acked without its state.
 
 A fenced broker stops its recovery and GC tasks, which could only fail
 from then on, and answers `UNAVAILABLE` until it is stopped. The Python client raises
-`ClaimLostError` (a `RuntimeError`) for `FAILED_PRECONDITION`.
+`ClaimLostError` (a `RuntimeError`) for `FAILED_PRECONDITION` and
+`PartitionOwnedError` for `ABORTED`.
 
 Reading a queue never creates it: `GetStats` for an unknown queue returns
 `NOT_FOUND`, and so do `ListDeadLetters`, `RedriveDeadLetters` and
@@ -156,14 +158,40 @@ Anvil has two shapes of queue, chosen by what the consumer needs:
 | Producer | `push`, `ack_and_forward` | `ack_and_scatter`, which names the partition of each payload |
 | Consumer | `claim`: workers compete for any message | `claim_from_group`: a worker names its partitions and gets messages from no other |
 | Load balance | Automatic: no worker idles while work is pending | The caller's, through the assignment of partitions |
-| Drain signal | The queue is finished and empty | Every partition is finished and empty |
+| Drain signal | The queue is finished and empty | The worker's partitions are finished and empty |
+| Dead letters reported with the drain signal | The queue's | Those of the worker's partitions |
 
 A consumer that needs no key affinity should use a queue, not a group: a
-group adds skew between partitions and nothing in return. The broker never
-gives a partition's messages to a worker that did not name it, since a
-consumer keeping state per key would then see part of a key. It does not
-check that a partition is named by one worker only: that assignment is the
-caller's.
+group adds skew between partitions and nothing in return.
+
+**A partition has one consumer at a time.** The first lease to claim a
+partition owns it, and a group claim naming a partition another lease owns
+is refused with `ABORTED`, whole: it takes none of the partitions it names.
+Ownership lives in the broker's memory and follows the lease:
+
+- It ends when the lease is dead and the recovery task has reclaimed its
+  claims, at most `lease_timeout_secs` plus `recovery_interval_secs` after
+  the worker's last heartbeat. Until then a replacement worker is refused,
+  since an ack of the dead lease could still land.
+- A broker restart ends every lease, and every ownership with it.
+- A worker whose lease died gets a new lease when it reconnects, and is
+  then a new consumer like any other: it may be refused its old partition
+  for a while, and it must reload its state.
+
+**Keeping state per key.** A consumer whose result depends on every message
+of a key, such as an aggregate, writes its state in the call that acks the
+messages it covers (`state_puts` of `ack` and `ack_and_scatter`): the two
+land together or not at all, so the state never counts a message that will
+be redelivered, nor misses one that was acked. A worker taking over a
+partition reads that state first. A late ack of the previous owner is
+fenced, and its state is refused with it.
+
+Dead letters of a partition are inputs the consumer never got. The claim
+that reports the partitions drained reports their number: a consumer whose
+result needs every input must not emit it when that number is not zero.
+
+The partition queues are ordinary queues, and a plain `claim` on one goes
+around its owner: consume a group only through `claim_from_group`.
 
 ---
 

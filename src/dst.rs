@@ -921,9 +921,10 @@ pub(crate) mod tests {
             handles.push(tokio::spawn(async move {
                 let w = format!("w_{wid}");
                 let l = format!("l_{wid}");
+                let partitions = s.group_partitions(group, &assigned).await.unwrap();
                 loop {
                     let (claimed, _, _) = s
-                        .claim_from_group(group, 1, &w, &l, &assigned)
+                        .claim_from_group(group, &partitions, 1, &w, &l)
                         .await
                         .unwrap();
                     if claimed.is_empty() {

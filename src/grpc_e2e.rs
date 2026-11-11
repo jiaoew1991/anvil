@@ -19,6 +19,7 @@
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use tokio::sync::mpsc;
@@ -71,6 +72,9 @@ mod tests {
     /// is dropped, which closes the stream the way a dead worker would.
     struct Heartbeat {
         lease_id: String,
+        /// When the last ping the broker answered was sent: the broker saw
+        /// the lease then or later.
+        seen_since: Arc<Mutex<Instant>>,
         pinger: JoinHandle<()>,
     }
 
@@ -82,6 +86,7 @@ mod tests {
                 timestamp: 0,
             };
             let (tx, rx) = mpsc::channel(1);
+            let sent_at = Instant::now();
             tx.send(ping.clone()).await.unwrap();
             let mut pongs = client
                 .clone()
@@ -90,18 +95,28 @@ mod tests {
                 .unwrap()
                 .into_inner();
             let lease_id = pongs.message().await.unwrap().unwrap().lease_id;
-            let pinger = tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(KEEPALIVE_INTERVAL).await;
-                    if tx.send(ping.clone()).await.is_err() {
-                        return;
-                    }
-                    if !matches!(pongs.message().await, Ok(Some(_))) {
-                        return;
+            let seen_since = Arc::new(Mutex::new(sent_at));
+            let pinger = tokio::spawn({
+                let seen_since = seen_since.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(KEEPALIVE_INTERVAL).await;
+                        let sent_at = Instant::now();
+                        if tx.send(ping.clone()).await.is_err() {
+                            return;
+                        }
+                        if !matches!(pongs.message().await, Ok(Some(_))) {
+                            return;
+                        }
+                        *seen_since.lock().unwrap() = sent_at;
                     }
                 }
             });
-            Self { lease_id, pinger }
+            Self {
+                lease_id,
+                seen_since,
+                pinger,
+            }
         }
     }
 
@@ -602,18 +617,18 @@ mod tests {
         assert_eq!(first[0].delivery_count, 1);
 
         let dead_lease_id = dead.lease_id.clone();
+        let seen_since = dead.seen_since.clone();
         drop(dead);
-        let dropped_at = Instant::now();
+        let seen_since = *seen_since.lock().unwrap();
         wait_for_stats(&client, queue, |s| {
             (s.pending_count, s.claimed_count) == (1, 0)
         })
         .await;
-        // The lease was last seen at most one keepalive before the drop.
         let lease_timeout = Duration::from_secs_f64(SHORT_TIMEOUT_SECS);
         assert!(
-            dropped_at.elapsed() + KEEPALIVE_INTERVAL >= lease_timeout,
-            "claim reclaimed {:?} after its lease went silent, before the {lease_timeout:?} lease timeout",
-            dropped_at.elapsed()
+            seen_since.elapsed() >= lease_timeout,
+            "claim reclaimed {:?} after its lease was seen, before the {lease_timeout:?} lease timeout",
+            seen_since.elapsed()
         );
 
         let live = Heartbeat::open(&client, "live").await;

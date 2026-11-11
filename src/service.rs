@@ -66,6 +66,7 @@ fn storage_status(rpc: &str, error: StorageError) -> Status {
         Rejection::InvalidArgument(message) => Status::invalid_argument(message.as_str()),
         Rejection::QueueFull(message) => Status::resource_exhausted(message.as_str()),
         Rejection::QueueFinished(message) => Status::failed_precondition(message.as_str()),
+        Rejection::PartitionOwned(message) => Status::aborted(message.as_str()),
     }
 }
 
@@ -139,6 +140,11 @@ impl AnvilService {
             storage,
             lease_timeout,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> &AnvilState {
+        &self.state
     }
 
     /// Convert internal Message to slim ClaimMessage (no queue, no created_at)
@@ -432,14 +438,26 @@ impl AnvilService {
                     .map(|&p| p as u32)
                     .collect();
 
+                let partitions = self
+                    .storage
+                    .group_partitions(&group.group_name, &assigned)
+                    .await
+                    .map_err(|e| storage_status("Claim(group)", e))?;
+                self.state
+                    .own_partitions(
+                        partitions.iter().map(|(_, queue)| queue.as_str()),
+                        &req.lease_id,
+                    )
+                    .map_err(|e| storage_status("Claim(group)", Box::new(e)))?;
+
                 let (claimed, source_queue, source_partition) = self
                     .storage
                     .claim_from_group(
                         &group.group_name,
+                        &partitions,
                         batch_size,
                         &req.worker_id,
                         &req.lease_id,
-                        &assigned,
                     )
                     .await
                     .map_err(|e| storage_status("Claim(group)", e))?;
@@ -447,22 +465,29 @@ impl AnvilService {
                 let messages: Vec<ClaimMessage> =
                     claimed.iter().map(Self::to_claim_message).collect();
 
-                // When empty, check if upstream group is finished + fully drained
+                // The worker's signal to exit covers the partitions it
+                // consumes: the rest of the group is other workers' to drain.
                 let (upstream_drained, dead_count) = if messages.is_empty() {
-                    match self.storage.check_group_completion(&group.group_name).await {
-                        Ok((all_finished, all_drained, partitions)) => {
-                            if all_finished && all_drained {
-                                tracing::info!(
-                                    "upstream_drained=true for group={}, worker={}",
-                                    group.group_name,
-                                    req.worker_id
-                                );
-                            }
-                            let dead_count = partitions.iter().map(|p| p.dead_count as i64).sum();
-                            (all_finished && all_drained, dead_count)
-                        }
-                        Err(_) => (false, 0),
+                    let mut drained = true;
+                    let mut dead_count = 0;
+                    for (_, queue) in &partitions {
+                        let completion = self
+                            .storage
+                            .check_queue_completion(queue)
+                            .await
+                            .map_err(|e| storage_status("Claim(group)", e))?;
+                        drained &= completion.drained;
+                        dead_count += completion.dead_count as i64;
                     }
+                    if drained {
+                        tracing::info!(
+                            "upstream_drained=true for group={}, partitions={:?}, worker={}",
+                            group.group_name,
+                            assigned,
+                            req.worker_id
+                        );
+                    }
+                    (drained, dead_count)
                 } else {
                     (false, 0)
                 };
@@ -1075,7 +1100,8 @@ impl Anvil for AnvilService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AnvilConfig;
+    use crate::recovery::RecoveryTask;
+    use crate::types::{AnvilConfig, SimClock};
     use tonic::Code;
 
     async fn create_service() -> (AnvilService, Arc<AnvilStorage>) {
@@ -1262,6 +1288,114 @@ mod tests {
             Code::InvalidArgument,
             "assigned_partitions is required",
         );
+    }
+
+    /// Claims one message of partition `partition` of group `g` as worker
+    /// and lease `lease`.
+    async fn group_claim(
+        service: &AnvilService,
+        lease: &str,
+        partition: i32,
+    ) -> Result<ClaimResponse, Status> {
+        service
+            .claim(Request::new(ClaimRequest {
+                source: Some(claim_request::Source::Group(GroupClaimSource {
+                    group_name: "g".to_string(),
+                    assigned_partitions: vec![partition],
+                })),
+                worker_id: lease.to_string(),
+                lease_id: lease.to_string(),
+                batch_size: 1,
+                timeout_ms: 0,
+            }))
+            .await
+            .map(Response::into_inner)
+    }
+
+    /// Goal: a partition has one consumer at a time, and a consumer drains
+    /// with its own partitions. Method: two leases claim from a finished
+    /// two-partition group with one message left in partition 1. A second
+    /// lease naming an owned partition is ABORTED, while its owner is live
+    /// and, once it is dead, until a recovery pass frees the partition; a
+    /// lease the broker does not hold is FAILED_PRECONDITION.
+    #[tokio::test]
+    async fn test_group_partition_ownership_follows_the_lease() {
+        let (service, storage) = create_service().await;
+        storage.create_queue_group("g", 2, 0, None).await.unwrap();
+        storage
+            .push_messages("g_p1", &[Message::new(b"x".to_vec())])
+            .await
+            .unwrap();
+        storage.mark_group_finished("g").await.unwrap();
+        let claim = |lease: &'static str, partition: i32| group_claim(&service, lease, partition);
+        let state = service.state();
+        state.update_lease("a");
+        state.update_lease("b");
+
+        let status = claim("unknown", 0).await.unwrap_err();
+        assert_status(&status, Code::FailedPrecondition, "lease_not_live");
+        // Partition 0 is drained whatever partition 1 still holds.
+        let own = claim("a", 0).await.unwrap();
+        assert!(own.upstream_drained);
+        let status = claim("b", 0).await.unwrap_err();
+        assert_status(&status, Code::Aborted, "partition_owned");
+        let other = claim("b", 1).await.unwrap();
+        assert_eq!((other.messages.len(), other.source_partition), (1, 1));
+        assert!(!other.upstream_drained);
+
+        // Both leases die and b's worker comes back: partition 0 stays a's
+        // until recovery, which reclaims a's claims first, has run.
+        state.prune_leases(-1.0);
+        state.update_lease("b");
+        let status = claim("b", 0).await.unwrap_err();
+        assert_status(&status, Code::Aborted, "partition_owned");
+        state.release_dead_owners(&state.lease_snapshot());
+        assert!(claim("b", 0).await.unwrap().upstream_drained);
+    }
+
+    /// Goal: a dead worker's partition passes to its successor only with
+    /// its claims. Method: under a running recovery task, lease a claims
+    /// the one message of partition 0 and never heartbeats; lease b, kept
+    /// alive, claims the partition until it is no longer refused. Its first
+    /// claim that succeeds returns the message a held, redelivered.
+    #[tokio::test]
+    async fn test_recovery_hands_a_dead_owners_partition_over() {
+        const HANDOVER_DEADLINE: Duration = Duration::from_secs(10);
+        // Lease a must expire in real time.
+        let _clock = SimClock::acquire();
+        let (service, storage) = create_service().await;
+        let config = AnvilConfig {
+            lease_timeout_secs: 0.2,
+            recovery_interval_secs: 0.05,
+            ..AnvilConfig::default()
+        };
+        let mut recovery = RecoveryTask::new(storage.clone(), service.state.clone(), config);
+        recovery.start();
+        storage.create_queue_group("g", 1, 0, None).await.unwrap();
+        storage
+            .push_messages("g_p0", &[Message::new(b"x".to_vec())])
+            .await
+            .unwrap();
+
+        service.state.update_lease("a");
+        let held = group_claim(&service, "a", 0).await.unwrap();
+        assert_eq!(held.messages.len(), 1);
+        let started = std::time::Instant::now();
+        let taken = loop {
+            service.state.update_lease("b");
+            match group_claim(&service, "b", 0).await {
+                Ok(response) => break response,
+                Err(status) => {
+                    assert_status(&status, Code::Aborted, "partition_owned");
+                    assert!(started.elapsed() < HANDOVER_DEADLINE, "never handed over");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+        recovery.stop_async().await;
+        assert_eq!(taken.messages.len(), 1);
+        assert_eq!(taken.messages[0].msg_id, held.messages[0].msg_id);
+        assert_eq!(taken.messages[0].delivery_count, 2);
     }
 
     /// A push past a bounded queue's capacity is RESOURCE_EXHAUSTED, and the

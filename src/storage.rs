@@ -82,6 +82,9 @@ pub enum Rejection {
     /// The queue is marked finished, and a consumer may already have been
     /// told it drained, so it takes no work back.
     QueueFinished(String),
+    /// Another worker's live lease consumes a partition the caller named in
+    /// a group claim.
+    PartitionOwned(String),
 }
 
 impl std::fmt::Display for Rejection {
@@ -91,7 +94,8 @@ impl std::fmt::Display for Rejection {
             | Rejection::NotFound(message)
             | Rejection::InvalidArgument(message)
             | Rejection::QueueFull(message)
-            | Rejection::QueueFinished(message) => f.write_str(message),
+            | Rejection::QueueFinished(message)
+            | Rejection::PartitionOwned(message) => f.write_str(message),
         }
     }
 }
@@ -2779,20 +2783,13 @@ impl AnvilStorage {
         Ok(all_new_msg_ids)
     }
 
-    /// Claims from the first of the caller's assigned partitions that has
-    /// messages, starting one partition later on each call so none starves.
-    /// Returns the messages with their partition's queue and index, or no
-    /// messages when every assigned partition is empty. A partition is never
-    /// claimed by a caller it is not assigned to: a consumer that keeps
-    /// state per key relies on seeing all of a partition.
-    pub async fn claim_from_group(
+    /// The queues of a group's `assigned_partitions`, each with its index, in
+    /// the order given.
+    pub async fn group_partitions(
         &self,
         group_name: &str,
-        batch_size: usize,
-        worker_id: &str,
-        lease_id: &str,
         assigned_partitions: &[u32],
-    ) -> Result<(Vec<ClaimedMessage>, String, u32), StorageError> {
+    ) -> Result<Vec<(u32, String)>, StorageError> {
         if assigned_partitions.is_empty() {
             return Err(Box::new(Rejection::InvalidArgument(
                 "assigned_partitions is required for a group claim".to_string(),
@@ -2802,6 +2799,7 @@ impl AnvilStorage {
             .get_group_meta(group_name)
             .await?
             .ok_or_else(|| Rejection::NotFound(format!("Queue group not found: {}", group_name)))?;
+        let mut partitions = Vec::with_capacity(assigned_partitions.len());
         for pid in assigned_partitions {
             if *pid >= group.num_partitions {
                 return Err(Box::new(Rejection::InvalidArgument(format!(
@@ -2809,9 +2807,25 @@ impl AnvilStorage {
                     pid, group.num_partitions
                 ))));
             }
+            partitions.push((*pid, group.partition_queues[*pid as usize].clone()));
         }
+        Ok(partitions)
+    }
 
-        let assigned_count = assigned_partitions.len() as u64;
+    /// Claims from the first of `partitions`, as `group_partitions` returns
+    /// them, that has messages, starting one partition later on each call so
+    /// none starves. Returns the messages with their partition's queue and
+    /// index, or no messages when every partition is empty.
+    pub async fn claim_from_group(
+        &self,
+        group_name: &str,
+        partitions: &[(u32, String)],
+        batch_size: usize,
+        worker_id: &str,
+        lease_id: &str,
+    ) -> Result<(Vec<ClaimedMessage>, String, u32), StorageError> {
+        assert!(!partitions.is_empty());
+        let partition_count = partitions.len() as u64;
         let first = {
             let mut map = self.group_claim_rr.lock().unwrap();
             let counter = map
@@ -2821,14 +2835,13 @@ impl AnvilStorage {
             *counter = first.wrapping_add(1);
             first
         };
-        for offset in 0..assigned_count {
-            let pid = assigned_partitions[((first + offset) % assigned_count) as usize];
-            let queue_name = &group.partition_queues[pid as usize];
+        for offset in 0..partition_count {
+            let (pid, queue_name) = &partitions[((first + offset) % partition_count) as usize];
             let claimed = self
                 .claim_messages(queue_name, batch_size, worker_id, lease_id)
                 .await?;
             if !claimed.is_empty() {
-                return Ok((claimed, queue_name.to_string(), pid));
+                return Ok((claimed, queue_name.clone(), *pid));
             }
         }
         Ok((Vec::new(), String::new(), 0))
