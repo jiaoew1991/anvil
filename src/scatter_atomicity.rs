@@ -112,10 +112,10 @@ mod tests {
         let crashed = tokio::runtime::Runtime::new().unwrap();
         let (storage, scattered_id, held_id) = crashed.block_on(async {
             let storage = AnvilStorage::new(&db_path).await.unwrap();
-            storage.create_queue(UPSTREAM, 0).await.unwrap();
-            storage.create_queue(FORWARD_QUEUE, 0).await.unwrap();
+            storage.create_queue(UPSTREAM, 0, None).await.unwrap();
+            storage.create_queue(FORWARD_QUEUE, 0, None).await.unwrap();
             storage
-                .create_queue_group(GROUP, PARTITIONS, 0)
+                .create_queue_group(GROUP, PARTITIONS, 0, None)
                 .await
                 .unwrap();
             let stale = HashMap::from([("stale".to_string(), b"x".to_vec())]);
@@ -299,10 +299,10 @@ mod tests {
                 .unwrap();
             let storage = crashed.block_on(async {
                 let storage = Arc::new(AnvilStorage::new(&db_path).await.unwrap());
-                storage.create_queue(UPSTREAM, 0).await.unwrap();
-                storage.create_queue(FORWARD_QUEUE, 0).await.unwrap();
+                storage.create_queue(UPSTREAM, 0, None).await.unwrap();
+                storage.create_queue(FORWARD_QUEUE, 0, None).await.unwrap();
                 storage
-                    .create_queue_group(GROUP, PARTITIONS, 0)
+                    .create_queue_group(GROUP, PARTITIONS, 0, None)
                     .await
                     .unwrap();
 

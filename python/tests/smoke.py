@@ -2,8 +2,9 @@
 
 Exercises the Python bindings end to end: start a broker on a temporary
 file:// store, push, claim, check the delivery count, renew, ack, see a
-second ack fenced, stop, and reopen the store, which now carries the format
-marker, directly.
+second ack fenced, dead-letter a poison message, redrive it (into a
+finished queue too) and purge it, stop, and
+reopen the store, which now carries the format marker, directly.
 """
 
 import sys
@@ -16,6 +17,7 @@ from anvil_py import (
     AnvilStorageReader,
     BrokerConfig,
     ClaimLostError,
+    QueueFinishedError,
     StorageFormatError,
 )
 
@@ -45,7 +47,7 @@ def main():
         client.push("work", b"payload")
 
         def claim_one():
-            messages, _drained = client.claim("work", batch_size=1)
+            messages, _drained, _dead_count = client.claim("work", batch_size=1)
             return messages
 
         (message,) = wait_for(claim_one)
@@ -62,11 +64,60 @@ def main():
         else:
             sys.exit("a second ack of a settled message was not fenced")
 
+        # A poison message dies at the queue's limit, is listed with the
+        # reason of its last nack, and is redriven as a first delivery.
+        client.create_queue("poison", max_deliveries=1)
+        client.push("poison", b"bad")
+        (poison,) = wait_for(lambda: client.claim("poison", batch_size=1)[0])
+        client.nack(
+            "poison", [poison.msg_id], claim_tokens=[poison.claim_token], reason="bad input"
+        )
+        stats = client.get_stats("poison")["queues"]["poison"]
+        assert stats["dead_count"] == 1 and stats["pending_count"] == 0, stats
+        (letter,), next_start_after = client.list_dead_letters("poison")
+        assert next_start_after is None
+        assert (letter.msg_id, letter.cause, letter.reason) == (
+            poison.msg_id,
+            "nack_limit",
+            "bad input",
+        ), letter
+        redriven = client.redrive_dead_letters("poison", [letter.msg_id, "unknown"])
+        assert redriven == {"redriven": [letter.msg_id], "missing": ["unknown"]}, redriven
+        (again,) = wait_for(lambda: client.claim("poison", batch_size=1)[0])
+        assert (again.payload, again.delivery_count) == (b"bad", 1), again
+        client.nack("poison", [again.msg_id], claim_tokens=[again.claim_token], dead_letter=True)
+
+        # A finished queue drains with its dead letter reported, and refuses
+        # a redrive with an error of its own, which a worker's handler for
+        # lost claims does not swallow, unless the redrive reopens it.
+        client.mark_queue_finished("poison")
+        assert client.claim("poison", batch_size=1) == ([], True, 1)
+        assert client.is_queue_finished("poison")["dead_count"] == 1
+        try:
+            client.redrive_dead_letters("poison", [again.msg_id])
+        except ClaimLostError:
+            sys.exit("a refused redrive was reported as a lost claim")
+        except QueueFinishedError:
+            pass
+        else:
+            sys.exit("a redrive into a finished queue was not refused")
+        redriven = client.redrive_dead_letters("poison", [again.msg_id], reopen=True)
+        assert redriven == {"redriven": [again.msg_id], "missing": []}, redriven
+        assert not client.is_queue_finished("poison")["finished"]
+        (third,) = wait_for(lambda: client.claim("poison", batch_size=1)[0])
+        client.nack("poison", [third.msg_id], claim_tokens=[third.claim_token], dead_letter=True)
+        (ids,), _ = client.list_dead_letters("poison", ids_only=True)
+        assert (ids.msg_id, ids.payload) == (third.msg_id, b""), ids
+        purged = client.purge_dead_letters("poison", [third.msg_id])
+        assert purged == {"purged": [third.msg_id], "missing": []}, purged
+
         client.stop()
         broker.stop()
 
         reader = AnvilStorageReader(f"file://{db_dir}")
-        assert reader.list_queues() == ["work"], reader.list_queues()
+        assert reader.list_queues() == ["poison", "work"], reader.list_queues()
+        stats = reader.get_queue_stats("poison")
+        assert (stats["dead_count"], stats["total_purged"]) == (0, 1), stats
     # A store this release cannot read raises a RuntimeError like any other
     # failure to open, so existing handlers still catch it.
     assert issubclass(StorageFormatError, RuntimeError)

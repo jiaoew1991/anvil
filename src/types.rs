@@ -206,10 +206,19 @@ pub struct ClaimInfo {
     pub claim_token: String,
     /// How many times the message has been handed out, this claim included.
     pub delivery_count: u32,
+    /// The broker process that made the claim (`AnvilStorage::incarnation`);
+    /// `None` for a claim stored before claims recorded it.
+    pub incarnation: Option<u64>,
 }
 
 impl ClaimInfo {
-    pub fn new(msg_id: String, worker_id: String, lease_id: String, delivery_count: u32) -> Self {
+    pub fn new(
+        msg_id: String,
+        worker_id: String,
+        lease_id: String,
+        delivery_count: u32,
+        incarnation: u64,
+    ) -> Self {
         assert!(delivery_count >= 1);
         Self {
             msg_id,
@@ -218,6 +227,7 @@ impl ClaimInfo {
             claimed_at: now_secs(),
             claim_token: uuid::Uuid::now_v7().to_string(),
             delivery_count,
+            incarnation: Some(incarnation),
         }
     }
 }
@@ -229,6 +239,44 @@ pub struct ClaimedMessage {
     pub claim_token: String,
     /// 1 on first delivery; each nack or reclaimed lease adds one.
     pub delivery_count: u32,
+}
+
+/// Why a message was dead-lettered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadLetterCause {
+    /// A nack settled the last delivery its queue allows.
+    NackLimit,
+    /// A reclaim settled the last delivery its queue allows.
+    ReclaimLimit,
+    /// A nack asked for it, whatever the delivery count.
+    Rejected,
+}
+
+impl DeadLetterCause {
+    /// The name the wire API and the metrics report.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeadLetterCause::NackLimit => "nack_limit",
+            DeadLetterCause::ReclaimLimit => "reclaim_limit",
+            DeadLetterCause::Rejected => "rejected",
+        }
+    }
+}
+
+/// A message taken out of circulation, kept until a redrive or a purge.
+#[derive(Debug, Clone)]
+pub struct DeadLetter {
+    pub message: Message,
+    /// Deliveries the message had, the last one included.
+    pub delivery_count: u32,
+    pub cause: DeadLetterCause,
+    /// The reason of the nack that settled the last delivery; empty for a
+    /// reclaim.
+    pub reason: String,
+    /// The worker that held the last claim.
+    pub worker_id: String,
+    /// Wall-clock time, milliseconds since the Unix epoch.
+    pub dead_at_ms: u64,
 }
 
 /// Queue group metadata
@@ -253,6 +301,11 @@ impl QueueGroupMeta {
         }
     }
 }
+
+/// The default of `AnvilConfig::default_max_deliveries`: generous enough
+/// that a transient failure is retried well past its cause, small enough
+/// that a poison message stops consuming workers within minutes.
+pub const DEFAULT_MAX_DELIVERIES: u32 = 20;
 
 /// Anvil server configuration
 #[derive(Debug, Clone)]
@@ -280,6 +333,10 @@ pub struct AnvilConfig {
     pub acked_retention_secs: f64,
     /// GC interval in seconds (how often to clean up acked messages)
     pub gc_interval_secs: f64,
+    /// Deliveries a message gets before a failed one is dead-lettered, for
+    /// every queue that sets no limit of its own; 0 is unlimited. Queues
+    /// created before dead letters existed set none, so this governs them.
+    pub default_max_deliveries: u32,
 }
 
 impl Default for AnvilConfig {
@@ -294,6 +351,7 @@ impl Default for AnvilConfig {
             max_queue_depth: 0,
             acked_retention_secs: 3600.0,
             gc_interval_secs: 60.0,
+            default_max_deliveries: DEFAULT_MAX_DELIVERIES,
         }
     }
 }
@@ -362,6 +420,7 @@ mod tests {
             "worker-1".to_string(),
             "lease-456".to_string(),
             1,
+            7,
         );
 
         assert_eq!(claim.msg_id, "msg-123");
@@ -369,6 +428,7 @@ mod tests {
         assert_eq!(claim.lease_id, "lease-456");
         assert!(claim.claimed_at > 0.0);
         assert!(!claim.claim_token.is_empty());
+        assert_eq!(claim.incarnation, Some(7));
     }
 
     #[test]

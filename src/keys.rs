@@ -48,6 +48,10 @@ const ACKED: u8 = 0x07;
 const FINISHED: u8 = 0x08;
 const GROUP: u8 = 0x09;
 const STATE: u8 = 0x0a;
+const DEAD_LETTER: u8 = 0x0b;
+const TOTAL_DEAD_LETTERED: u8 = 0x0c;
+const TOTAL_REDRIVEN: u8 = 0x0d;
+const TOTAL_PURGED: u8 = 0x0e;
 
 const ESCAPE: u8 = 0x00;
 const ESCAPED_NUL: u8 = 0xff;
@@ -197,10 +201,30 @@ pub(crate) fn total_acked(queue: &str) -> Vec<u8> {
     Key::new(TOTAL_ACKED, queue.len() + 2).string(queue).0
 }
 
+/// The lifetime count of messages of `queue` dead-lettered, merge-summed.
+pub(crate) fn total_dead_lettered(queue: &str) -> Vec<u8> {
+    Key::new(TOTAL_DEAD_LETTERED, queue.len() + 2)
+        .string(queue)
+        .0
+}
+
+/// The lifetime count of dead letters of `queue` redriven, merge-summed.
+pub(crate) fn total_redriven(queue: &str) -> Vec<u8> {
+    Key::new(TOTAL_REDRIVEN, queue.len() + 2).string(queue).0
+}
+
+/// The lifetime count of dead letters of `queue` purged, merge-summed.
+pub(crate) fn total_purged(queue: &str) -> Vec<u8> {
+    Key::new(TOTAL_PURGED, queue.len() + 2).string(queue).0
+}
+
 /// Whether `key` holds a merge-summed total, the only keys the merge
 /// operator may combine.
 pub(crate) fn is_total(key: &[u8]) -> bool {
-    matches!(key.first(), Some(&(TOTAL_PUSHED | TOTAL_ACKED)))
+    matches!(
+        key.first(),
+        Some(&(TOTAL_PUSHED | TOTAL_ACKED | TOTAL_DEAD_LETTERED | TOTAL_REDRIVEN | TOTAL_PURGED))
+    )
 }
 
 /// The message waiting at `seq` in `queue`.
@@ -323,6 +347,37 @@ pub(crate) fn parse_state(key: &[u8]) -> Result<(String, String), MalformedKey> 
     Ok(parsed)
 }
 
+/// The dead letter of message `msg_id` of `queue`.
+pub(crate) fn dead_letter(queue: &str, msg_id: &str) -> Vec<u8> {
+    Key::new(DEAD_LETTER, queue.len() + msg_id.len() + 4)
+        .string(queue)
+        .string(msg_id)
+        .0
+}
+
+/// The dead letters of `queue` by msg_id, those after `start_after` only
+/// when it is given. Strings are prefix-free, so the first key past a dead
+/// letter's is that key followed by 0x00.
+pub(crate) fn dead_letters(queue: &str, start_after: Option<&str>) -> Range<Vec<u8>> {
+    let all = prefix_range(Key::new(DEAD_LETTER, queue.len() + 2).string(queue).0);
+    match start_after {
+        Some(msg_id) => {
+            let mut start = dead_letter(queue, msg_id);
+            start.push(0x00);
+            start..all.end
+        }
+        None => all,
+    }
+}
+
+/// Queue and msg_id of a dead letter key.
+pub(crate) fn parse_dead_letter(key: &[u8]) -> Result<(String, String), MalformedKey> {
+    let mut fields = Fields::new(key, DEAD_LETTER)?;
+    let parsed = (fields.string()?, fields.string()?);
+    fields.end()?;
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,11 +451,34 @@ mod tests {
         );
     }
 
+    /// Goal: a queue's dead letters after a cursor are exactly those whose
+    /// msg_id sorts after it, whatever bytes the msg_ids hold, and never
+    /// another queue's.
+    #[test]
+    fn test_dead_letters_after_cursor_are_exact() {
+        let range = dead_letters("q", Some("m"));
+        assert!(!range.contains(&dead_letter("q", "m")));
+        assert!(range.contains(&dead_letter("q", "m\0")));
+        assert!(range.contains(&dead_letter("q", "ma")));
+        assert!(range.contains(&dead_letter("q", "n")));
+        assert!(!range.contains(&dead_letter("q", "a")));
+        assert!(!range.contains(&dead_letter("q\0", "z")));
+        assert!(!range.contains(&dead_letter("q:", "z")));
+        let range = dead_letters("q", None);
+        assert!(range.contains(&dead_letter("q", "")));
+        assert!(!range.contains(&dead_letter("qa", "")));
+        assert_eq!(
+            parse_dead_letter(&dead_letter("q:1", "m\0")).unwrap(),
+            ("q:1".to_string(), "m\0".to_string())
+        );
+    }
+
     /// Goal: a key of one family never parses as another's, and trailing or
     /// missing bytes are refused.
     #[test]
     fn test_malformed_keys_are_refused() {
         assert!(parse_claim(&acked("q", 1, "m")).is_err());
+        assert!(parse_dead_letter(&claim("q", "m")).is_err());
         assert!(parse_pending(&pending("q", 1)[..9]).is_err());
         let mut long = claim("q", "m");
         long.push(0);
@@ -408,6 +486,9 @@ mod tests {
         assert!(parse_queue(&[QUEUE, b'q', 0x00, 0x02]).is_err());
         assert!(parse_queue(&[QUEUE, 0xc3, 0x28, 0x00, 0x01]).is_err());
         assert!(is_total(&total_pushed("q")) && is_total(&total_acked("q")));
+        assert!(is_total(&total_dead_lettered("q")) && is_total(&total_redriven("q")));
+        assert!(is_total(&total_purged("q")));
+        assert!(!is_total(&dead_letter("q", "m")));
         assert!(!is_total(&queue("q")) && !is_total(FORMAT));
     }
 }

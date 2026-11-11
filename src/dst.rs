@@ -21,7 +21,7 @@
 // Invariants checked:
 //   1. Counter consistency: meta.claimed_count == actual claimed keys
 //   2. Pending consistency: push_seq - claim_seq == actual pending keys
-//   3. Message conservation: every msg_id is in exactly one of pending/claimed/acked
+//   3. Message conservation: every msg_id is in exactly one of pending/claimed/acked/dead/purged
 //   4. No overlap: no msg_id appears in both claimed and acked
 //   5. ack_and_forward atomicity: downstream push_seq increases iff upstream ack succeeds
 
@@ -35,8 +35,12 @@ pub(crate) mod tests {
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
-    use crate::storage::AnvilStorage;
+    use crate::storage::{AnvilStorage, NackOptions, DEAD_LETTERS_PER_CALL_MAX};
     use crate::types::{advance_sim_time_secs, set_sim_time_nanos, Message, SimClock};
+
+    /// The delivery limit of the simulated queues: small, so the workload
+    /// dead-letters, redrives and purges as often as it requeues.
+    const DST_MAX_DELIVERIES: u32 = 3;
 
     /// What a simulated worker currently holds (claimed messages).
     #[derive(Default, Clone)]
@@ -65,6 +69,13 @@ pub(crate) mod tests {
         },
         Nack {
             worker_idx: usize,
+            dead_letter: bool,
+        },
+        Redrive {
+            queue_idx: usize,
+        },
+        Purge {
+            queue_idx: usize,
         },
         AckAndForward {
             worker_idx: usize,
@@ -85,7 +96,8 @@ pub(crate) mod tests {
         num_workers: usize,
         workers: Vec<WorkerState>,
         lease_ids: Vec<String>,
-        /// Every (queue, msg_id) whose push or forward returned success.
+        /// Every (queue, msg_id) whose push or forward returned success, and
+        /// that was not purged since: a purge drops a message for good.
         pub(crate) pushed: HashSet<(String, String)>,
         /// Every (queue, msg_id) whose ack returned success.
         pub(crate) acked: HashSet<(String, String)>,
@@ -107,7 +119,10 @@ pub(crate) mod tests {
 
             let queues: Vec<String> = (0..num_queues).map(|i| format!("q{}", i)).collect();
             for q in &queues {
-                storage.create_queue(q, 0).await.unwrap();
+                storage
+                    .create_queue(q, 0, Some(DST_MAX_DELIVERIES))
+                    .await
+                    .unwrap();
             }
 
             let workers: Vec<WorkerState> =
@@ -133,7 +148,10 @@ pub(crate) mod tests {
             // Delete all queues and recreate them
             for q in &self.queues {
                 let _ = self.storage.delete_queue(q).await;
-                self.storage.create_queue(q, 0).await.unwrap();
+                self.storage
+                    .create_queue(q, 0, Some(DST_MAX_DELIVERIES))
+                    .await
+                    .unwrap();
             }
             self.rng = StdRng::seed_from_u64(seed);
             self.workers = (0..self.num_workers)
@@ -147,7 +165,7 @@ pub(crate) mod tests {
         pub(crate) fn generate_ops(&mut self, count: usize) -> Vec<Op> {
             let mut ops = Vec::with_capacity(count);
             for _ in 0..count {
-                let op = match self.rng.random_range(0u32..10) {
+                let op = match self.rng.random_range(0u32..12) {
                     0..3 => {
                         let queue_idx = self.rng.random_range(0..self.queues.len());
                         if self.rng.random_bool(0.3) {
@@ -169,10 +187,17 @@ pub(crate) mod tests {
                     },
                     7 => Op::Nack {
                         worker_idx: self.rng.random_range(0..self.workers.len()),
+                        dead_letter: self.rng.random_bool(0.1),
                     },
                     8 => Op::AckAndForward {
                         worker_idx: self.rng.random_range(0..self.workers.len()),
                         downstream_idx: self.rng.random_range(0..self.queues.len()),
+                    },
+                    10 => Op::Redrive {
+                        queue_idx: self.rng.random_range(0..self.queues.len()),
+                    },
+                    11 => Op::Purge {
+                        queue_idx: self.rng.random_range(0..self.queues.len()),
                     },
                     _ => {
                         if self.rng.random_bool(0.5) {
@@ -259,7 +284,10 @@ pub(crate) mod tests {
                     }
                 }
 
-                Op::Nack { worker_idx } => {
+                Op::Nack {
+                    worker_idx,
+                    dead_letter,
+                } => {
                     let worker = &mut self.workers[worker_idx];
                     if worker.claims.is_empty() {
                         return;
@@ -278,7 +306,17 @@ pub(crate) mod tests {
                     let lease_id = &self.lease_ids[worker_idx];
                     for (queue, (msg_ids, tokens)) in &by_queue {
                         self.storage
-                            .nack_messages(queue, msg_ids, tokens, &worker_id, lease_id)
+                            .nack_messages(
+                                queue,
+                                msg_ids,
+                                tokens,
+                                &worker_id,
+                                lease_id,
+                                NackOptions {
+                                    dead_letter,
+                                    reason: "dst",
+                                },
+                            )
                             .await
                             .unwrap();
                     }
@@ -317,6 +355,49 @@ pub(crate) mod tests {
                     self.acked.insert((queue, msg_id));
                     self.pushed
                         .extend(out_msgs.into_iter().map(|m| (downstream.clone(), m.msg_id)));
+                }
+
+                Op::Redrive { queue_idx } => {
+                    let queue = &self.queues[queue_idx];
+                    let (letters, _) = self
+                        .storage
+                        .list_dead_letters(queue, None, 3, false)
+                        .await
+                        .unwrap();
+                    if letters.is_empty() {
+                        return;
+                    }
+                    let msg_ids: Vec<String> =
+                        letters.into_iter().map(|l| l.message.msg_id).collect();
+                    let (redriven, missing) = self
+                        .storage
+                        .redrive_dead_letters(queue, &msg_ids, false)
+                        .await
+                        .unwrap();
+                    assert_eq!((redriven, missing), (msg_ids, Vec::new()));
+                }
+
+                Op::Purge { queue_idx } => {
+                    let queue = &self.queues[queue_idx];
+                    let (letters, _) = self
+                        .storage
+                        .list_dead_letters(queue, None, 2, false)
+                        .await
+                        .unwrap();
+                    if letters.is_empty() {
+                        return;
+                    }
+                    let msg_ids: Vec<String> =
+                        letters.into_iter().map(|l| l.message.msg_id).collect();
+                    let (purged, missing) = self
+                        .storage
+                        .purge_dead_letters(queue, &msg_ids)
+                        .await
+                        .unwrap();
+                    assert_eq!((&purged, missing), (&msg_ids, Vec::new()));
+                    for msg_id in purged {
+                        self.pushed.remove(&(queue.clone(), msg_id));
+                    }
                 }
 
                 Op::AdvanceTime { secs } => {
@@ -364,6 +445,28 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every dead letter of `queue`, by msg_id.
+    pub(crate) async fn dead_letter_ids(storage: &AnvilStorage, queue: &str) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        let mut start_after: Option<String> = None;
+        loop {
+            let (page, more) = storage
+                .list_dead_letters(
+                    queue,
+                    start_after.as_deref(),
+                    DEAD_LETTERS_PER_CALL_MAX,
+                    false,
+                )
+                .await
+                .unwrap();
+            start_after = page.last().map(|l| l.message.msg_id.clone());
+            ids.extend(page.into_iter().map(|l| l.message.msg_id));
+            if !more {
+                return ids;
+            }
+        }
+    }
+
     /// Scan storage and verify all invariants.
     pub(crate) async fn check_invariants(storage: &AnvilStorage, queues: &[String]) {
         for queue in queues {
@@ -393,19 +496,36 @@ pub(crate) mod tests {
                 meta
             );
 
-            // Invariant 3: conservation — pending + claimed + acked >= total_pushed
-            // (excess = cumulative nack count, always >= 0)
-            let lhs = pending_from_meta + meta.claimed_count + meta.total_acked;
+            // Invariant 3: conservation — pending + claimed + acked + dead +
+            // purged >= total_pushed (excess = cumulative nack count, always
+            // >= 0)
+            let lhs = pending_from_meta
+                + meta.claimed_count
+                + meta.total_acked
+                + meta.dead_count
+                + meta.total_purged;
             assert!(
                 lhs >= meta.total_pushed,
-                "[{}] conservation: {} + {} + {} = {} < total_pushed={} (meta={:?})",
-                queue,
-                pending_from_meta,
-                meta.claimed_count,
-                meta.total_acked,
-                lhs,
+                "[{queue}] conservation: {lhs} < total_pushed={} (meta={meta:?})",
                 meta.total_pushed,
-                meta
+            );
+
+            // Invariant 3b: dead_count == actual dead letter keys, none of
+            // them also claimed
+            let dead_ids = dead_letter_ids(storage, queue).await;
+            assert_eq!(
+                meta.dead_count,
+                dead_ids.len() as u64,
+                "[{}] dead_count: meta={} actual={}",
+                queue,
+                meta.dead_count,
+                dead_ids.len()
+            );
+            assert!(
+                claimed_entries
+                    .iter()
+                    .all(|(_, id, _)| !dead_ids.contains(id)),
+                "[{queue}] a message both claimed and dead"
             );
 
             // Invariant 4: no msg_id in both claimed AND acked
@@ -463,8 +583,8 @@ pub(crate) mod tests {
     async fn test_dst_forward_heavy() {
         let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
-        storage.create_queue("upstream", 0).await.unwrap();
-        storage.create_queue("downstream", 0).await.unwrap();
+        storage.create_queue("upstream", 0, None).await.unwrap();
+        storage.create_queue("downstream", 0, None).await.unwrap();
 
         set_sim_time_nanos(1_735_689_600_000_000_000);
 
@@ -515,7 +635,7 @@ pub(crate) mod tests {
     async fn test_dst_recovery_cycle() {
         let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
-        storage.create_queue("q", 0).await.unwrap();
+        storage.create_queue("q", 0, None).await.unwrap();
 
         set_sim_time_nanos(1_735_689_600_000_000_000);
 
@@ -588,12 +708,13 @@ pub(crate) mod tests {
         assert_eq!(meta.claimed_count, 0);
     }
 
-    /// Nack storm: 5 messages bounce 20× between pending and claimed.
+    /// Nack storm: 5 messages bounce 20× between pending and claimed, on a
+    /// queue without a delivery limit.
     #[tokio::test]
     async fn test_dst_nack_storm() {
         let _clock = SimClock::acquire();
         let storage = AnvilStorage::new("memory://").await.unwrap();
-        storage.create_queue("q", 0).await.unwrap();
+        storage.create_queue("q", 0, Some(0)).await.unwrap();
 
         set_sim_time_nanos(1_735_689_600_000_000_000);
 
@@ -613,7 +734,7 @@ pub(crate) mod tests {
             let ids: Vec<String> = claimed.iter().map(|c| c.message.msg_id.clone()).collect();
             let tokens: Vec<String> = claimed.iter().map(|c| c.claim_token.clone()).collect();
             storage
-                .nack_messages("q", &ids, &tokens, "w0", "lease-0")
+                .nack_messages("q", &ids, &tokens, "w0", "lease-0", NackOptions::default())
                 .await
                 .unwrap();
 
@@ -652,7 +773,7 @@ pub(crate) mod tests {
         let storage = AnvilStorage::new("memory://").await.unwrap();
         let storage = Arc::new(storage);
         let queue = "stress_q";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         // Push 10000 messages
         let mut msgs = Vec::new();
@@ -714,7 +835,7 @@ pub(crate) mod tests {
 
         let storage = Arc::new(AnvilStorage::new("memory://").await.unwrap());
         let queue = "pca_q";
-        storage.create_queue(queue, 0).await.unwrap();
+        storage.create_queue(queue, 0, None).await.unwrap();
 
         // Phase 1: push 5000 messages concurrently from 50 pushers
         let total_pushed = Arc::new(AtomicU64::new(0));
@@ -777,7 +898,7 @@ pub(crate) mod tests {
     async fn test_concurrent_claim_from_group() {
         let storage = Arc::new(AnvilStorage::new("memory://").await.unwrap());
         let group = "stress_grp";
-        storage.create_queue_group(group, 4, 0).await.unwrap();
+        storage.create_queue_group(group, 4, 0, None).await.unwrap();
 
         // Push 2000 messages across partitions
         for pid in 0..4u32 {
@@ -830,7 +951,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_bounded_queue_rejects_when_full() {
         let storage = AnvilStorage::new("memory://").await.unwrap();
-        storage.create_queue("bounded", 3).await.unwrap(); // max 3 in-flight
+        storage.create_queue("bounded", 3, None).await.unwrap(); // max 3 in-flight
 
         // Push 3 messages — should succeed
         for i in 0..3 {
@@ -955,9 +1076,20 @@ pub(crate) mod tests {
                 "[{queue}] pending left after drain"
             );
         }
+        let mut dead: HashSet<(String, String)> = HashSet::new();
+        for queue in queues {
+            for msg_id in dead_letter_ids(storage, queue).await {
+                let key = (queue.clone(), msg_id);
+                assert!(!drained.contains(&key), "{key:?} both delivered and dead");
+                assert!(!stored_acked.contains(&key), "{key:?} both acked and dead");
+                dead.insert(key);
+            }
+        }
         let lost: Vec<_> = pushed
             .iter()
-            .filter(|key| !stored_acked.contains(*key) && !drained.contains(*key))
+            .filter(|key| {
+                !stored_acked.contains(*key) && !drained.contains(*key) && !dead.contains(*key)
+            })
             .collect();
         assert!(
             lost.is_empty(),
@@ -1025,7 +1157,7 @@ pub(crate) mod tests {
                 .unwrap();
             let storage = crashed.block_on(async {
                 let storage = Arc::new(AnvilStorage::new(&db_path).await.unwrap());
-                storage.create_queue(&queue, 0).await.unwrap();
+                storage.create_queue(&queue, 0, None).await.unwrap();
 
                 for _ in 0..PRODUCERS {
                     let (storage, queue, pushed) = (storage.clone(), queue.clone(), pushed.clone());
@@ -1071,7 +1203,12 @@ pub(crate) mod tests {
                                 } else {
                                     storage
                                         .nack_messages(
-                                            &queue, msg_ids, tokens, &worker_id, &lease_id,
+                                            &queue,
+                                            msg_ids,
+                                            tokens,
+                                            &worker_id,
+                                            &lease_id,
+                                            NackOptions::default(),
                                         )
                                         .await
                                         .map(|()| false)

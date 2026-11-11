@@ -19,6 +19,7 @@
 
 use futures::StreamExt;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -72,11 +73,15 @@ impl AnvilBrokerInner {
         Self::new_with_storage(config, storage).await
     }
 
-    /// Create a new broker instance using existing storage
+    /// Create a new broker instance using existing storage, which takes the
+    /// config's `default_max_deliveries`.
     pub async fn new_with_storage(
         config: AnvilConfig,
         storage: Arc<AnvilStorage>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        storage
+            .default_max_deliveries
+            .store(config.default_max_deliveries, Ordering::Relaxed);
         let state = Arc::new(AnvilState::new());
 
         // Recovery and GC tasks now only use storage (no memory state to recover)

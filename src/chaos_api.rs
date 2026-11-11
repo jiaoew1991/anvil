@@ -144,7 +144,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn nack() -> complete_request::Action {
-        complete_request::Action::Nack(NackAction {})
+        complete_request::Action::Nack(NackAction::default())
     }
 
     pub(crate) fn forward(downstream: &str, count: usize) -> complete_request::Action {
@@ -197,6 +197,7 @@ pub(crate) mod tests {
                 group_name: group.to_string(),
                 num_partitions: partitions,
                 max_pending_per_partition: 0,
+                max_deliveries: None,
             }))
             .await
             .map(|r| r.into_inner())
@@ -418,6 +419,7 @@ pub(crate) mod tests {
                 .create_queue(Request::new(CreateQueueRequest {
                     queue: queue.to_string(),
                     max_pending,
+                    max_deliveries: None,
                 }))
                 .await
                 .unwrap();
@@ -569,6 +571,7 @@ pub(crate) mod tests {
             .create_queue(Request::new(CreateQueueRequest {
                 queue: String::new(),
                 max_pending: 0,
+                max_deliveries: None,
             }))
             .await;
         assert_code(&created, Code::InvalidArgument, "create");
@@ -594,6 +597,7 @@ pub(crate) mod tests {
             .create_queue(Request::new(CreateQueueRequest {
                 queue: "down".to_string(),
                 max_pending: 0,
+                max_deliveries: None,
             }))
             .await
             .unwrap();
@@ -720,7 +724,7 @@ pub(crate) mod tests {
                         let (service, storage) = service().await;
                         // A forward to a queue not yet loaded suspends to
                         // load it before it reaches the hold.
-                        storage.create_queue("down", 0).await.unwrap();
+                        storage.create_queue("down", 0, None).await.unwrap();
                         let message = push_and_claim(&service, "up").await;
                         let (_, msg_id, info) =
                             storage.scan_claimed(Some("up")).await.unwrap().remove(0);

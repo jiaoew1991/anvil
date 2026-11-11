@@ -60,7 +60,7 @@ mod storage_faults;
 use format::FormatError;
 use server::AnvilBrokerInner;
 use storage::{AnvilStorage, StorageError};
-use types::AnvilConfig;
+use types::{AnvilConfig, DEFAULT_MAX_DELIVERIES};
 
 pyo3::create_exception!(
     anvil_py,
@@ -133,13 +133,15 @@ pub struct BrokerConfig {
     pub acked_retention_secs: f64,
     #[pyo3(get, set)]
     pub gc_interval_secs: f64,
+    #[pyo3(get, set)]
+    pub default_max_deliveries: u32,
 }
 
 #[pymethods]
 impl BrokerConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (db_path, host="0.0.0.0".to_string(), port=0, lease_timeout_secs=60.0, claim_age_timeout_secs=60.0, recovery_interval_secs=10.0, max_queue_depth=0, acked_retention_secs=3600.0, gc_interval_secs=60.0))]
+    #[pyo3(signature = (db_path, host="0.0.0.0".to_string(), port=0, lease_timeout_secs=60.0, claim_age_timeout_secs=60.0, recovery_interval_secs=10.0, max_queue_depth=0, acked_retention_secs=3600.0, gc_interval_secs=60.0, default_max_deliveries=DEFAULT_MAX_DELIVERIES))]
     fn new(
         db_path: String,
         host: String,
@@ -150,6 +152,7 @@ impl BrokerConfig {
         max_queue_depth: usize,
         acked_retention_secs: f64,
         gc_interval_secs: f64,
+        default_max_deliveries: u32,
     ) -> PyResult<Self> {
         let config = Self {
             db_path,
@@ -161,6 +164,7 @@ impl BrokerConfig {
             max_queue_depth,
             acked_retention_secs,
             gc_interval_secs,
+            default_max_deliveries,
         };
         AnvilConfig::from(config.clone())
             .validate()
@@ -193,6 +197,7 @@ impl From<BrokerConfig> for AnvilConfig {
             max_queue_depth: config.max_queue_depth,
             acked_retention_secs: config.acked_retention_secs,
             gc_interval_secs: config.gc_interval_secs,
+            default_max_deliveries: config.default_max_deliveries,
         }
     }
 }
@@ -465,6 +470,8 @@ impl AnvilStorageReader {
         dict.set_item("claimed_count", meta.claimed_count)?;
         dict.set_item("total_pushed", meta.total_pushed)?;
         dict.set_item("total_acked", meta.total_acked)?;
+        dict.set_item("dead_count", meta.dead_count)?;
+        dict.set_item("total_purged", meta.total_purged)?;
         Ok(dict.into())
     }
 
@@ -646,9 +653,14 @@ fn anvil_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AnvilStorageReader>()?;
     m.add_class::<client::AnvilRustClient>()?;
     m.add_class::<client::RustMessage>()?;
+    m.add_class::<client::DeadLetter>()?;
     m.add(
         "ClaimLostError",
         m.py().get_type::<client::ClaimLostError>(),
+    )?;
+    m.add(
+        "QueueFinishedError",
+        m.py().get_type::<client::QueueFinishedError>(),
     )?;
     m.add(
         "StorageFormatError",

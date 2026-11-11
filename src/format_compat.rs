@@ -30,14 +30,18 @@
 mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::path::Path;
+    use std::sync::atomic::Ordering;
 
     use crate::storage::tests::split_claims;
-    use crate::storage::{AnvilStorage, Rejection};
-    use crate::types::{now_nanos, set_sim_time_nanos, ClaimedMessage, Message, SimClock};
+    use crate::storage::{AnvilStorage, NackOptions, Rejection};
+    use crate::types::{
+        now_nanos, set_sim_time_nanos, ClaimedMessage, DeadLetterCause, Message, SimClock,
+    };
 
     /// Names the scenario a writer wrote, so the verifier knows what to
-    /// expect. Bumped whenever the writer adds to the scenario.
-    const SCENARIO: &[u8] = b"1";
+    /// expect. Bumped whenever the writer adds to the scenario: 2 adds dead
+    /// letters and queues with a delivery limit of their own.
+    const SCENARIO: &[u8] = b"2";
     const COMPAT: &str = "compat";
     /// Namespaces and keys with ':' and NUL, which only a versioned format
     /// stores apart.
@@ -47,6 +51,10 @@ mod tests {
     const PARTITIONS: u32 = 3;
     const BOUND: u64 = 2;
     const DAY_NANOS: u64 = 86_400 * 1_000_000_000;
+    /// The verifier's default delivery limit, low enough that a message
+    /// the writer redelivered dies at its next failure unless its queue set
+    /// a limit of its own. Every queue of scenario 1 sets none.
+    const VERIFY_DEFAULT_MAX_DELIVERIES: u32 = 2;
     /// How long before the writer ran it acks the entries that are past
     /// retention by the time the verifier runs GC with a one-day retention.
     const EXPIRED_AGE_NANOS: u64 = 30 * DAY_NANOS;
@@ -57,9 +65,13 @@ mod tests {
     }
 
     async fn open(dir: &Path) -> AnvilStorage {
-        AnvilStorage::new(&format!("file://{}", dir.display()))
+        let storage = AnvilStorage::new(&format!("file://{}", dir.display()))
             .await
-            .unwrap()
+            .unwrap();
+        storage
+            .default_max_deliveries
+            .store(VERIFY_DEFAULT_MAX_DELIVERIES, Ordering::Relaxed);
+        storage
     }
 
     fn payload(queue: &str, i: usize) -> Vec<u8> {
@@ -100,7 +112,14 @@ mod tests {
         let nacked = claim(&storage, "redelivered", 1).await;
         let (ids, tokens) = split_claims(&nacked);
         storage
-            .nack_messages("redelivered", &ids, &tokens, "worker", "lease")
+            .nack_messages(
+                "redelivered",
+                &ids,
+                &tokens,
+                "worker",
+                "lease",
+                NackOptions::default(),
+            )
             .await
             .unwrap();
         let reclaimed = claim(&storage, "redelivered", 1).await;
@@ -110,6 +129,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recovered, 1);
+
+        // Dead letters, one of each cause, on a queue that dies at its first
+        // failure; then a queue that never dies, with one delivery behind it.
+        storage.create_queue("dead", 0, Some(1)).await.unwrap();
+        push(&storage, "dead", 3).await;
+        let mut claimed = claim(&storage, "dead", 3).await;
+        claimed.sort_by(|a, b| a.message.payload.cmp(&b.message.payload));
+        for (claimed, dead_letter, reason) in [
+            (&claimed[0], true, "rejected"),
+            (&claimed[1], false, "failed"),
+        ] {
+            let (ids, tokens) = split_claims(std::slice::from_ref(claimed));
+            storage
+                .nack_messages(
+                    "dead",
+                    &ids,
+                    &tokens,
+                    "worker",
+                    "lease",
+                    NackOptions {
+                        dead_letter,
+                        reason,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let recovered = storage
+            .recover_expired_claims(1.0, 1.0, Some(&HashMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(recovered, 1);
+        storage.create_queue("unlimited", 0, Some(0)).await.unwrap();
+        push(&storage, "unlimited", 1).await;
+        let claimed = claim(&storage, "unlimited", 1).await;
+        let (ids, tokens) = split_claims(&claimed);
+        storage
+            .nack_messages(
+                "unlimited",
+                &ids,
+                &tokens,
+                "worker",
+                "lease",
+                NackOptions::default(),
+            )
+            .await
+            .unwrap();
 
         push(&storage, "pending", 4).await;
         let tagged = Message::with_metadata(
@@ -142,7 +208,7 @@ mod tests {
         storage.mark_queue_finished("finished").await.unwrap();
 
         storage
-            .create_queue_group(GROUP, PARTITIONS, 0)
+            .create_queue_group(GROUP, PARTITIONS, 0, None)
             .await
             .unwrap();
         push(&storage, "scatter-src", 1).await;
@@ -183,7 +249,7 @@ mod tests {
             .await
             .unwrap();
 
-        storage.create_queue("bounded", BOUND).await.unwrap();
+        storage.create_queue("bounded", BOUND, None).await.unwrap();
         push(&storage, "bounded", BOUND as usize).await;
 
         // Retention: two acks long past retention, two fresh ones.
@@ -225,7 +291,12 @@ mod tests {
             .state_get_batch(COMPAT, &["scenario".to_string()])
             .await
             .unwrap();
-        assert_eq!(scenario["scenario"], SCENARIO, "an unknown scenario");
+        let scenario = scenario["scenario"].as_slice();
+        assert!(
+            scenario == b"1" || scenario == SCENARIO,
+            "an unknown scenario"
+        );
+        let dead_letters = scenario >= b"2".as_slice();
 
         // GC first, before the verifier acks anything: exactly the two
         // expired entries go.
@@ -237,7 +308,7 @@ mod tests {
         assert_eq!(counts(&storage, "retention").await, (4, 4, 0, 0));
 
         let queues: BTreeSet<String> = storage.list_queues().await.unwrap().into_iter().collect();
-        let expected: BTreeSet<String> = [
+        let mut expected: BTreeSet<String> = [
             "acked",
             "bounded",
             "claimed",
@@ -253,7 +324,16 @@ mod tests {
         .into_iter()
         .map(String::from)
         .collect();
+        if dead_letters {
+            expected.extend(["dead".to_string(), "unlimited".to_string()]);
+        }
         assert_eq!(queues, expected);
+        // A store without dead letters loads as one: no queue holds any.
+        for queue in &queues {
+            let dead = storage.get_meta(queue).await.unwrap().dead_count;
+            let expected = if queue == "dead" { 3 } else { 0 };
+            assert_eq!(dead, expected, "{queue}");
+        }
 
         assert_eq!(counts(&storage, "pending").await, (5, 0, 0, 5));
         let claimed = claim(&storage, "pending", 10).await;
@@ -269,7 +349,8 @@ mod tests {
         assert_eq!(counts(&storage, "pending").await, (5, 5, 0, 0));
 
         // The writer's claims, settled with the tokens it handed out: one
-        // acked, the other reclaimed and redelivered.
+        // acked, the other reclaimed and redelivered. The writer's process
+        // made that claim, so its reclaim gives the delivery back.
         assert_eq!(counts(&storage, "claimed").await, (3, 0, 2, 1));
         let held = storage.scan_claimed(Some("claimed")).await.unwrap();
         assert_eq!(held.len(), 2);
@@ -300,13 +381,15 @@ mod tests {
         let redelivered = claim(&storage, "claimed", 10).await;
         let mut deliveries: Vec<u32> = redelivered.iter().map(|c| c.delivery_count).collect();
         deliveries.sort();
-        assert_eq!(deliveries, [1, 2]);
+        assert_eq!(deliveries, [1, 1]);
         ack(&storage, "claimed", &redelivered).await;
         assert_eq!(counts(&storage, "claimed").await, (3, 3, 0, 0));
 
         assert_eq!(counts(&storage, "acked").await, (3, 3, 0, 0));
         assert_eq!(storage.scan_acked(Some("acked")).await.unwrap().len(), 3);
 
+        // The writer set no limit on this queue, so the verifier's default
+        // governs it: a nack at the second delivery dead-letters.
         assert_eq!(counts(&storage, "redelivered").await, (2, 0, 0, 2));
         let redelivered = claim(&storage, "redelivered", 10).await;
         assert!(redelivered.iter().all(|c| c.delivery_count == 2));
@@ -314,11 +397,39 @@ mod tests {
             sorted_payloads(&redelivered),
             [payload("redelivered", 0), payload("redelivered", 1)]
         );
-        ack(&storage, "redelivered", &redelivered).await;
+        let (ids, tokens) = split_claims(&redelivered[..1]);
+        storage
+            .nack_messages(
+                "redelivered",
+                &ids,
+                &tokens,
+                "worker",
+                "lease",
+                NackOptions::default(),
+            )
+            .await
+            .unwrap();
+        ack(&storage, "redelivered", &redelivered[1..]).await;
+        assert_eq!(counts(&storage, "redelivered").await, (2, 1, 0, 0));
+        let letters = storage
+            .list_dead_letters("redelivered", None, 10, false)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(letters.len(), 1);
+        assert_eq!(letters[0].message.msg_id, ids[0]);
+        assert_eq!(letters[0].cause, DeadLetterCause::NackLimit);
 
-        assert_eq!(
-            storage.check_queue_completion("finished").await.unwrap(),
-            (true, true, 0, 0)
+        if dead_letters {
+            verify_dead_letters(&storage).await;
+        }
+
+        assert!(
+            storage
+                .check_queue_completion("finished")
+                .await
+                .unwrap()
+                .drained
         );
 
         let group = storage.get_group_meta(GROUP).await.unwrap().unwrap();
@@ -374,6 +485,90 @@ mod tests {
             .unwrap();
 
         storage.close().await.unwrap();
+    }
+
+    /// Checks the dead letters and the limits scenario 2 wrote, then
+    /// redrives, purges and settles them.
+    async fn verify_dead_letters(storage: &AnvilStorage) {
+        assert_eq!(counts(storage, "dead").await, (3, 0, 0, 0));
+        let (mut letters, _) = storage
+            .list_dead_letters("dead", None, 10, false)
+            .await
+            .unwrap();
+        letters.sort_by(|a, b| a.message.payload.cmp(&b.message.payload));
+        let found: Vec<(Vec<u8>, DeadLetterCause, &str, u32, &str)> = letters
+            .iter()
+            .map(|l| {
+                (
+                    l.message.payload.clone(),
+                    l.cause,
+                    l.reason.as_str(),
+                    l.delivery_count,
+                    l.worker_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (
+                    payload("dead", 0),
+                    DeadLetterCause::Rejected,
+                    "rejected",
+                    1,
+                    "worker"
+                ),
+                (
+                    payload("dead", 1),
+                    DeadLetterCause::NackLimit,
+                    "failed",
+                    1,
+                    "worker"
+                ),
+                (
+                    payload("dead", 2),
+                    DeadLetterCause::ReclaimLimit,
+                    "",
+                    1,
+                    "worker"
+                ),
+            ]
+        );
+        let ids: Vec<String> = letters.iter().map(|l| l.message.msg_id.clone()).collect();
+        let (redriven, _) = storage
+            .redrive_dead_letters("dead", &ids[..1], false)
+            .await
+            .unwrap();
+        assert_eq!(redriven, ids[..1]);
+        let claimed = claim(storage, "dead", 10).await;
+        assert_eq!(sorted_payloads(&claimed), [payload("dead", 0)]);
+        assert_eq!(claimed[0].delivery_count, 1);
+        ack(storage, "dead", &claimed).await;
+        let (purged, _) = storage.purge_dead_letters("dead", &ids[1..]).await.unwrap();
+        assert_eq!(purged, ids[1..]);
+        assert_eq!(counts(storage, "dead").await, (3, 1, 0, 0));
+        let meta = storage.get_meta("dead").await.unwrap();
+        assert_eq!((meta.dead_count, meta.total_purged), (0, 2));
+
+        // Its own limit of 0 outranks the verifier's default of 2.
+        let claimed = claim(storage, "unlimited", 1).await;
+        assert_eq!(claimed[0].delivery_count, 2);
+        let (ids, tokens) = split_claims(&claimed);
+        storage
+            .nack_messages(
+                "unlimited",
+                &ids,
+                &tokens,
+                "worker",
+                "lease",
+                NackOptions::default(),
+            )
+            .await
+            .unwrap();
+        let claimed = claim(storage, "unlimited", 1).await;
+        assert_eq!(claimed[0].delivery_count, 3);
+        ack(storage, "unlimited", &claimed).await;
+        assert_eq!(counts(storage, "unlimited").await, (1, 1, 0, 0));
     }
 
     /// The writer, run by CI from each release: `ANVIL_FORMAT_COMPAT_DIR`
