@@ -18,14 +18,14 @@
 // 1. Runtime recovery: reclaim messages from dead workers (expired claims)
 // 2. Garbage collection: delete acked messages after retention period
 //
-// Note: With the new storage-only model, startup recovery is automatic -
-// storage is the source of truth, no memory state needs rebuilding.
+// Storage is the source of truth, so no memory state is rebuilt at startup;
+// the broker runs one recovery pass itself before it serves (see `server`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, interval_at, Duration, Instant};
 
 use crate::state::AnvilState;
 use crate::storage::{self, AnvilStorage, GC_PASS_KEYS_MAX};
@@ -81,7 +81,10 @@ impl RecoveryTask {
         }
 
         let handle = tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs_f64(interval_secs));
+            // The first pass comes one interval from now: the broker runs
+            // one itself before it serves.
+            let period = Duration::from_secs_f64(interval_secs);
+            let mut ticker = interval_at(Instant::now() + period, period);
 
             loop {
                 tokio::select! {

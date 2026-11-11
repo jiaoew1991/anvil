@@ -14,8 +14,8 @@
 
 // Anvil gRPC Server
 //
-// Storage-only model: No startup recovery needed.
-// Storage is the source of truth - broker can restart anytime.
+// Storage is the source of truth: a broker can restart at any time, and
+// reclaims the claims of the one before it as it starts.
 
 use futures::StreamExt;
 use std::net::SocketAddr;
@@ -102,8 +102,17 @@ impl AnvilBrokerInner {
     /// Start the gRPC server
     pub async fn start(&mut self) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         self.config.validate()?;
-        // No startup recovery needed - storage is the source of truth!
-        // Just start background tasks.
+        // Claims made by an earlier broker process died with its leases.
+        // They are reclaimed before this one serves: until then such a
+        // claim still acks, behind the back of the worker that has taken
+        // its partition over since.
+        self.storage
+            .recover_expired_claims(
+                self.config.lease_timeout_secs,
+                self.config.claim_age_timeout_secs,
+                Some(&self.state.lease_snapshot()),
+            )
+            .await?;
 
         // Start background recovery task (recovers expired claims)
         self.recovery_task.start();
