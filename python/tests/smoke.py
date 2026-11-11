@@ -147,6 +147,13 @@ def main():
         else:
             sys.exit("a second worker claimed an owned partition")
         intruder.stop()
+        # Nor is a partition claimed as a plain queue, around its owner.
+        try:
+            client.claim("fan_p1", timeout_ms=0)
+        except ValueError:
+            pass
+        else:
+            sys.exit("a partition was claimed as a plain queue")
 
         client.stop()
         broker.stop()

@@ -633,6 +633,9 @@ pub struct AnvilStorage {
     /// Where each worker's next group claim starts among its assigned
     /// partitions, per group.
     group_claim_rr: std::sync::Mutex<HashMap<String, u64>>,
+    /// The partition queues of every queue group. A plain claim on one
+    /// would go around the partition's owner, so the service refuses it.
+    partition_queues: DashSet<String>,
     /// The limits of the queue records loaded or written so far.
     limits: Arc<QueueLimits>,
     /// Picked at random when the store is opened and recorded in every claim
@@ -755,6 +758,7 @@ impl AnvilStorage {
             counters: DashMap::new(),
             counters_loading: Arc::new(tokio::sync::Mutex::new(())),
             group_claim_rr: std::sync::Mutex::new(HashMap::new()),
+            partition_queues: DashSet::new(),
             limits: Arc::new(QueueLimits::default()),
             incarnation: uuid::Uuid::now_v7().as_u64_pair().1,
             default_max_deliveries: AtomicU32::new(DEFAULT_MAX_DELIVERIES),
@@ -763,7 +767,11 @@ impl AnvilStorage {
             taken_at: DashMap::new(),
             renewed_at: DashMap::new(),
         };
-        if let Err(e) = storage.open_format().await {
+        let opened = async {
+            storage.open_format().await?;
+            storage.load_partition_queues().await
+        };
+        if let Err(e) = opened.await {
             // A refused store is left as it was found, and closed, so the
             // caller can open it again with a release that reads it.
             if let Err(close) = storage.db.close().await {
@@ -2641,6 +2649,24 @@ impl AnvilStorage {
         }
     }
 
+    /// Records the partition queues of the groups already in the store.
+    async fn load_partition_queues(&self) -> Result<(), StorageError> {
+        let mut iter = self.db.scan(keys::groups()).await?;
+        while let Some(kv) = iter.next().await? {
+            let group = format::decode_group(&keys::parse_group(&kv.key)?, &kv.value)?;
+            for queue in group.partition_queues {
+                self.partition_queues.insert(queue);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `queue` is a partition of a queue group, which only a group
+    /// claim may consume.
+    pub fn is_partition_queue(&self, queue: &str) -> bool {
+        self.partition_queues.contains(queue)
+    }
+
     /// Create a queue group with N partition queues atomically, and report
     /// whether this call created it. Idempotent: returns the existing group
     /// if it already exists, with `false`.
@@ -2684,6 +2710,12 @@ impl AnvilStorage {
         if created || !landing.limits.is_empty() {
             landing.loading = Some(loading);
             self.commit(batch, Wait::Durable, landing).await?;
+        }
+
+        for queue_name in &meta.partition_queues {
+            if !self.partition_queues.contains(queue_name) {
+                self.partition_queues.insert(queue_name.clone());
+            }
         }
 
         if created {

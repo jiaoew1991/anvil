@@ -382,6 +382,12 @@ impl AnvilService {
             // --- Plain queue claim ---
             Some(claim_request::Source::Queue(queue)) => {
                 check_queue_name(&queue, "claim queue")?;
+                if self.storage.is_partition_queue(&queue) {
+                    return Err(Status::invalid_argument(format!(
+                        "queue {queue} is a partition of a queue group: \
+                         claim it with a group claim"
+                    )));
+                }
                 let claimed = self
                     .storage
                     .claim_messages(&queue, batch_size, &req.worker_id, &req.lease_id)
@@ -1353,6 +1359,55 @@ mod tests {
         assert_status(&status, Code::Aborted, "partition_owned");
         state.release_dead_owners(&state.lease_snapshot());
         assert!(claim("b", 0).await.unwrap().upstream_drained);
+    }
+
+    /// Goal: a partition queue is consumed only through its group. Method:
+    /// a plain claim on a group's partition is INVALID_ARGUMENT, on the
+    /// broker that created the group and on one that reopened its store;
+    /// a group claim then gets the message, which no plain claim took.
+    #[tokio::test]
+    async fn test_plain_claim_of_a_partition_is_refused() {
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let serve = || async {
+            let storage = AnvilStorage::open("db".to_string(), object_store.clone())
+                .await
+                .unwrap();
+            let storage = Arc::new(storage);
+            let service = AnvilService::new(
+                Arc::new(AnvilState::new()),
+                storage.clone(),
+                AnvilConfig::default().lease_timeout_secs,
+            );
+            (service, storage)
+        };
+        async fn plain_claim(service: &AnvilService) -> Result<Response<ClaimResponse>, Status> {
+            let request = ClaimRequest {
+                source: Some(claim_request::Source::Queue("g_p0".to_string())),
+                worker_id: "w".to_string(),
+                lease_id: "l".to_string(),
+                batch_size: 1,
+                timeout_ms: 0,
+            };
+            service.claim(Request::new(request)).await
+        }
+
+        let (service, storage) = serve().await;
+        storage.create_queue_group("g", 1, 0, None).await.unwrap();
+        storage
+            .push_messages("g_p0", &[Message::new(b"x".to_vec())])
+            .await
+            .unwrap();
+        let status = plain_claim(&service).await.unwrap_err();
+        assert_status(&status, Code::InvalidArgument, "partition of a queue group");
+        storage.close().await.unwrap();
+
+        let (service, _storage) = serve().await;
+        let status = plain_claim(&service).await.unwrap_err();
+        assert_status(&status, Code::InvalidArgument, "partition of a queue group");
+        service.state.update_lease("a");
+        let claimed = group_claim(&service, "a", 0).await.unwrap();
+        assert_eq!(claimed.messages.len(), 1);
     }
 
     /// Goal: the partition of a worker that died or got stuck passes to
