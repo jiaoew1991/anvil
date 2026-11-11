@@ -21,7 +21,7 @@
 // exactly as `tokio::time::timeout` does here.
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -52,11 +52,11 @@ mod tests {
     /// it waits for each kind of fault to be drawn.
     const FLAKY_ROUNDS_MAX: usize = 8;
 
-    fn memory() -> Arc<dyn ObjectStore> {
+    pub(crate) fn memory() -> Arc<dyn ObjectStore> {
         Arc::new(InMemory::new())
     }
 
-    async fn open(store: &FaultStore) -> AnvilStorage {
+    pub(crate) async fn open(store: &FaultStore) -> AnvilStorage {
         tokio::time::timeout(
             WAIT_DEADLINE,
             AnvilStorage::open("anvil".to_string(), Arc::new(store.clone())),
@@ -68,7 +68,7 @@ mod tests {
 
     /// Faults of a store behind a congested network: requests fail, time
     /// out and lose the response to a put that landed.
-    fn flaky() -> Faults {
+    pub(crate) fn flaky() -> Faults {
         let op = OpFaults {
             latency: Duration::from_millis(2),
             fail_rate: 0.15,
@@ -84,7 +84,7 @@ mod tests {
     }
 
     /// Every request fails, as when the store answers only 503s.
-    fn down() -> Faults {
+    pub(crate) fn down() -> Faults {
         let op = OpFaults {
             fail_rate: 1.0,
             ..OpFaults::default()

@@ -437,6 +437,12 @@ mod tests {
 
         let group = storage.get_group_meta(GROUP).await.unwrap().unwrap();
         assert_eq!(group.partition_queues, ["grp_p0", "grp_p1", "grp_p2"]);
+        // A group written by a release that let its partitions be claimed
+        // as plain queues is recognized at open, and they no longer are.
+        for queue in &group.partition_queues {
+            assert!(storage.is_partition_queue(queue), "{queue}");
+        }
+        assert!(!storage.is_partition_queue("scatter-src"));
         assert_eq!(counts(&storage, "scatter-src").await, (1, 1, 0, 0));
         let mut scattered = Vec::new();
         let partitions = storage.group_partitions(GROUP, &[0, 1, 2]).await.unwrap();
