@@ -4543,7 +4543,10 @@ pub(crate) mod tests {
 
     /// (pending, claimed, acked, dead, purged) of `queue`, which with
     /// `pushed` account for every message.
-    async fn dead_counts(storage: &AnvilStorage, queue: &str) -> (u64, u64, u64, u64, u64) {
+    pub(crate) async fn dead_counts(
+        storage: &AnvilStorage,
+        queue: &str,
+    ) -> (u64, u64, u64, u64, u64) {
         let meta = storage.get_meta(queue).await.unwrap();
         let counts = (
             meta.push_seq - meta.claim_seq,

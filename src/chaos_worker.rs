@@ -45,7 +45,7 @@ mod tests {
     use crate::service::proto::anvil_client::AnvilClient;
     use crate::service::proto::*;
     use crate::state::AnvilState;
-    use crate::storage::tests::split_claims;
+    use crate::storage::tests::{dead_counts, split_claims};
     use crate::storage::{AnvilStorage, NackOptions, Rejection, StorageError};
     use crate::types::{advance_sim_time_secs, set_sim_time_nanos, AnvilConfig, Message};
     use crate::types::{ClaimedMessage, SimClock};
@@ -1455,5 +1455,76 @@ mod tests {
             assert_eq!((up.total_acked, up.claimed_count), (1, 0), "polls {polls}");
             assert_eq!(down.total_pushed, 1, "polls {polls}");
         }
+    }
+
+    /// Goal: a redrive or purge abandoned mid-call by its caller takes
+    /// effect at most once and gives back the queue's dead letter lock:
+    /// either it landed, and its retry reports its msg_ids missing, or it
+    /// did not, and the retry does the work; the counters agree either way.
+    /// Method: for each number of polls before the drop, dead-letter two
+    /// messages, poll a redrive of them that many times and drop it, then
+    /// retry it; the same for a purge.
+    #[tokio::test]
+    async fn test_abandoned_redrive_and_purge_settle_once() {
+        const LETTERS: usize = 2;
+        let storage = AnvilStorage::new("memory://").await.unwrap();
+        let mut landed_before_drop = 0;
+        for (polls, purge) in (1..=3).flat_map(|polls| [(polls, false), (polls, true)]) {
+            let case = format!("polls {polls}, purge {purge}");
+            let queue = format!("abandoned-{polls}-{purge}");
+            push_batch(&storage, &queue, LETTERS).await;
+            let claimed = storage
+                .claim_messages(&queue, LETTERS, "worker", "lease")
+                .await
+                .unwrap();
+            let (ids, tokens) = split_claims(&claimed);
+            let reject = NackOptions {
+                dead_letter: true,
+                reason: "",
+            };
+            storage
+                .nack_messages(&queue, &ids, &tokens, "worker", "lease", reject)
+                .await
+                .unwrap();
+
+            let attempt = || {
+                let (storage, queue, ids) = (&storage, &queue, &ids);
+                async move {
+                    if purge {
+                        storage.purge_dead_letters(queue, ids).await
+                    } else {
+                        storage.redrive_dead_letters(queue, ids, false).await
+                    }
+                }
+            };
+            if let Some(result) = poll_then_drop(attempt(), polls).await {
+                assert_eq!(result.unwrap(), (ids.clone(), Vec::new()), "{case}");
+            }
+            // The retry waits for the lock, which a write the dropped call
+            // submitted holds until it has landed.
+            let (done, missing) = tokio::time::timeout(WAIT_DEADLINE, attempt())
+                .await
+                .unwrap_or_else(|_| panic!("{case}: the abandoned call kept the lock"))
+                .unwrap();
+            if done.is_empty() {
+                assert_eq!(missing, ids, "{case}");
+                landed_before_drop += 1;
+            } else {
+                assert_eq!((done, missing), (ids.clone(), Vec::new()), "{case}");
+            }
+
+            let letters = LETTERS as u64;
+            let expected = if purge {
+                (0, 0, 0, 0, letters)
+            } else {
+                (letters, 0, 0, 0, 0)
+            };
+            assert_eq!(dead_counts(&storage, &queue).await, expected, "{case}");
+            check_invariants(&storage, std::slice::from_ref(&queue)).await;
+        }
+        assert!(
+            landed_before_drop > 0,
+            "no call was dropped after its write"
+        );
     }
 }

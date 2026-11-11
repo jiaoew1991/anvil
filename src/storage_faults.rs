@@ -27,6 +27,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use slatedb::object_store::memory::InMemory;
     use slatedb::object_store::ObjectStore;
     use tonic::{Code, Request};
@@ -38,8 +40,8 @@ mod tests {
     use crate::service::proto::*;
     use crate::service::AnvilService;
     use crate::state::AnvilState;
-    use crate::storage::tests::split_claims;
-    use crate::storage::AnvilStorage;
+    use crate::storage::tests::{dead_counts, split_claims};
+    use crate::storage::{AnvilStorage, NackOptions, Rejection};
     use crate::types::{AnvilConfig, Message, SimClock};
 
     /// Bounds every wait, so a wedged broker fails the test instead of
@@ -121,6 +123,28 @@ mod tests {
         }
     }
 
+    /// Pushes `count` messages to `queue` and dead-letters them all, as a
+    /// worker that knows no retry can succeed does. Returns their msg_ids.
+    async fn dead_letter(storage: &AnvilStorage, queue: &str, count: usize) -> Vec<String> {
+        let messages: Vec<Message> = (0..count).map(|i| Message::new(vec![i as u8])).collect();
+        storage.push_messages(queue, &messages).await.unwrap();
+        let claimed = storage
+            .claim_messages(queue, count, "w", "l")
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), count);
+        let (ids, tokens) = split_claims(&claimed);
+        let reject = NackOptions {
+            dead_letter: true,
+            reason: "rejected",
+        };
+        storage
+            .nack_messages(queue, &ids, &tokens, "w", "l", reject)
+            .await
+            .unwrap();
+        ids
+    }
+
     /// Goal: whatever the DST workload saw succeed over a flaky store
     /// survives a crash, and a broker can load it back over the same flaky
     /// store. Method: run the workload with transient failures, timeouts and
@@ -165,6 +189,283 @@ mod tests {
                 )
                 .await
                 .expect("recovery check wedged on the flaky store");
+            });
+        }
+    }
+
+    /// Asserts that the counters of `queue` account for every message
+    /// pushed to it, and returns them as `dead_counts` does, which checks
+    /// the dead count against the dead letter keys.
+    async fn accounted(
+        storage: &AnvilStorage,
+        queue: &str,
+        pushed: usize,
+        when: &str,
+    ) -> (u64, u64, u64, u64, u64) {
+        let counts = dead_counts(storage, queue).await;
+        let (pending, claimed, acked, dead, purged) = counts;
+        let total_pushed = storage.get_queue_stats(queue).await.unwrap().total_pushed;
+        assert_eq!(total_pushed, pushed as u64, "{when}");
+        assert_eq!(
+            total_pushed,
+            pending + claimed + acked + dead + purged,
+            "{when}: pushed = pending + claimed + acked + dead + purged, got {counts:?}"
+        );
+        counts
+    }
+
+    /// Goal: over a flaky store, a queue that dead-letters, redrives and
+    /// purges accounts for every message pushed to it: pushed = pending +
+    /// claimed + acked + dead + purged, by the counters and by the keys,
+    /// when the workload stops and again after a crash and a reload.
+    /// Method: with a delivery limit of 2 and transient failures, timeouts
+    /// and lost put responses on every request, nack four messages to their
+    /// limit, then run a producer, workers that ack, nack, reject or abandon
+    /// what they claim, a reclaimer that takes claims from under them, and
+    /// an operator that purges and redrives the dead letters it lists; leave
+    /// a message in every state, kill the runtime, and reopen with the
+    /// faults still on.
+    #[test]
+    fn test_flaky_store_accounts_for_dead_letters() {
+        const QUEUE: &str = "q";
+        const MAX_DELIVERIES: u32 = 2;
+        const WORKERS: u64 = 3;
+        const BATCHES: usize = 8;
+        const BATCH: usize = 4;
+        /// Claims each worker still makes once the producer is done.
+        const CLAIMS_AFTER_PRODUCER: usize = 6;
+        /// Bounds the whole workload, every operation of which may back off
+        /// on the flaky store.
+        const WORKLOAD_DEADLINE: Duration = Duration::from_secs(120);
+
+        for seed in [21u64, 22] {
+            let inner = memory();
+            let store = FaultStore::new(inner.clone(), seed);
+            store.set_faults(flaky());
+
+            let crashed = tokio::runtime::Runtime::new().unwrap();
+            let workload = crashed.block_on(async {
+                let storage = Arc::new(open(&store).await);
+                storage
+                    .create_queue(QUEUE, 0, Some(MAX_DELIVERIES))
+                    .await
+                    .unwrap();
+                let nack = |dead_letter| NackOptions {
+                    dead_letter,
+                    reason: "flaky",
+                };
+
+                let at_limit: Vec<Message> = (0..4).map(|i| Message::new(vec![i as u8])).collect();
+                storage.push_messages(QUEUE, &at_limit).await.unwrap();
+                let mut pushed: Vec<String> = at_limit.into_iter().map(|m| m.msg_id).collect();
+                for delivery in 1..=MAX_DELIVERIES {
+                    let claimed = storage.claim_messages(QUEUE, 4, "w", "l").await.unwrap();
+                    assert!(claimed.iter().all(|c| c.delivery_count == delivery));
+                    let (ids, tokens) = split_claims(&claimed);
+                    storage
+                        .nack_messages(QUEUE, &ids, &tokens, "w", "l", nack(false))
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(accounted(&storage, QUEUE, 4, "at the limit").await.3, 4);
+
+                let producer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let workers_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let producer = {
+                    let (storage, done) = (storage.clone(), producer_done.clone());
+                    tokio::spawn(async move {
+                        let mut pushed = Vec::new();
+                        for _ in 0..BATCHES {
+                            let messages: Vec<Message> =
+                                (0..BATCH).map(|_| Message::new(b"work".to_vec())).collect();
+                            storage.push_messages(QUEUE, &messages).await.unwrap();
+                            pushed.extend(messages.into_iter().map(|m| m.msg_id));
+                        }
+                        done.store(true, Ordering::Release);
+                        pushed
+                    })
+                };
+                let workers: Vec<_> = (0..WORKERS)
+                    .map(|w| {
+                        let (storage, producer_done) = (storage.clone(), producer_done.clone());
+                        tokio::spawn(async move {
+                            let mut rng = StdRng::seed_from_u64(seed * 100 + w);
+                            let (worker, lease) = (format!("w{w}"), format!("l{w}"));
+                            let mut acked = Vec::new();
+                            let mut claims_left = CLAIMS_AFTER_PRODUCER;
+                            while claims_left > 0 {
+                                if producer_done.load(Ordering::Acquire) {
+                                    claims_left -= 1;
+                                }
+                                let claimed = storage
+                                    .claim_messages(QUEUE, 3, &worker, &lease)
+                                    .await
+                                    .unwrap();
+                                if claimed.is_empty() {
+                                    tokio::time::sleep(POLL_INTERVAL).await;
+                                }
+                                for message in claimed {
+                                    let ids = [message.message.msg_id];
+                                    let tokens = [message.claim_token];
+                                    let settled = match rng.random_range(0..10) {
+                                        0..3 => storage
+                                            .ack_messages(QUEUE, &ids, &tokens, &worker, &lease)
+                                            .await
+                                            .map(|()| acked.extend(ids)),
+                                        // Abandoned: the reclaimer takes it.
+                                        3 => continue,
+                                        roll => {
+                                            storage
+                                                .nack_messages(
+                                                    QUEUE,
+                                                    &ids,
+                                                    &tokens,
+                                                    &worker,
+                                                    &lease,
+                                                    nack(roll == 4),
+                                                )
+                                                .await
+                                        }
+                                    };
+                                    // The reclaimer took the claim first.
+                                    if let Err(error) = settled {
+                                        let fenced = error.downcast_ref::<Rejection>();
+                                        assert!(
+                                            matches!(fenced, Some(Rejection::Fenced(_))),
+                                            "{error}"
+                                        );
+                                    }
+                                }
+                            }
+                            acked
+                        })
+                    })
+                    .collect();
+                let reclaimer = {
+                    let (storage, done) = (storage.clone(), workers_done.clone());
+                    tokio::spawn(async move {
+                        let no_live_leases = HashMap::new();
+                        while !done.load(Ordering::Acquire) {
+                            tokio::time::sleep(POLL_INTERVAL * 5).await;
+                            storage
+                                .recover_expired_claims(0.0, 0.0, Some(&no_live_leases))
+                                .await
+                                .unwrap();
+                        }
+                    })
+                };
+                let operator = {
+                    let (storage, done) = (storage.clone(), workers_done.clone());
+                    tokio::spawn(async move {
+                        let mut purged = Vec::new();
+                        let mut redriven = 0;
+                        loop {
+                            let last_pass = done.load(Ordering::Acquire);
+                            let (letters, _) = storage
+                                .list_dead_letters(QUEUE, None, 4, true)
+                                .await
+                                .unwrap();
+                            let ids: Vec<String> =
+                                letters.into_iter().map(|l| l.message.msg_id).collect();
+                            // No one else takes a dead letter out, so none
+                            // listed is missing.
+                            let (to_purge, to_redrive) = ids.split_at(ids.len() / 2);
+                            if !to_purge.is_empty() {
+                                let result =
+                                    storage.purge_dead_letters(QUEUE, to_purge).await.unwrap();
+                                assert_eq!(result, (to_purge.to_vec(), Vec::new()));
+                                purged.extend_from_slice(to_purge);
+                            }
+                            if !to_redrive.is_empty() {
+                                let result = storage
+                                    .redrive_dead_letters(QUEUE, to_redrive, false)
+                                    .await
+                                    .unwrap();
+                                assert_eq!(result, (to_redrive.to_vec(), Vec::new()));
+                                redriven += to_redrive.len();
+                            }
+                            if last_pass {
+                                return (purged, redriven);
+                            }
+                            tokio::time::sleep(POLL_INTERVAL).await;
+                        }
+                    })
+                };
+
+                let (acked, purged, redriven) = tokio::time::timeout(WORKLOAD_DEADLINE, async {
+                    pushed.extend(producer.await.unwrap());
+                    let mut acked = Vec::new();
+                    for worker in workers {
+                        acked.extend(worker.await.unwrap());
+                    }
+                    workers_done.store(true, Ordering::Release);
+                    reclaimer.await.unwrap();
+                    let (purged, redriven) = operator.await.unwrap();
+                    (acked, purged, redriven)
+                })
+                .await
+                .expect("the workload wedged on the flaky store");
+                assert!(purged.len() >= 2, "the letters at the limit were purged");
+                assert!(redriven >= 2, "the letters at the limit were redriven");
+
+                // A message in every state, whatever the workload left.
+                pushed.extend(dead_letter(&storage, QUEUE, 2).await);
+                let rest: Vec<Message> = (0..3).map(|i| Message::new(vec![i as u8])).collect();
+                storage.push_messages(QUEUE, &rest).await.unwrap();
+                pushed.extend(rest.into_iter().map(|m| m.msg_id));
+                let claimed = storage.claim_messages(QUEUE, 2, "w", "l").await.unwrap();
+                let (ids, tokens) = split_claims(&claimed);
+                storage
+                    .ack_messages(QUEUE, &ids[..1], &tokens[..1], "w", "l")
+                    .await
+                    .unwrap();
+                let mut acked: HashSet<String> = acked.into_iter().collect();
+                acked.insert(ids[0].clone());
+
+                let counts = accounted(&storage, QUEUE, pushed.len(), "after the workload").await;
+                let (pending, claimed, _, dead, _) = counts;
+                assert!(pending > 0 && claimed > 0 && dead > 0, "{counts:?}");
+                assert_eq!(counts.2, acked.len() as u64, "every ack counted once");
+                assert_eq!(counts.4, purged.len() as u64, "every purge counted once");
+                check_invariants(&storage, &[QUEUE.to_string()]).await;
+                (storage, pushed, acked, purged, counts)
+            });
+            let (storage, pushed, acked, purged, counts) = workload;
+            crash(crashed, storage);
+            let faults = store.counts();
+            assert!(faults.failed.load(Ordering::Relaxed) > 0);
+            assert!(faults.landed_then_failed.load(Ordering::Relaxed) > 0);
+
+            let reopened = FaultStore::new(inner, seed + 1000);
+            reopened.set_faults(flaky());
+            let recovered = tokio::runtime::Runtime::new().unwrap();
+            recovered.block_on(async {
+                let storage = open(&reopened).await;
+                let reloaded = tokio::time::timeout(
+                    WAIT_DEADLINE,
+                    accounted(&storage, QUEUE, pushed.len(), "after the reload"),
+                )
+                .await
+                .expect("the reload wedged on the flaky store");
+                assert_eq!(reloaded, counts, "the reload changed the counters");
+
+                // A purged message is gone for good, so it is not expected
+                // back, and the totals leave no room for one that came back.
+                let on_queue = |ids: &mut dyn Iterator<Item = &String>| {
+                    ids.map(|id| (QUEUE.to_string(), id.clone()))
+                        .collect::<HashSet<_>>()
+                };
+                let purged: HashSet<&String> = purged.iter().collect();
+                let kept = on_queue(&mut pushed.iter().filter(|id| !purged.contains(id)));
+                let acked = on_queue(&mut acked.iter());
+                tokio::time::timeout(
+                    WAIT_DEADLINE,
+                    check_recovered(&storage, &[QUEUE.to_string()], &kept, &acked),
+                )
+                .await
+                .expect("recovery check wedged on the flaky store");
+                let (pending, ..) = accounted(&storage, QUEUE, pushed.len(), "drained").await;
+                assert_eq!(pending, 0);
             });
         }
     }
@@ -304,6 +605,203 @@ mod tests {
         assert_eq!(drain(&storage, queue).await, vec![message.msg_id]);
         let meta = storage.get_queue_stats(queue).await.unwrap();
         assert_eq!((meta.total_pushed, meta.total_acked), (1, 1));
+    }
+
+    /// Goal: a redrive cut off by its deadline after its batch was submitted
+    /// lands exactly once: its retry finds no dead letter under those ids,
+    /// the counters match the keys, and the queue's dead letter lock is
+    /// free for the next redrive and purge. Method: slow every put, cancel a
+    /// redrive while it waits for durability, retry it with the puts still
+    /// slow, redrive and purge other letters, then crash and reopen.
+    #[test]
+    fn test_redrive_cut_off_by_deadline_lands_once() {
+        let inner = memory();
+        let store = FaultStore::new(inner.clone(), 9);
+        let queue = "q";
+
+        let crashed = tokio::runtime::Runtime::new().unwrap();
+        let (storage, redriven_ids) = crashed.block_on(async {
+            let storage = open(&store).await;
+            let dead = dead_letter(&storage, queue, 4).await;
+            assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 4, 0));
+
+            store.set_faults(slow_puts(Duration::from_millis(400)));
+            let cut_off = tokio::time::timeout(
+                Duration::from_millis(100),
+                storage.redrive_dead_letters(queue, &dead[..2], false),
+            )
+            .await;
+            assert!(cut_off.is_err(), "the redrive beat its deadline");
+            assert_eq!(dead_counts(&storage, queue).await, (2, 0, 0, 2, 0));
+
+            let retry = tokio::time::timeout(
+                WAIT_DEADLINE,
+                storage.redrive_dead_letters(queue, &dead[..2], false),
+            )
+            .await
+            .expect("the cancelled redrive kept the dead letter lock")
+            .unwrap();
+            assert_eq!(retry, (Vec::new(), dead[..2].to_vec()));
+            assert_eq!(dead_counts(&storage, queue).await, (2, 0, 0, 2, 0));
+            store.set_faults(Faults::default());
+
+            let later = tokio::time::timeout(WAIT_DEADLINE, async {
+                let redriven = storage
+                    .redrive_dead_letters(queue, &dead[2..3], false)
+                    .await
+                    .unwrap();
+                let purged = storage.purge_dead_letters(queue, &dead[3..]).await.unwrap();
+                (redriven, purged)
+            })
+            .await
+            .expect("the cancelled redrive kept the dead letter lock");
+            assert_eq!(later.0, (dead[2..3].to_vec(), Vec::new()));
+            assert_eq!(later.1, (dead[3..].to_vec(), Vec::new()));
+            assert_eq!(dead_counts(&storage, queue).await, (3, 0, 0, 0, 1));
+            check_invariants(&storage, &[queue.to_string()]).await;
+            (storage, dead[..3].to_vec())
+        });
+        crash(crashed, storage);
+
+        let recovered = tokio::runtime::Runtime::new().unwrap();
+        recovered.block_on(async {
+            let storage = open(&FaultStore::new(inner, 10)).await;
+            assert_eq!(dead_counts(&storage, queue).await, (3, 0, 0, 0, 1));
+            let claimed = storage.claim_messages(queue, 64, "w", "l").await.unwrap();
+            let delivered: Vec<(String, u32)> = claimed
+                .iter()
+                .map(|c| (c.message.msg_id.clone(), c.delivery_count))
+                .collect();
+            let expected: Vec<(String, u32)> = redriven_ids.into_iter().map(|id| (id, 1)).collect();
+            assert_eq!(delivered, expected, "each redriven message once, anew");
+            assert_eq!(dead_counts(&storage, queue).await, (0, 3, 0, 0, 1));
+        });
+    }
+
+    /// Goal: a redrive or purge cancelled before it submits its batch does
+    /// nothing and gives back the queue's dead letter lock. Method: restart
+    /// the broker so the dead letters live only in the store, make every
+    /// read slow, cancel a redrive and a purge while they read their
+    /// letters, then lift the latency and run both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_redrive_and_purge_cancelled_mid_read_do_nothing() {
+        let store = FaultStore::new(memory(), 13);
+        let queue = "q";
+        let storage = open(&store).await;
+        // Letters span several blocks, so reading one is not served by the
+        // blocks an earlier read cached.
+        let messages: Vec<Message> = (0..4).map(|_| Message::new(vec![7u8; 8 * 1024])).collect();
+        storage.push_messages(queue, &messages).await.unwrap();
+        let claimed = storage.claim_messages(queue, 4, "w", "l").await.unwrap();
+        let (dead, tokens) = split_claims(&claimed);
+        let reject = NackOptions {
+            dead_letter: true,
+            reason: "rejected",
+        };
+        storage
+            .nack_messages(queue, &dead, &tokens, "w", "l", reject)
+            .await
+            .unwrap();
+        storage.close().await.unwrap();
+
+        let storage = open(&store).await;
+        storage.get_queue_stats(queue).await.unwrap();
+        store.set_faults(Faults {
+            get: OpFaults {
+                latency: Duration::from_millis(500),
+                ..OpFaults::default()
+            },
+            ..Faults::default()
+        });
+        let deadline = Duration::from_millis(150);
+        let redrive = storage.redrive_dead_letters(queue, &dead[..2], false);
+        let cancelled = tokio::time::timeout(deadline, redrive).await;
+        assert!(cancelled.is_err(), "the redrive beat its deadline");
+        let purge = storage.purge_dead_letters(queue, &dead[2..]);
+        let cancelled = tokio::time::timeout(deadline, purge).await;
+        assert!(cancelled.is_err(), "the purge beat its deadline");
+        store.set_faults(Faults::default());
+
+        assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 4, 0));
+        let (redriven, purged) = tokio::time::timeout(WAIT_DEADLINE, async {
+            let redriven = storage
+                .redrive_dead_letters(queue, &dead[..2], false)
+                .await
+                .unwrap();
+            let purged = storage.purge_dead_letters(queue, &dead[2..]).await.unwrap();
+            (redriven, purged)
+        })
+        .await
+        .expect("a cancelled redrive or purge kept the dead letter lock");
+        assert_eq!(redriven, (dead[..2].to_vec(), Vec::new()));
+        assert_eq!(purged, (dead[2..].to_vec(), Vec::new()));
+        assert_eq!(dead_counts(&storage, queue).await, (2, 0, 0, 0, 2));
+        check_invariants(&storage, &[queue.to_string()]).await;
+    }
+
+    /// Goal: a purge cut off by its deadline after its batch was submitted
+    /// lands exactly once: its retry finds no dead letter under those ids,
+    /// `total_purged` counts them once, and the queue's dead letter lock is
+    /// free for the next purge and redrive. Method: slow every put, cancel a
+    /// purge while it waits for durability, retry it with the puts still
+    /// slow, purge and redrive other letters, then crash and reopen.
+    #[test]
+    fn test_purge_cut_off_by_deadline_lands_once() {
+        let inner = memory();
+        let store = FaultStore::new(inner.clone(), 11);
+        let queue = "q";
+
+        let crashed = tokio::runtime::Runtime::new().unwrap();
+        let (storage, redriven_id) = crashed.block_on(async {
+            let storage = open(&store).await;
+            let dead = dead_letter(&storage, queue, 4).await;
+
+            store.set_faults(slow_puts(Duration::from_millis(400)));
+            let cut_off = tokio::time::timeout(
+                Duration::from_millis(100),
+                storage.purge_dead_letters(queue, &dead[..2]),
+            )
+            .await;
+            assert!(cut_off.is_err(), "the purge beat its deadline");
+            assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 2, 2));
+
+            let retry =
+                tokio::time::timeout(WAIT_DEADLINE, storage.purge_dead_letters(queue, &dead[..2]))
+                    .await
+                    .expect("the cancelled purge kept the dead letter lock")
+                    .unwrap();
+            assert_eq!(retry, (Vec::new(), dead[..2].to_vec()));
+            assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 2, 2));
+            store.set_faults(Faults::default());
+
+            let later = tokio::time::timeout(WAIT_DEADLINE, async {
+                let purged = storage
+                    .purge_dead_letters(queue, &dead[2..3])
+                    .await
+                    .unwrap();
+                let redriven = storage
+                    .redrive_dead_letters(queue, &dead[3..], false)
+                    .await
+                    .unwrap();
+                (purged, redriven)
+            })
+            .await
+            .expect("the cancelled purge kept the dead letter lock");
+            assert_eq!(later.0, (dead[2..3].to_vec(), Vec::new()));
+            assert_eq!(later.1, (dead[3..].to_vec(), Vec::new()));
+            assert_eq!(dead_counts(&storage, queue).await, (1, 0, 0, 0, 3));
+            check_invariants(&storage, &[queue.to_string()]).await;
+            (storage, dead[3].clone())
+        });
+        crash(crashed, storage);
+
+        let recovered = tokio::runtime::Runtime::new().unwrap();
+        recovered.block_on(async {
+            let storage = open(&FaultStore::new(inner, 12)).await;
+            assert_eq!(dead_counts(&storage, queue).await, (1, 0, 0, 0, 3));
+            assert_eq!(drain(&storage, queue).await, vec![redriven_id]);
+            assert_eq!(dead_counts(&storage, queue).await, (0, 0, 1, 0, 3));
+        });
     }
 
     /// Goal: heartbeats keep leases alive while every write is slow, so no
