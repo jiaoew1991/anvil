@@ -173,11 +173,11 @@ Ownership lives in the broker's memory and follows the lease:
   claims, at most `lease_timeout_secs` plus `recovery_interval_secs` after
   the worker's last heartbeat. Until then a replacement worker is refused,
   since an ack of the dead lease could still land.
-- It also ends when a claim on the partition ages out under a live lease
-  (`claim_age_timeout_secs`) and is reclaimed: the worker is stuck, and its
-  message can only be redelivered to the partition's owner. The worker
-  loses every partition it owns, to whoever claims them next; if no one
-  has, it may claim them again.
+- A worker that lets a claim on a partition it owns age out under a live
+  lease (`claim_age_timeout_secs`) is stuck, and its message can only be
+  redelivered to the partition's owner. The broker ends its lease: the
+  next recovery pass reclaims every claim it holds, on any queue, and
+  frees its partitions, and its heartbeat is given a new lease.
 - A broker restart ends every lease, and every ownership with it.
 - A worker whose lease died gets a new lease when it reconnects, and is
   then a new consumer like any other: it may be refused its old partition

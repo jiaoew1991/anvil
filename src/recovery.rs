@@ -97,6 +97,9 @@ impl RecoveryTask {
                         }
 
                         state.prune_leases(lease_timeout_secs);
+                        // Waits out the group claims that passed their
+                        // ownership check on a lease just pruned.
+                        drop(state.group_claims.write().await);
                         let lease_snapshot = state.lease_snapshot();
                         match storage
                             .recover_expired_claims(
@@ -106,7 +109,10 @@ impl RecoveryTask {
                             )
                             .await
                         {
-                            Ok(reclaimed) => state.release_owners(&lease_snapshot, &reclaimed),
+                            Ok(reclaimed) => {
+                                state.release_dead_owners(&lease_snapshot);
+                                state.end_stuck_leases(&reclaimed);
+                            }
                             Err(e) => {
                                 tracing::error!("Recovery error: {}", e);
                                 // A closed database never reopens: every
