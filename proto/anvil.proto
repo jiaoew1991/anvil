@@ -103,9 +103,11 @@ message ClaimRequest {
 
 message GroupClaimSource {
   string group_name = 1;
+  // The partitions this worker consumes: at least one, each within the
+  // group. The broker claims from no other partition.
   repeated int32 assigned_partitions = 2;
-  bool allow_steal = 3;
-  int64 steal_pending_threshold = 4;
+  reserved 3, 4;
+  reserved "allow_steal", "steal_pending_threshold";
 }
 
 // Slim message — no queue (caller knows), no created_at (unused by workers)

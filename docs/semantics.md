@@ -70,7 +70,7 @@ Key differences:
 - **No partitions**: Workers compete for any message
 - **Claim-based**: Messages are "leased" to workers with timeout
 - **Automatic recovery**: Timed-out claims return to pending queue
-- **Work-stealing**: Natural load balancing
+- **Competing consumers**: Natural load balancing
 
 ---
 
@@ -127,7 +127,7 @@ A failed RPC's status code tells the caller what to do next:
 |------|---------|-------------------|
 | `FAILED_PRECONDITION` | The caller no longer holds a claim it acks, nacks, forwards, scatters or renews: its token, lease or worker does not match, the message is no longer claimed, or another settlement holds it. Or a redrive into a queue marked finished | Drop the message; another worker owns it or it is done. A redrive: the queue's consumers may have exited |
 | `NOT_FOUND` | The queue or queue group does not exist | Create it first |
-| `INVALID_ARGUMENT` | The request is malformed: claim tokens that do not pair up with message ids, a message id listed twice in one ack, nack, renewal, redrive or purge, an empty queue name (push, claim, create, forward target, dead letter calls), a state update with an empty namespace, a negative `steal_pending_threshold`, a redrive or purge of no or more than 1000 dead letters, a list limit outside 1 to 1000 | Fix the request |
+| `INVALID_ARGUMENT` | The request is malformed: claim tokens that do not pair up with message ids, a message id listed twice in one ack, nack, renewal, redrive or purge, an empty queue name (push, claim, create, forward target, dead letter calls), a state update with an empty namespace, a group claim that names no partition or one outside the group, a redrive or purge of no or more than 1000 dead letters, a list limit outside 1 to 1000 | Fix the request |
 | `RESOURCE_EXHAUSTED` | A bounded queue is full (message starts with `QueueFull`) | Back off and retry |
 | `UNAVAILABLE` | The broker's database is closed for good: a newer broker opened it and fenced this one, or a storage background task failed | Fail over to the current broker; do not retry this one |
 | `INTERNAL` | The broker's storage failed | Retry |
@@ -144,6 +144,26 @@ Reading a queue never creates it: `GetStats` for an unknown queue returns
 `NOT_FOUND`, and so do `ListDeadLetters`, `RedriveDeadLetters` and
 `PurgeDeadLetters`. A queue is created by `CreateQueue`, `CreateQueueGroup`,
 or on first use by a push, claim, forward or scatter.
+
+### 2.5 Queues and Queue Groups
+
+Anvil has two shapes of queue, chosen by what the consumer needs:
+
+| | Queue (the default) | Queue group |
+|---|---|---|
+| For | Work any worker may take | Work keyed so that one consumer must see every message of a key: a group-by, a join, one output per partition |
+| Structure | One queue | `n` partition queues, `{group}_p{i}`, each an ordinary queue |
+| Producer | `push`, `ack_and_forward` | `ack_and_scatter`, which names the partition of each payload |
+| Consumer | `claim`: workers compete for any message | `claim_from_group`: a worker names its partitions and gets messages from no other |
+| Load balance | Automatic: no worker idles while work is pending | The caller's, through the assignment of partitions |
+| Drain signal | The queue is finished and empty | Every partition is finished and empty |
+
+A consumer that needs no key affinity should use a queue, not a group: a
+group adds skew between partitions and nothing in return. The broker never
+gives a partition's messages to a worker that did not name it, since a
+consumer keeping state per key would then see part of a key. It does not
+check that a partition is named by one worker only: that assignment is the
+caller's.
 
 ---
 
@@ -641,7 +661,7 @@ requeues the message as before.
 
 **Rationale:**
 1. **No global ordering**: Anvil doesn't guarantee message order
-2. **Work-stealing**: Any worker can process any message
+2. **Competing consumers**: Any worker can process any message
 3. **Simpler model**: No need to track "last processed offset" per partition
 
 **Trade-off:**

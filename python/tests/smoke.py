@@ -3,7 +3,7 @@
 Exercises the Python bindings end to end: start a broker on a temporary
 file:// store, push, claim, check the delivery count, renew, ack, see a
 second ack fenced, dead-letter a poison message, redrive it (into a
-finished queue too) and purge it, stop, and
+finished queue too) and purge it, claim from a queue group, stop, and
 reopen the store, which now carries the format marker, directly.
 """
 
@@ -124,11 +124,20 @@ def main():
         purged = client.purge_dead_letters("poison", [third.msg_id])
         assert purged == {"purged": [third.msg_id], "missing": []}, purged
 
+        # A group claim takes messages only from the partitions assigned.
+        client.create_queue_group("fan", 2)
+        client.push("fan_p1", b"keyed")
+        result = client.claim_from_group("fan", [0], timeout_ms=0)
+        assert (result.messages, result.source_partition) == ([], None), result
+        result = client.claim_from_group("fan", [1])
+        (keyed,) = result.messages
+        assert (keyed.payload, keyed.queue, result.source_partition) == (b"keyed", "fan_p1", 1), result
+
         client.stop()
         broker.stop()
 
         reader = AnvilStorageReader(f"file://{db_dir}")
-        assert reader.list_queues() == ["poison", "work"], reader.list_queues()
+        assert reader.list_queues() == ["fan_p0", "fan_p1", "poison", "work"], reader.list_queues()
         stats = reader.get_queue_stats("poison")
         assert (stats["dead_count"], stats["total_purged"]) == (0, 1), stats
         assert stats["max_deliveries"] == 1, stats

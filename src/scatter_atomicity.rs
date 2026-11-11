@@ -238,7 +238,7 @@ mod tests {
             let expected: [&[&[u8]]; 3] = [&[b"p0-a", b"p0-b"], &[], &[b"p2-a"]];
             for (pid, want) in (0..PARTITIONS).zip(expected) {
                 let (got, source_queue, source_pid) = storage
-                    .claim_from_group(GROUP, 10, "w", "l", &[pid], false, 0)
+                    .claim_from_group(GROUP, 10, "w", "l", &[pid])
                     .await
                     .unwrap();
                 let payloads: Vec<&[u8]> =

@@ -424,16 +424,8 @@ impl AnvilService {
                 if group.group_name.is_empty() {
                     return Err(Status::invalid_argument("group_name is required"));
                 }
-                // Cast to u64, a negative threshold becomes a huge one that
-                // no partition's backlog exceeds, silently disabling stealing.
-                let Ok(steal_pending_threshold) = u64::try_from(group.steal_pending_threshold)
-                else {
-                    return Err(Status::invalid_argument(format!(
-                        "steal_pending_threshold must not be negative, got {}",
-                        group.steal_pending_threshold
-                    )));
-                };
-
+                // Cast to u32, a negative partition becomes one past any group's
+                // end, which the storage rejects.
                 let assigned: Vec<u32> = group
                     .assigned_partitions
                     .iter()
@@ -448,8 +440,6 @@ impl AnvilService {
                         &req.worker_id,
                         &req.lease_id,
                         &assigned,
-                        group.allow_steal,
-                        steal_pending_threshold,
                     )
                     .await
                     .map_err(|e| storage_status("Claim(group)", e))?;
@@ -1236,8 +1226,8 @@ mod tests {
         assert_status(&status, Code::FailedPrecondition, "message_not_claimed");
     }
 
-    /// A renewal naming a claim twice and a group claim with a negative
-    /// steal threshold are malformed: INVALID_ARGUMENT, and nothing renews.
+    /// A renewal naming a claim twice and a group claim naming no partition
+    /// are malformed: INVALID_ARGUMENT, and nothing renews.
     #[tokio::test]
     async fn test_malformed_requests_are_invalid_argument() {
         let (service, _storage) = create_service().await;
@@ -1258,9 +1248,7 @@ mod tests {
             .claim(Request::new(ClaimRequest {
                 source: Some(claim_request::Source::Group(GroupClaimSource {
                     group_name: "group".to_string(),
-                    assigned_partitions: vec![0],
-                    allow_steal: true,
-                    steal_pending_threshold: -1,
+                    assigned_partitions: Vec::new(),
                 })),
                 worker_id: "w".to_string(),
                 lease_id: "l".to_string(),
@@ -1269,7 +1257,11 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert_status(&status, Code::InvalidArgument, "steal_pending_threshold");
+        assert_status(
+            &status,
+            Code::InvalidArgument,
+            "assigned_partitions is required",
+        );
     }
 
     /// A push past a bounded queue's capacity is RESOURCE_EXHAUSTED, and the

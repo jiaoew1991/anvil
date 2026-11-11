@@ -923,7 +923,7 @@ pub(crate) mod tests {
                 let l = format!("l_{wid}");
                 loop {
                     let (claimed, _, _) = s
-                        .claim_from_group(group, 1, &w, &l, &assigned, true, 0)
+                        .claim_from_group(group, 1, &w, &l, &assigned)
                         .await
                         .unwrap();
                     if claimed.is_empty() {
@@ -1131,7 +1131,7 @@ pub(crate) mod tests {
     }
 
     /// Concurrent producers, workers acking and nacking, and a reclaimer
-    /// that keeps stealing claims out from under them, crashed mid-flight
+    /// that keeps taking claims out from under them, crashed mid-flight
     /// at several points. The reclaimer races every settlement, and
     /// concurrent writers race to persist the queue counters, so this is
     /// where a check-then-write gap or an out-of-order counter write would
