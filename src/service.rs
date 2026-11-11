@@ -768,6 +768,8 @@ impl Anvil for AnvilService {
                             total_acked: meta.total_acked as i64,
                             dead_count: meta.dead_count as i64,
                             total_purged: meta.total_purged as i64,
+                            max_deliveries: meta.max_deliveries,
+                            effective_max_deliveries: meta.effective_max_deliveries,
                         },
                     );
                 }

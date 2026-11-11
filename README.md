@@ -42,7 +42,9 @@ runs as the per-job broker embedded in the Ray driver.
   `default_max_deliveries`, 20; 0 is unlimited) moves the message to the
   queue's dead letters instead, with its body, the cause and the last nack's
   reason. A nack with `dead_letter=True` does so at once. Dead letters are
-  listed, redriven to pending with a fresh delivery count, or purged. See
+  listed, redriven to pending with a fresh delivery count, or purged.
+  `get_stats` reports a queue's own `max_deliveries` and the
+  `effective_max_deliveries` in force. See
   the runbook in [docs/semantics.md](docs/semantics.md) section 5.6 for
   recovering from a downstream outage.
 

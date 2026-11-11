@@ -512,6 +512,12 @@ pub struct QueueMeta {
     pub dead_count: u64,
     /// Total dead letters ever purged (lifetime counter)
     pub total_purged: u64,
+    /// The delivery limit the queue set for itself, 0 = unlimited; `None`
+    /// for a queue that follows the broker's default.
+    pub max_deliveries: Option<u32>,
+    /// The limit a nack or reclaim applies now: the queue's own, else the
+    /// default of this storage; 0 = unlimited.
+    pub effective_max_deliveries: u32,
 }
 
 /// What a nack asks for beyond returning its messages.
@@ -1222,7 +1228,7 @@ impl AnvilStorage {
             .load_counters(queue)
             .await?
             .ok_or_else(|| Rejection::NotFound(format!("queue not found: {queue}")))?;
-        Ok(Self::meta_of(&counters))
+        Ok(self.meta_of(queue, &counters))
     }
 
     /// Metadata of every queue loaded since startup, without touching the
@@ -1230,11 +1236,17 @@ impl AnvilStorage {
     pub fn queue_meta_snapshot(&self) -> Vec<(String, QueueMeta)> {
         self.counters
             .iter()
-            .map(|entry| (entry.key().clone(), Self::meta_of(entry.value())))
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    self.meta_of(entry.key(), entry.value()),
+                )
+            })
             .collect()
     }
 
-    fn meta_of(counters: &QueueCounters) -> QueueMeta {
+    fn meta_of(&self, queue: &str, counters: &QueueCounters) -> QueueMeta {
+        let (max_deliveries, effective_max_deliveries) = self.delivery_limits(queue);
         let s = counters.state.lock().expect("queue state poisoned");
         QueueMeta {
             push_seq: s.push_seq_committed,
@@ -1244,7 +1256,17 @@ impl AnvilStorage {
             total_acked: s.total_acked,
             dead_count: s.dead_count(),
             total_purged: s.total_purged,
+            max_deliveries,
+            effective_max_deliveries,
         }
+    }
+
+    /// The delivery limit `queue` set for itself, if any, and the limit in
+    /// effect: its own, else the default; 0 = unlimited.
+    fn delivery_limits(&self, queue: &str) -> (Option<u32>, u32) {
+        let own = self.limits.max_deliveries.get(queue).map(|limit| *limit);
+        let effective = own.unwrap_or_else(|| self.default_max_deliveries.load(Ordering::Relaxed));
+        (own, effective)
     }
 
     /// Create a queue: write its record.
@@ -1896,10 +1918,7 @@ impl AnvilStorage {
         assert!(!claims.is_empty());
         assert_eq!(claims.len(), hold.claims.len());
 
-        let max_deliveries = self.limits.max_deliveries.get(queue).map_or(
-            self.default_max_deliveries.load(Ordering::Relaxed),
-            |limit| *limit,
-        );
+        let (_, max_deliveries) = self.delivery_limits(queue);
         let (reason, limit_cause) = match requeue {
             Requeue::Nack(nack) => (nack.reason, DeadLetterCause::NackLimit),
             Requeue::Reclaim => ("", DeadLetterCause::ReclaimLimit),
@@ -4693,8 +4712,9 @@ pub(crate) mod tests {
     }
 
     /// Goal: creating a queue sets, keeps or replaces its delivery limit as
-    /// documented, beside its bound. Method: create, re-create with and
-    /// without each setting, and read the stored record and the cache.
+    /// documented, beside its bound, and the queue's stats report the limit
+    /// it set and the one in effect. Method: create, re-create with and
+    /// without each setting, and read the stored record and the stats.
     #[tokio::test]
     async fn test_create_queue_keeps_or_replaces_the_limit() {
         let storage = create_temp_storage().await;
@@ -4707,14 +4727,25 @@ pub(crate) mod tests {
                 (record.max_pending, record.max_deliveries)
             }
         };
+        async fn limits(storage: &AnvilStorage, queue: &str) -> (Option<u32>, u32) {
+            let meta = storage.get_meta(queue).await.unwrap();
+            (meta.max_deliveries, meta.effective_max_deliveries)
+        }
         storage.create_queue(queue, 0, None).await.unwrap();
         assert_eq!(record(&storage).await, (0, None));
+        assert_eq!(
+            limits(&storage, queue).await,
+            (None, DEFAULT_MAX_DELIVERIES)
+        );
+        storage.default_max_deliveries.store(9, Ordering::Relaxed);
+        assert_eq!(limits(&storage, queue).await, (None, 9));
         storage.create_queue(queue, 0, Some(4)).await.unwrap();
         storage.create_queue(queue, 7, None).await.unwrap();
         assert_eq!(record(&storage).await, (7, Some(4)));
+        assert_eq!(limits(&storage, queue).await, (Some(4), 4));
         storage.create_queue(queue, 0, Some(0)).await.unwrap();
         assert_eq!(record(&storage).await, (7, Some(0)));
-        assert_eq!(*storage.limits.max_deliveries.get(queue).unwrap(), 0);
+        assert_eq!(limits(&storage, queue).await, (Some(0), 0));
 
         let (group, _) = storage
             .create_queue_group("g", 2, 0, Some(5))
@@ -4987,6 +5018,11 @@ pub(crate) mod tests {
 
         let storage = AnvilStorage::new(&db_path).await.unwrap();
         assert_eq!(dead_counts(&storage, queue).await, before);
+        let meta = storage.get_meta(queue).await.unwrap();
+        assert_eq!(
+            (meta.max_deliveries, meta.effective_max_deliveries),
+            (Some(1), 1)
+        );
         let redriven = storage.claim_messages(queue, 1, "w", "l").await.unwrap();
         nack(&storage, queue, &redriven, NackOptions::default()).await;
         assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 3, 1));

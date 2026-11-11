@@ -995,6 +995,8 @@ impl AnvilRustClient {
             qd.set_item("total_acked", s.total_acked)?;
             qd.set_item("dead_count", s.dead_count)?;
             qd.set_item("total_purged", s.total_purged)?;
+            qd.set_item("max_deliveries", s.max_deliveries)?;
+            qd.set_item("effective_max_deliveries", s.effective_max_deliveries)?;
             queues_dict.set_item(q, qd)?;
         }
         let result = PyDict::new(py);

@@ -364,7 +364,9 @@ character boundary, so a nack carrying a whole traceback still succeeds) and
 the worker. A nack with `dead_letter` set dead-letters its messages at once,
 cause `rejected`. The limit is read when the claim is settled, so a lowered
 limit applies from the next nack or reclaim, and a message already past it
-gets that one more delivery.
+gets that one more delivery. `GetStats` reports both sides of the limit:
+`max_deliveries`, the queue's own setting, absent while it follows the
+broker's default, and `effective_max_deliveries`, the limit in effect now.
 
 Dead letters are neither pending nor claimed: they count as settled for the
 drain signal and take no room in a bounded queue. So that work a pipeline
@@ -583,11 +585,20 @@ When the service the workers call goes down, every message fails until it
 comes back, and each one is dead-lettered once it has used up its
 deliveries. The messages are not lost; recover them in three steps.
 
-1. **Stop the bleeding.** While the outage lasts, lift the limit of the live
-   queues so nothing more dies: `create_queue(q, max_deliveries=0)`, or
+1. **Stop the bleeding.** First read each live queue's limit and write it
+   down: `get_stats(q)["queues"][q]` holds `max_deliveries`, the queue's
+   own setting (`None` while it follows the broker's
+   `default_max_deliveries`), and `effective_max_deliveries`, the limit in
+   effect (0 = unlimited). A group's partitions are queues: read them by
+   the `queue_names` that `create_queue_group` returns. Then lift the limit
+   so nothing more dies while the outage lasts:
+   `create_queue(q, max_deliveries=0)`, or
    `create_queue_group(g, n, max_deliveries=0)` for a group's partitions.
-   Creating an existing queue changes only the settings it is given. Set the
-   limit back the same way once the downstream is healthy.
+   Creating an existing queue changes only the settings it is given. Once
+   the downstream is healthy, set the limit back the same way, to the
+   `effective_max_deliveries` read before. A queue never drops a limit it
+   set, so one that followed the broker's default now keeps that number as
+   its own and no longer follows a change of the default.
 2. **Redrive.** Once the downstream has recovered, page through the dead
    letters with `list_dead_letters(q, ids_only=True, limit=1000)` and pass
    each page's msg_ids to `redrive_dead_letters`. A finished queue needs

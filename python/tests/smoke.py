@@ -74,6 +74,10 @@ def main():
         )
         stats = client.get_stats("poison")["queues"]["poison"]
         assert stats["dead_count"] == 1 and stats["pending_count"] == 0, stats
+        # Stats tell a queue's own limit from the broker's default in effect.
+        assert (stats["max_deliveries"], stats["effective_max_deliveries"]) == (1, 1), stats
+        stats = client.get_stats("work")["queues"]["work"]
+        assert (stats["max_deliveries"], stats["effective_max_deliveries"]) == (None, 20), stats
         (letter,), next_start_after = client.list_dead_letters("poison")
         assert next_start_after is None
         assert (letter.msg_id, letter.cause, letter.reason) == (
@@ -118,6 +122,7 @@ def main():
         assert reader.list_queues() == ["poison", "work"], reader.list_queues()
         stats = reader.get_queue_stats("poison")
         assert (stats["dead_count"], stats["total_purged"]) == (0, 1), stats
+        assert stats["max_deliveries"] == 1, stats
     # A store this release cannot read raises a RuntimeError like any other
     # failure to open, so existing handlers still catch it.
     assert issubclass(StorageFormatError, RuntimeError)
