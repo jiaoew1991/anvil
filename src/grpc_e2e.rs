@@ -772,8 +772,6 @@ mod tests {
                     source: Some(claim_request::Source::Group(GroupClaimSource {
                         group_name: group.to_string(),
                         assigned_partitions: vec![pid as i32],
-                        allow_steal: false,
-                        steal_pending_threshold: 0,
                     })),
                     worker_id: "worker".to_string(),
                     lease_id: lease.lease_id.clone(),

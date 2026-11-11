@@ -7,6 +7,15 @@ served over gRPC and stored in [SlateDB](https://slatedb.io) (`memory://`,
 It was extracted from [nurion](https://github.com/lumalabs/nurion), where it
 runs as the per-job broker embedded in the Ray driver.
 
+## Queues and queue groups
+
+A **queue** is for work any worker may take: workers compete for messages
+(`claim`). A **queue group** is for work keyed so that one consumer must see
+every message of a key, such as a group-by: the producer scatters payloads
+over the group's partition queues (`ack_and_scatter`) and each worker claims
+only the partitions assigned to it (`claim_from_group`). See
+[docs/semantics.md](docs/semantics.md) section 2.5.
+
 ## Guarantees
 
 - **Fenced completion.** Every claim carries a `claim_token` and the worker's

@@ -438,7 +438,7 @@ mod tests {
         let mut scattered = Vec::new();
         loop {
             let (claimed, queue, _) = storage
-                .claim_from_group(GROUP, 10, "worker", "lease", &[0, 1, 2], false, 0)
+                .claim_from_group(GROUP, 10, "worker", "lease", &[0, 1, 2])
                 .await
                 .unwrap();
             if claimed.is_empty() {

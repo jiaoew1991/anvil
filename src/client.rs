@@ -159,17 +159,22 @@ impl DeadLetter {
     }
 }
 
-/// What `claim` returns.
+/// What `claim` and `claim_from_group` return.
 #[pyclass(frozen)]
 pub struct ClaimResult {
     /// The messages claimed, a list of `RustMessage`.
     #[pyo3(get)]
     pub messages: Py<PyList>,
-    /// The queue is finished and empty: the worker's signal to exit.
+    /// The partition a group claim took its messages from; `None` for a
+    /// plain claim and when no message is returned.
+    #[pyo3(get)]
+    pub source_partition: Option<i32>,
+    /// The queue or group is finished and empty: the worker's signal to
+    /// exit.
     #[pyo3(get)]
     pub drained: bool,
-    /// Dead letters left in the queue, whose work was not done; reported
-    /// when no message is returned.
+    /// Dead letters left in the queue or group, whose work was not done;
+    /// reported when no message is returned.
     #[pyo3(get)]
     pub dead_count: i64,
 }
@@ -178,8 +183,10 @@ pub struct ClaimResult {
 impl ClaimResult {
     fn __repr__(&self, py: Python<'_>) -> String {
         format!(
-            "ClaimResult(messages=<{} messages>, drained={}, dead_count={})",
+            "ClaimResult(messages=<{} messages>, source_partition={}, drained={}, dead_count={})",
             self.messages.bind(py).len(),
+            self.source_partition
+                .map_or("None".to_string(), |partition| partition.to_string()),
             if self.drained { "True" } else { "False" },
             self.dead_count
         )
@@ -490,37 +497,33 @@ impl AnvilRustClient {
         })?;
         Ok(ClaimResult {
             messages: PyList::new(py, messages)?.unbind(),
+            source_partition: None,
             drained,
             dead_count,
         })
     }
 
-    /// Claims from a queue group, like `claim`. Returns `(messages,
-    /// source_queue, source_partition, drained, dead_count)`, the last two
-    /// for the whole group.
-    #[pyo3(signature = (group_name, batch_size=1, timeout_ms=5000, assigned_partitions=None, allow_steal=false, steal_pending_threshold=0))]
-    #[allow(clippy::too_many_arguments)]
+    /// Claims from the partitions of a queue group assigned to this worker,
+    /// like `claim`: `drained` and `dead_count` are for the whole group, and
+    /// `source_partition` is the partition the messages came from.
+    #[pyo3(signature = (group_name, assigned_partitions, batch_size=1, timeout_ms=5000))]
     fn claim_from_group(
         &self,
         py: Python<'_>,
         group_name: String,
+        assigned_partitions: Vec<i32>,
         batch_size: i32,
         timeout_ms: i32,
-        assigned_partitions: Option<Vec<i32>>,
-        allow_steal: bool,
-        steal_pending_threshold: i64,
-    ) -> PyResult<(Vec<RustMessage>, String, i32, bool, i64)> {
+    ) -> PyResult<ClaimResult> {
         let inner = self.inner.clone();
-        py.detach(move || {
+        let (messages, source_partition, drained, dead_count) = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::ClaimRequest {
                     source: Some(proto::claim_request::Source::Group(
                         proto::GroupClaimSource {
-                            group_name: group_name.clone(),
-                            assigned_partitions: assigned_partitions.unwrap_or_default(),
-                            allow_steal,
-                            steal_pending_threshold,
+                            group_name,
+                            assigned_partitions,
                         },
                     )),
                     worker_id: inner.worker_id.clone(),
@@ -533,24 +536,25 @@ impl AnvilRustClient {
                     .await
                     .map_err(status_to_pyerr)?
                     .into_inner();
-                let source_q = if resp.source_queue.is_empty() {
-                    group_name
-                } else {
-                    resp.source_queue.clone()
-                };
                 let messages: Vec<RustMessage> = resp
                     .messages
                     .iter()
-                    .map(|m| RustMessage::from_claim_message(m, &source_q))
+                    .map(|m| RustMessage::from_claim_message(m, &resp.source_queue))
                     .collect();
-                Ok((
+                let source_partition = (!messages.is_empty()).then_some(resp.source_partition);
+                PyResult::Ok((
                     messages,
-                    resp.source_queue,
-                    resp.source_partition,
+                    source_partition,
                     resp.upstream_drained,
                     resp.dead_count,
                 ))
             })
+        })?;
+        Ok(ClaimResult {
+            messages: PyList::new(py, messages)?.unbind(),
+            source_partition,
+            drained,
+            dead_count,
         })
     }
 

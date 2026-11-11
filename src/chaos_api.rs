@@ -356,8 +356,6 @@ pub(crate) mod tests {
             source: Some(claim_request::Source::Group(GroupClaimSource {
                 group_name: group_name.to_string(),
                 assigned_partitions: vec![-1, 7],
-                allow_steal: false,
-                steal_pending_threshold: 0,
             })),
             worker_id: "w".to_string(),
             lease_id: "lease-w".to_string(),
@@ -384,12 +382,12 @@ pub(crate) mod tests {
         for (case, request, code) in claims {
             assert_code(&service.claim(Request::new(request)).await, code, case);
         }
-        let out_of_range = service
-            .claim(Request::new(group_claim("group")))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(out_of_range.messages.is_empty());
+        let out_of_range = service.claim(Request::new(group_claim("group"))).await;
+        assert_code(
+            &out_of_range,
+            Code::InvalidArgument,
+            "partitions out of range",
+        );
         for partitions in [0, -1, i32::MIN] {
             let created = create_group(&service, "bad", partitions).await;
             assert_code(&created, Code::InvalidArgument, "num_partitions");
@@ -837,13 +835,13 @@ pub(crate) mod tests {
         });
     }
 
-    /// Goal: stealing never delivers a message twice. Method: a producer
-    /// scatters 400 messages, ten per call, unevenly over four partitions while owners
-    /// claim their assigned partition and thieves claim with stealing at
-    /// thresholds 0 and 1; every consumer acks and stops on the group's
-    /// drain signal. Each message is delivered exactly once.
+    /// Goal: consumers assigned the same partition never get a message
+    /// twice. Method: a producer scatters 400 messages, ten per call,
+    /// unevenly over four partitions while four consumers claim one
+    /// partition each and two claim all four; every consumer acks and stops
+    /// on the group's drain signal. Each message is delivered exactly once.
     #[test]
-    fn test_group_steal_racing_assigned_claims_delivers_once() {
+    fn test_group_overlapping_assignments_deliver_once() {
         const PARTITIONS: i32 = 4;
         const MESSAGES: usize = 400;
         const SCATTER_BATCH: usize = 10;
@@ -883,15 +881,17 @@ pub(crate) mod tests {
                     let service = service.clone();
                     let worker = format!("w{c}");
                     tokio::spawn(async move {
-                        let assigned = if c < PARTITIONS { vec![c] } else { Vec::new() };
+                        let assigned = if c < PARTITIONS {
+                            vec![c]
+                        } else {
+                            (0..PARTITIONS).collect()
+                        };
                         let mut delivered = Vec::new();
                         loop {
                             let request = ClaimRequest {
                                 source: Some(claim_request::Source::Group(GroupClaimSource {
                                     group_name: "g".to_string(),
                                     assigned_partitions: assigned.clone(),
-                                    allow_steal: c % 2 == 0 || c >= PARTITIONS,
-                                    steal_pending_threshold: i64::from(c % 2),
                                 })),
                                 worker_id: worker.clone(),
                                 lease_id: format!("lease-{worker}"),

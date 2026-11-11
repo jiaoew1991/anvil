@@ -626,8 +626,9 @@ pub struct AnvilStorage {
     /// earlier one and derive a claim cursor past the push cursor, and a late
     /// zero write could reset totals another writer had merged.
     counters_loading: Arc<tokio::sync::Mutex<()>>,
-    /// Per-group round-robin counters for O(1) steal path in claim_from_group
-    steal_rr: std::sync::Mutex<HashMap<String, u64>>,
+    /// Where each worker's next group claim starts among its assigned
+    /// partitions, per group.
+    group_claim_rr: std::sync::Mutex<HashMap<String, u64>>,
     /// The limits of the queue records loaded or written so far.
     limits: Arc<QueueLimits>,
     /// Picked at random when the store is opened and recorded in every claim
@@ -749,7 +750,7 @@ impl AnvilStorage {
             db,
             counters: DashMap::new(),
             counters_loading: Arc::new(tokio::sync::Mutex::new(())),
-            steal_rr: std::sync::Mutex::new(HashMap::new()),
+            group_claim_rr: std::sync::Mutex::new(HashMap::new()),
             limits: Arc::new(QueueLimits::default()),
             incarnation: uuid::Uuid::now_v7().as_u64_pair().1,
             default_max_deliveries: AtomicU32::new(DEFAULT_MAX_DELIVERIES),
@@ -2778,8 +2779,12 @@ impl AnvilStorage {
         Ok(all_new_msg_ids)
     }
 
-    /// Claim from a partition group (O(1) per call).
-    #[allow(clippy::too_many_arguments)]
+    /// Claims from the first of the caller's assigned partitions that has
+    /// messages, starting one partition later on each call so none starves.
+    /// Returns the messages with their partition's queue and index, or no
+    /// messages when every assigned partition is empty. A partition is never
+    /// claimed by a caller it is not assigned to: a consumer that keeps
+    /// state per key relies on seeing all of a partition.
     pub async fn claim_from_group(
         &self,
         group_name: &str,
@@ -2787,76 +2792,45 @@ impl AnvilStorage {
         worker_id: &str,
         lease_id: &str,
         assigned_partitions: &[u32],
-        allow_steal: bool,
-        steal_pending_threshold: u64,
     ) -> Result<(Vec<ClaimedMessage>, String, u32), StorageError> {
+        if assigned_partitions.is_empty() {
+            return Err(Box::new(Rejection::InvalidArgument(
+                "assigned_partitions is required for a group claim".to_string(),
+            )));
+        }
         let group = self
             .get_group_meta(group_name)
             .await?
             .ok_or_else(|| Rejection::NotFound(format!("Queue group not found: {}", group_name)))?;
-
-        // O(A) where A is small (2-4): try claim directly, no meta reads needed.
-        if !assigned_partitions.is_empty() {
-            let a_len = assigned_partitions.len() as u64;
-            let rr_assigned = {
-                let mut map = self.steal_rr.lock().unwrap();
-                let key = format!("{}_assigned_{}", group_name, worker_id);
-                let counter = map.entry(key).or_insert(0);
-                let val = *counter;
-                *counter = val.wrapping_add(1);
-                val
-            };
-            for offset in 0..a_len {
-                let idx = ((rr_assigned + offset) % a_len) as usize;
-                let pid = assigned_partitions[idx];
-                if (pid as usize) < group.partition_queues.len() {
-                    let queue_name = &group.partition_queues[pid as usize];
-                    let claimed = self
-                        .claim_messages(queue_name, batch_size, worker_id, lease_id)
-                        .await?;
-                    if !claimed.is_empty() {
-                        return Ok((claimed, queue_name.to_string(), pid));
-                    }
-                }
+        for pid in assigned_partitions {
+            if *pid >= group.num_partitions {
+                return Err(Box::new(Rejection::InvalidArgument(format!(
+                    "Partition {} out of range [0, {})",
+                    pid, group.num_partitions
+                ))));
             }
         }
 
-        // Steal: round-robin through unassigned partitions.
-        if allow_steal {
-            let total = group.partition_queues.len() as u64;
-            if total > 0 {
-                let rr = {
-                    let mut map = self.steal_rr.lock().unwrap();
-                    let counter = map.entry(group_name.to_string()).or_insert(0);
-                    let val = *counter;
-                    *counter = val.wrapping_add(1);
-                    val
-                };
-
-                for offset in 0..total {
-                    let pid = ((rr + offset) % total) as u32;
-                    if assigned_partitions.contains(&pid) {
-                        continue;
-                    }
-                    let queue_name = &group.partition_queues[pid as usize];
-                    if steal_pending_threshold > 0 {
-                        let meta = self.get_meta(queue_name).await?;
-                        let pending = meta.push_seq.saturating_sub(meta.claim_seq);
-                        if pending <= steal_pending_threshold {
-                            continue;
-                        }
-                    }
-                    let claimed = self
-                        .claim_messages(queue_name, batch_size, worker_id, lease_id)
-                        .await?;
-                    if !claimed.is_empty() {
-                        return Ok((claimed, queue_name.to_string(), pid));
-                    }
-                }
+        let assigned_count = assigned_partitions.len() as u64;
+        let first = {
+            let mut map = self.group_claim_rr.lock().unwrap();
+            let counter = map
+                .entry(format!("{}_assigned_{}", group_name, worker_id))
+                .or_insert(0);
+            let first = *counter;
+            *counter = first.wrapping_add(1);
+            first
+        };
+        for offset in 0..assigned_count {
+            let pid = assigned_partitions[((first + offset) % assigned_count) as usize];
+            let queue_name = &group.partition_queues[pid as usize];
+            let claimed = self
+                .claim_messages(queue_name, batch_size, worker_id, lease_id)
+                .await?;
+            if !claimed.is_empty() {
+                return Ok((claimed, queue_name.to_string(), pid));
             }
         }
-
-        // Nothing to claim
         Ok((Vec::new(), String::new(), 0))
     }
 
@@ -2916,8 +2890,8 @@ impl AnvilStorage {
         // Clean up in-memory round-robin counters for this group
         let prefix = format!("{}_", group_name);
         {
-            let mut map = self.steal_rr.lock().unwrap();
-            map.retain(|k, _| !k.starts_with(&prefix) && k != group_name);
+            let mut map = self.group_claim_rr.lock().unwrap();
+            map.retain(|k, _| !k.starts_with(&prefix));
         }
 
         tracing::info!(
