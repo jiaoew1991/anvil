@@ -2394,12 +2394,14 @@ impl AnvilStorage {
     /// tests had to use 10 s for both, even though task duration and
     /// dead-worker detection are completely different concerns. Splitting
     /// them lets each test (and production) tune them independently.
+    ///
+    /// Returns the queue and lease of each claim reclaimed.
     pub async fn recover_expired_claims(
         &self,
         lease_timeout_secs: f64,
         claim_age_timeout_secs: f64,
         active_leases: Option<&HashMap<String, Instant>>,
-    ) -> Result<usize, StorageError> {
+    ) -> Result<Vec<(String, String)>, StorageError> {
         let now = mono_now();
         let all_claimed = self.scan_claimed(None).await?;
         let live_tokens: std::collections::HashSet<&str> = all_claimed
@@ -2470,7 +2472,7 @@ impl AnvilStorage {
             expired_by_queue.entry(queue).or_default().push(info);
         }
 
-        let mut total = 0;
+        let mut reclaimed = Vec::new();
         for (queue, expired) in expired_by_queue {
             let claims = self.reclaim_messages(&queue, &expired, now).await?;
             if claims.is_empty() {
@@ -2480,14 +2482,18 @@ impl AnvilStorage {
                 claims.len() as u64,
                 &[opentelemetry::KeyValue::new("queue", queue.clone())],
             );
-            total += claims.len();
+            reclaimed.extend(
+                claims
+                    .into_iter()
+                    .map(|claim| (queue.clone(), claim.lease_id)),
+            );
         }
 
-        if total > 0 {
-            tracing::info!("Recovered {} expired claims", total);
+        if !reclaimed.is_empty() {
+            tracing::info!("Recovered {} expired claims", reclaimed.len());
         }
 
-        Ok(total)
+        Ok(reclaimed)
     }
 
     // === State Operations ===
@@ -3149,7 +3155,8 @@ pub(crate) mod tests {
         let reclaimed = storage
             .recover_expired_claims(30.0, 60.0, None)
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(reclaimed, 2, "a claim in `colon:00` was not reclaimed");
         assert!(storage.scan_claimed(None).await.unwrap().is_empty());
 
@@ -3219,7 +3226,8 @@ pub(crate) mod tests {
                         Some(&HashMap::new()),
                     )
                     .await
-                    .unwrap();
+                    .unwrap()
+                    .len();
                 assert_eq!(recovered_count, 1);
                 delivered = storage
                     .claim_messages(queue, 1, "worker", "lease-2")
@@ -3336,7 +3344,8 @@ pub(crate) mod tests {
                 Some(&no_live_leases),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(reclaimed, 1);
 
         let third = storage
@@ -3976,7 +3985,8 @@ pub(crate) mod tests {
         let recovered = storage
             .recover_expired_claims(0.0, 0.0, None)
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(recovered, 1);
 
         let claimed_again = storage
@@ -4023,7 +4033,8 @@ pub(crate) mod tests {
                 Some(&active),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(recovered, 0);
 
         let still_claimed = storage.scan_claimed(Some(queue)).await.unwrap();
@@ -4069,6 +4080,7 @@ pub(crate) mod tests {
                     )
                     .await
                     .unwrap()
+                    .len()
             }
         };
         let window = CLAIM_AGE_TIMEOUT_SECS_PRODUCTION;
@@ -4639,7 +4651,8 @@ pub(crate) mod tests {
                 Some(&HashMap::new()),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(recovered, 1);
         assert_eq!(dead_counts(&storage, queue).await, (0, 0, 0, 1, 0));
         let letter = &all_dead_letters(&storage, queue).await[0];
@@ -5043,7 +5056,8 @@ pub(crate) mod tests {
         let reclaimed = storage
             .recover_expired_claims(1.0, 1.0, Some(&no_live_leases))
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(reclaimed, 2);
         assert_eq!(dead_counts(&storage, queue).await, (2, 0, 0, 0, 0));
         let again = storage.claim_messages(queue, 2, "w", "l").await.unwrap();
@@ -5330,7 +5344,8 @@ pub(crate) mod tests {
         let recovered = storage
             .recover_expired_claims(0.0, 0.0, None)
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(recovered, 1);
 
         let claimed = storage
@@ -5889,7 +5904,8 @@ pub(crate) mod tests {
                             Some(&active),
                         )
                         .await
-                        .unwrap();
+                        .unwrap()
+                        .len();
                     tokio::time::sleep(TEST_RECOVERY_TICK).await;
                 }
             })

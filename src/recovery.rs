@@ -106,7 +106,7 @@ impl RecoveryTask {
                             )
                             .await
                         {
-                            Ok(_) => state.release_dead_owners(&lease_snapshot),
+                            Ok(reclaimed) => state.release_owners(&lease_snapshot, &reclaimed),
                             Err(e) => {
                                 tracing::error!("Recovery error: {}", e);
                                 // A closed database never reopens: every

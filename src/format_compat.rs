@@ -127,7 +127,8 @@ mod tests {
         let recovered = storage
             .recover_expired_claims(1.0, 1.0, Some(&HashMap::new()))
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(recovered, 1);
 
         // Dead letters, one of each cause, on a queue that dies at its first
@@ -159,7 +160,8 @@ mod tests {
         let recovered = storage
             .recover_expired_claims(1.0, 1.0, Some(&HashMap::new()))
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(recovered, 1);
         storage.create_queue("unlimited", 0, Some(0)).await.unwrap();
         push(&storage, "unlimited", 1).await;
@@ -376,7 +378,8 @@ mod tests {
         let recovered = storage
             .recover_expired_claims(1.0, 1.0, Some(&HashMap::new()))
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(recovered, 1);
         let redelivered = claim(&storage, "claimed", 10).await;
         let mut deliveries: Vec<u32> = redelivered.iter().map(|c| c.delivery_count).collect();

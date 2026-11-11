@@ -1349,53 +1349,89 @@ mod tests {
         state.update_lease("b");
         let status = claim("b", 0).await.unwrap_err();
         assert_status(&status, Code::Aborted, "partition_owned");
-        state.release_dead_owners(&state.lease_snapshot());
+        state.release_owners(&state.lease_snapshot(), &[]);
         assert!(claim("b", 0).await.unwrap().upstream_drained);
     }
 
-    /// Goal: a dead worker's partition passes to its successor only with
-    /// its claims. Method: under a running recovery task, lease a claims
-    /// the one message of partition 0 and never heartbeats; lease b, kept
-    /// alive, claims the partition until it is no longer refused. Its first
-    /// claim that succeeds returns the message a held, redelivered.
+    /// Goal: the partition of a worker that died or got stuck passes to
+    /// its successor with its claims, and the worker can no longer commit
+    /// behind the successor's back. Method: under a running recovery task,
+    /// lease a claims the one message of partition 0 and holds it, with a
+    /// lease that expires (dead) or a claim that ages out under a live
+    /// lease (stuck); lease b, kept alive, claims the partition until it is
+    /// no longer refused. Its first claim that succeeds returns the message
+    /// a held, redelivered, and a's ack of it, with the state it carries,
+    /// is refused.
     #[tokio::test]
-    async fn test_recovery_hands_a_dead_owners_partition_over() {
+    async fn test_recovery_hands_a_lost_owners_partition_over() {
         const HANDOVER_DEADLINE: Duration = Duration::from_secs(10);
-        // Lease a must expire in real time.
+        // The timeouts must run out in real time.
         let _clock = SimClock::acquire();
-        let (service, storage) = create_service().await;
-        let config = AnvilConfig {
+        let dead = AnvilConfig {
             lease_timeout_secs: 0.2,
             recovery_interval_secs: 0.05,
             ..AnvilConfig::default()
         };
-        let mut recovery = RecoveryTask::new(storage.clone(), service.state.clone(), config);
-        recovery.start();
-        storage.create_queue_group("g", 1, 0, None).await.unwrap();
-        storage
-            .push_messages("g_p0", &[Message::new(b"x".to_vec())])
-            .await
-            .unwrap();
-
-        service.state.update_lease("a");
-        let held = group_claim(&service, "a", 0).await.unwrap();
-        assert_eq!(held.messages.len(), 1);
-        let started = std::time::Instant::now();
-        let taken = loop {
-            service.state.update_lease("b");
-            match group_claim(&service, "b", 0).await {
-                Ok(response) => break response,
-                Err(status) => {
-                    assert_status(&status, Code::Aborted, "partition_owned");
-                    assert!(started.elapsed() < HANDOVER_DEADLINE, "never handed over");
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }
+        let stuck = AnvilConfig {
+            claim_age_timeout_secs: 0.2,
+            recovery_interval_secs: 0.05,
+            ..AnvilConfig::default()
         };
-        recovery.stop_async().await;
-        assert_eq!(taken.messages.len(), 1);
-        assert_eq!(taken.messages[0].msg_id, held.messages[0].msg_id);
-        assert_eq!(taken.messages[0].delivery_count, 2);
+        for (case, config) in [("dead", dead), ("stuck", stuck)] {
+            let (service, storage) = create_service().await;
+            let mut recovery = RecoveryTask::new(storage.clone(), service.state.clone(), config);
+            recovery.start();
+            storage.create_queue_group("g", 1, 0, None).await.unwrap();
+            storage
+                .push_messages("g_p0", &[Message::new(b"x".to_vec())])
+                .await
+                .unwrap();
+
+            service.state.update_lease("a");
+            let held = group_claim(&service, "a", 0).await.unwrap();
+            assert_eq!(held.messages.len(), 1, "{case}");
+            let started = std::time::Instant::now();
+            let taken = loop {
+                service.state.update_lease("b");
+                match group_claim(&service, "b", 0).await {
+                    Ok(response) => break response,
+                    Err(status) => {
+                        assert_status(&status, Code::Aborted, "partition_owned");
+                        assert!(started.elapsed() < HANDOVER_DEADLINE, "{case}: no handover");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            };
+            recovery.stop_async().await;
+            assert_eq!(taken.messages.len(), 1, "{case}");
+            assert_eq!(taken.messages[0].msg_id, held.messages[0].msg_id, "{case}");
+            assert_eq!(taken.messages[0].delivery_count, 2, "{case}");
+
+            let late = CompleteRequest {
+                upstream_queue: "g_p0".to_string(),
+                msg_ids: vec![held.messages[0].msg_id.clone()],
+                claim_tokens: vec![held.messages[0].claim_token.clone()],
+                worker_id: "a".to_string(),
+                lease_id: "a".to_string(),
+                action: Some(complete_request::Action::Ack(AckAction {})),
+                state: Some(StateUpdate {
+                    namespace: "sums".to_string(),
+                    puts: HashMap::from([("p0".to_string(), b"stale".to_vec())]),
+                    deletes: Vec::new(),
+                }),
+            };
+            let status = service.complete(Request::new(late)).await.unwrap_err();
+            assert_eq!(
+                status.code(),
+                Code::FailedPrecondition,
+                "{case}: {status:?}"
+            );
+            let state = storage
+                .state_get_batch("sums", &["p0".to_string()])
+                .await
+                .unwrap();
+            assert!(state.is_empty(), "{case}: a lost owner wrote {state:?}");
+        }
     }
 
     /// A push past a bounded queue's capacity is RESOURCE_EXHAUSTED, and the

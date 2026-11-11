@@ -19,7 +19,7 @@
 // - Lease management: track worker heartbeats
 
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -154,14 +154,33 @@ impl AnvilState {
         Ok(())
     }
 
-    /// Frees the partitions of dead leases: those absent from `recovered`,
-    /// the leases the recovery pass just run took for live, and not opened
-    /// since. That pass reclaimed every claim of such a lease, so its worker
-    /// can settle no message behind the next owner's back. Until then the
-    /// partition stays owned, as an ack of the dead lease may still land.
-    pub fn release_dead_owners(&self, recovered: &HashMap<String, Instant>) {
-        self.partition_owners.lock().unwrap().retain(|_, lease_id| {
-            recovered.contains_key(lease_id) || self.leases.contains_key(lease_id)
+    /// Frees the partitions of the leases a recovery pass found dead or
+    /// stuck, once it has reclaimed their claims: `recovered` is the leases
+    /// the pass took for live, `reclaimed` the queue and lease of each claim
+    /// it took back.
+    ///
+    /// - A dead lease is absent from `recovered` and was not opened since.
+    ///   The pass reclaimed every claim it held, so its worker can settle no
+    ///   message behind the next owner's back. Until then its partitions
+    ///   stay owned, as an ack of the dead lease may still land.
+    /// - A stuck lease is live but let a claim on a partition it owns age
+    ///   out. The message can only be redelivered to the partition's owner,
+    ///   so a worker that stays stuck would hold its partitions for good:
+    ///   it loses them all, to whoever claims them next.
+    pub fn release_owners(
+        &self,
+        recovered: &HashMap<String, Instant>,
+        reclaimed: &[(String, String)],
+    ) {
+        let mut owners = self.partition_owners.lock().unwrap();
+        let stuck: HashSet<&str> = reclaimed
+            .iter()
+            .filter(|(queue, lease_id)| owners.get(queue) == Some(lease_id))
+            .map(|(_, lease_id)| lease_id.as_str())
+            .collect();
+        owners.retain(|_, lease_id| {
+            let live = recovered.contains_key(lease_id) || self.leases.contains_key(lease_id);
+            live && !stuck.contains(lease_id.as_str())
         });
     }
 

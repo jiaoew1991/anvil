@@ -173,6 +173,11 @@ Ownership lives in the broker's memory and follows the lease:
   claims, at most `lease_timeout_secs` plus `recovery_interval_secs` after
   the worker's last heartbeat. Until then a replacement worker is refused,
   since an ack of the dead lease could still land.
+- It also ends when a claim on the partition ages out under a live lease
+  (`claim_age_timeout_secs`) and is reclaimed: the worker is stuck, and its
+  message can only be redelivered to the partition's owner. The worker
+  loses every partition it owns, to whoever claims them next; if no one
+  has, it may claim them again.
 - A broker restart ends every lease, and every ownership with it.
 - A worker whose lease died gets a new lease when it reconnects, and is
   then a new consumer like any other: it may be refused its old partition
@@ -184,7 +189,9 @@ messages it covers (`state_puts` of `ack` and `ack_and_scatter`): the two
 land together or not at all, so the state never counts a message that will
 be redelivered, nor misses one that was acked. A worker taking over a
 partition reads that state first. A late ack of the previous owner is
-fenced, and its state is refused with it.
+fenced, and its state is refused with it. A worker whose ack is refused
+(`FAILED_PRECONDITION`) has lost the messages it covered, and possibly its
+partition with them: it reloads its state before it goes on.
 
 Dead letters of a partition are inputs the consumer never got. The claim
 that reports the partitions drained reports their number: a consumer whose
