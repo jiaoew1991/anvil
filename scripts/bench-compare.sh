@@ -20,6 +20,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# A release's PyO3 refuses to build against a Python newer than it knows.
+# These tests run no Python, so let every tree build against any.
+export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+
 keys_per_sec_ratio_min=${KEYS_PER_SEC_RATIO_MIN:-0.85}
 ack_p99_ratio_max=${ACK_P99_RATIO_MAX:-0}
 rounds=${ROUNDS:-3}

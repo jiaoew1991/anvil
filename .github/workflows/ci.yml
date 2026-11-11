@@ -65,8 +65,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The oldest supported Python and the newest PyO3 0.23 supports.
-        python: ["3.10", "3.13"]
+        # The oldest and the newest supported Python, and 3.13, the newest
+        # that PyO3 0.23 supported.
+        python: ["3.10", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

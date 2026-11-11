@@ -9,6 +9,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# A release's PyO3 refuses to build against a Python newer than it knows.
+# These tests run no Python, so let every tree build against any.
+export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 # Runs format-compat test $2 of source tree $1, built into target directory

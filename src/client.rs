@@ -340,7 +340,7 @@ impl AnvilRustClient {
 
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             let channel = inner.runtime.block_on(async {
                 let endpoint = tonic::transport::Endpoint::from_shared(format!(
                     "http://{}",
@@ -381,7 +381,7 @@ impl AnvilRustClient {
 
     fn stop(&self, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.heartbeat_running.store(false, Ordering::SeqCst);
             if let Some(handle) = inner.heartbeat_handle.lock().unwrap().take() {
                 let _ = inner.runtime.block_on(handle);
@@ -405,9 +405,9 @@ impl AnvilRustClient {
     fn __exit__(
         &self,
         py: Python<'_>,
-        _exc_type: Option<PyObject>,
-        _exc_val: Option<PyObject>,
-        _exc_tb: Option<PyObject>,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
     ) -> PyResult<()> {
         self.stop(py)
     }
@@ -437,7 +437,7 @@ impl AnvilRustClient {
     ) -> PyResult<(Vec<RustMessage>, bool, i64)> {
         let inner = self.inner.clone();
         let q = queue.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::ClaimRequest {
@@ -478,7 +478,7 @@ impl AnvilRustClient {
         steal_pending_threshold: i64,
     ) -> PyResult<(Vec<RustMessage>, String, i32, bool, i64)> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::ClaimRequest {
@@ -548,7 +548,7 @@ impl AnvilRustClient {
             }
         }
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::CompleteRequest {
@@ -587,7 +587,7 @@ impl AnvilRustClient {
             ));
         }
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::RenewClaimsRequest {
@@ -634,7 +634,7 @@ impl AnvilRustClient {
             }
         }
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::CompleteRequest {
@@ -684,7 +684,7 @@ impl AnvilRustClient {
             }
         }
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::CompleteRequest {
@@ -748,7 +748,7 @@ impl AnvilRustClient {
             })
             .collect();
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::CompleteRequest {
@@ -793,7 +793,7 @@ impl AnvilRustClient {
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<String> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::PushRequest {
@@ -820,7 +820,7 @@ impl AnvilRustClient {
         payloads: Vec<Vec<u8>>,
     ) -> PyResult<Vec<String>> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::PushRequest {
@@ -850,9 +850,9 @@ impl AnvilRustClient {
     fn claim_and_complete(
         &self,
         py: Python<'_>,
-        claim_request: PyObject,
-        complete_request: Option<PyObject>,
-    ) -> PyResult<PyObject> {
+        claim_request: Py<PyAny>,
+        complete_request: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         // This method accepts Python dicts and returns a Python dict.
         // For now, expose the raw unified API. The Python wrapper can
         // build the dicts.
@@ -873,7 +873,7 @@ impl AnvilRustClient {
         keys: Vec<String>,
     ) -> PyResult<HashMap<String, Vec<u8>>> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::StateGetRequest { namespace, keys };
@@ -896,7 +896,7 @@ impl AnvilRustClient {
         deletes: Option<Vec<String>>,
     ) -> PyResult<(i32, i32)> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::StatePutRequest {
@@ -930,7 +930,7 @@ impl AnvilRustClient {
         max_deliveries: Option<u32>,
     ) -> PyResult<bool> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::CreateQueueRequest {
@@ -956,7 +956,7 @@ impl AnvilRustClient {
         #[allow(unused)] force: bool,
     ) -> PyResult<(bool, i32)> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::DeleteQueueRequest { queue };
@@ -971,9 +971,9 @@ impl AnvilRustClient {
     }
 
     #[pyo3(signature = (queue=None))]
-    fn get_stats(&self, py: Python<'_>, queue: Option<String>) -> PyResult<PyObject> {
+    fn get_stats(&self, py: Python<'_>, queue: Option<String>) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
-        let stats = py.allow_threads(move || {
+        let stats = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::GetStatsRequest {
@@ -1023,7 +1023,7 @@ impl AnvilRustClient {
         ids_only: bool,
     ) -> PyResult<(Vec<DeadLetter>, Option<String>)> {
         let inner = self.inner.clone();
-        let resp = py.allow_threads(move || {
+        let resp = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::ListDeadLettersRequest {
@@ -1069,9 +1069,9 @@ impl AnvilRustClient {
         queue: String,
         msg_ids: Vec<String>,
         reopen: bool,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
-        let resp = py.allow_threads(move || {
+        let resp = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::RedriveDeadLettersRequest {
@@ -1105,9 +1105,9 @@ impl AnvilRustClient {
         py: Python<'_>,
         queue: String,
         msg_ids: Vec<String>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
-        let resp = py.allow_threads(move || {
+        let resp = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::PurgeDeadLettersRequest { queue, msg_ids };
@@ -1130,7 +1130,7 @@ impl AnvilRustClient {
 
     fn mark_queue_finished(&self, py: Python<'_>, queue: String) -> PyResult<bool> {
         let inner = self.inner.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::MarkQueueFinishedRequest { queue };
@@ -1144,9 +1144,9 @@ impl AnvilRustClient {
         })
     }
 
-    fn is_queue_finished(&self, py: Python<'_>, queue: String) -> PyResult<PyObject> {
+    fn is_queue_finished(&self, py: Python<'_>, queue: String) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
-        let resp = py.allow_threads(move || {
+        let resp = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::IsQueueFinishedRequest { queue };
@@ -1179,9 +1179,9 @@ impl AnvilRustClient {
         num_partitions: i32,
         max_pending_per_partition: u64,
         max_deliveries: Option<u32>,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
-        let resp = py.allow_threads(move || {
+        let resp = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::CreateQueueGroupRequest {
@@ -1204,9 +1204,9 @@ impl AnvilRustClient {
         Ok(dict.into())
     }
 
-    fn is_group_finished(&self, py: Python<'_>, group_name: String) -> PyResult<PyObject> {
+    fn is_group_finished(&self, py: Python<'_>, group_name: String) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
-        let resp = py.allow_threads(move || {
+        let resp = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::IsGroupFinishedRequest { group_name };
@@ -1236,9 +1236,9 @@ impl AnvilRustClient {
         Ok(dict.into())
     }
 
-    fn get_group_stats(&self, py: Python<'_>, group_name: String) -> PyResult<PyObject> {
+    fn get_group_stats(&self, py: Python<'_>, group_name: String) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
-        let resp = py.allow_threads(move || {
+        let resp = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::GetGroupStatsRequest { group_name };
@@ -1271,9 +1271,9 @@ impl AnvilRustClient {
         Ok(dict.into())
     }
 
-    fn mark_group_finished(&self, py: Python<'_>, group_name: String) -> PyResult<PyObject> {
+    fn mark_group_finished(&self, py: Python<'_>, group_name: String) -> PyResult<Py<PyAny>> {
         let inner = self.inner.clone();
-        let resp = py.allow_threads(move || {
+        let resp = py.detach(move || {
             inner.runtime.block_on(async {
                 let mut client = inner.get_client()?;
                 let request = proto::MarkGroupFinishedRequest { group_name };
