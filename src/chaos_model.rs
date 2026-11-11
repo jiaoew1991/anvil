@@ -333,7 +333,8 @@ mod tests {
                 .storage
                 .recover_expired_claims(NEVER_SECS, NEVER_SECS, Some(&live))
                 .await
-                .unwrap();
+                .unwrap()
+                .len();
             let mut dead: Vec<(&'static str, ClaimMessage)> =
                 std::mem::take(&mut self.model.held[w]);
             self.log

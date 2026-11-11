@@ -443,6 +443,7 @@ impl AnvilService {
                     .group_partitions(&group.group_name, &assigned)
                     .await
                     .map_err(|e| storage_status("Claim(group)", e))?;
+                let in_flight = self.state.group_claims.read().await;
                 self.state
                     .own_partitions(
                         partitions.iter().map(|(_, queue)| queue.as_str()),
@@ -461,6 +462,7 @@ impl AnvilService {
                     )
                     .await
                     .map_err(|e| storage_status("Claim(group)", e))?;
+                drop(in_flight);
 
                 let messages: Vec<ClaimMessage> =
                     claimed.iter().map(Self::to_claim_message).collect();
@@ -1353,49 +1355,138 @@ mod tests {
         assert!(claim("b", 0).await.unwrap().upstream_drained);
     }
 
-    /// Goal: a dead worker's partition passes to its successor only with
-    /// its claims. Method: under a running recovery task, lease a claims
-    /// the one message of partition 0 and never heartbeats; lease b, kept
-    /// alive, claims the partition until it is no longer refused. Its first
-    /// claim that succeeds returns the message a held, redelivered.
+    /// Goal: the partition of a worker that died or got stuck passes to
+    /// its successor with every claim the worker held, so the worker can no
+    /// longer commit behind the successor's back. Method: under a running
+    /// recovery task, lease a claims the two messages of partition 0 one
+    /// after the other and holds them, with a lease that expires (dead) or
+    /// under a live lease whose first claim ages out while the second is
+    /// still young (stuck); lease b, kept alive, claims the partition until
+    /// it is no longer refused. It gets both messages, redelivered, and a's
+    /// acks of them, with the state they carry, are refused.
     #[tokio::test]
-    async fn test_recovery_hands_a_dead_owners_partition_over() {
+    async fn test_recovery_hands_a_lost_owners_partition_over() {
         const HANDOVER_DEADLINE: Duration = Duration::from_secs(10);
-        // Lease a must expire in real time.
+        const TIMEOUT_SECS: f64 = 0.3;
+        // The timeouts must run out in real time.
+        let _clock = SimClock::acquire();
+        let dead = AnvilConfig {
+            lease_timeout_secs: TIMEOUT_SECS,
+            recovery_interval_secs: 0.05,
+            ..AnvilConfig::default()
+        };
+        let stuck = AnvilConfig {
+            claim_age_timeout_secs: TIMEOUT_SECS,
+            recovery_interval_secs: 0.05,
+            ..AnvilConfig::default()
+        };
+        for (case, config) in [("dead", dead), ("stuck", stuck)] {
+            let (service, storage) = create_service().await;
+            let mut recovery = RecoveryTask::new(storage.clone(), service.state.clone(), config);
+            recovery.start();
+            storage.create_queue_group("g", 1, 0, None).await.unwrap();
+            let messages = [Message::new(b"x".to_vec()), Message::new(b"y".to_vec())];
+            storage.push_messages("g_p0", &messages).await.unwrap();
+
+            service.state.update_lease("a");
+            let mut held = group_claim(&service, "a", 0).await.unwrap().messages;
+            // The second claim is still young when the first ages out.
+            tokio::time::sleep(Duration::from_secs_f64(TIMEOUT_SECS * 0.7)).await;
+            held.extend(group_claim(&service, "a", 0).await.unwrap().messages);
+            assert_eq!(held.len(), 2, "{case}");
+
+            // From b's first claim on, a holds nothing it could still ack.
+            let started = std::time::Instant::now();
+            let mut taken = loop {
+                assert!(started.elapsed() < HANDOVER_DEADLINE, "{case}: no handover");
+                service.state.update_lease("b");
+                match group_claim(&service, "b", 0).await {
+                    Ok(response) => break response.messages,
+                    Err(status) => assert_status(&status, Code::Aborted, "partition_owned"),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            for message in &held {
+                let late = CompleteRequest {
+                    upstream_queue: "g_p0".to_string(),
+                    msg_ids: vec![message.msg_id.clone()],
+                    claim_tokens: vec![message.claim_token.clone()],
+                    worker_id: "a".to_string(),
+                    lease_id: "a".to_string(),
+                    action: Some(complete_request::Action::Ack(AckAction {})),
+                    state: Some(StateUpdate {
+                        namespace: "sums".to_string(),
+                        puts: HashMap::from([("p0".to_string(), b"stale".to_vec())]),
+                        deletes: Vec::new(),
+                    }),
+                };
+                let status = service.complete(Request::new(late)).await.unwrap_err();
+                assert_eq!(
+                    status.code(),
+                    Code::FailedPrecondition,
+                    "{case}: {status:?}"
+                );
+            }
+            taken.extend(group_claim(&service, "b", 0).await.unwrap().messages);
+            recovery.stop_async().await;
+            assert_eq!(taken.len(), held.len(), "{case}");
+            for message in &taken {
+                assert_eq!(message.delivery_count, 2, "{case}");
+            }
+            let state = storage
+                .state_get_batch("sums", &["p0".to_string()])
+                .await
+                .unwrap();
+            assert!(state.is_empty(), "{case}: a lost owner wrote {state:?}");
+        }
+    }
+
+    /// Goal: a dead owner's partition is not freed while one of its group
+    /// claims may still be storing a claim. Method: lease a owns partition
+    /// 0 and dies under a running recovery task while the test holds the
+    /// guard a group claim holds; for many recovery intervals lease b gets
+    /// no answer or a refusal, and once the guard is dropped it takes the
+    /// partition.
+    #[tokio::test]
+    async fn test_recovery_waits_for_group_claims_in_flight() {
+        const HANDOVER_DEADLINE: Duration = Duration::from_secs(10);
+        const ATTEMPT_DEADLINE: Duration = Duration::from_millis(50);
+        // The lease must expire in real time.
         let _clock = SimClock::acquire();
         let (service, storage) = create_service().await;
         let config = AnvilConfig {
-            lease_timeout_secs: 0.2,
-            recovery_interval_secs: 0.05,
+            lease_timeout_secs: 0.1,
+            recovery_interval_secs: 0.02,
             ..AnvilConfig::default()
         };
         let mut recovery = RecoveryTask::new(storage.clone(), service.state.clone(), config);
         recovery.start();
         storage.create_queue_group("g", 1, 0, None).await.unwrap();
-        storage
-            .push_messages("g_p0", &[Message::new(b"x".to_vec())])
-            .await
-            .unwrap();
-
         service.state.update_lease("a");
-        let held = group_claim(&service, "a", 0).await.unwrap();
-        assert_eq!(held.messages.len(), 1);
+        group_claim(&service, "a", 0).await.unwrap();
+
+        let in_flight = service.state.group_claims.read().await;
+        let held_until = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < held_until {
+            service.state.update_lease("b");
+            // No answer while the recovery pass queues ahead of the claim.
+            if let Ok(answer) = timeout(ATTEMPT_DEADLINE, group_claim(&service, "b", 0)).await {
+                assert_status(&answer.unwrap_err(), Code::Aborted, "partition_owned");
+            }
+        }
+        drop(in_flight);
+
         let started = std::time::Instant::now();
-        let taken = loop {
+        loop {
+            assert!(started.elapsed() < HANDOVER_DEADLINE, "no handover");
             service.state.update_lease("b");
             match group_claim(&service, "b", 0).await {
-                Ok(response) => break response,
-                Err(status) => {
-                    assert_status(&status, Code::Aborted, "partition_owned");
-                    assert!(started.elapsed() < HANDOVER_DEADLINE, "never handed over");
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+                Ok(_) => break,
+                Err(status) => assert_status(&status, Code::Aborted, "partition_owned"),
             }
-        };
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         recovery.stop_async().await;
-        assert_eq!(taken.messages.len(), 1);
-        assert_eq!(taken.messages[0].msg_id, held.messages[0].msg_id);
-        assert_eq!(taken.messages[0].delivery_count, 2);
     }
 
     /// A push past a bounded queue's capacity is RESOURCE_EXHAUSTED, and the

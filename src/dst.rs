@@ -413,7 +413,8 @@ pub(crate) mod tests {
                         .storage
                         .recover_expired_claims(timeout_secs, timeout_secs, None)
                         .await
-                        .unwrap();
+                        .unwrap()
+                        .len();
                     if recovered > 0 {
                         // Reconcile: only keep claims that are still in storage's claimed set.
                         // Build a set of (queue, msg_id) pairs that are still claimed.
@@ -662,7 +663,8 @@ pub(crate) mod tests {
         let recovered = storage
             .recover_expired_claims(60.0, 60.0, None)
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(recovered, 10);
 
         let meta = storage.get_queue_stats("q").await.unwrap();

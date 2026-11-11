@@ -31,6 +31,7 @@ mod tests {
     use crate::server::AnvilBrokerInner;
     use crate::service::proto::anvil_client::AnvilClient;
     use crate::service::proto::*;
+    use crate::storage::AnvilStorage;
     use crate::types::{AnvilConfig, SimClock};
 
     /// Short enough that a test waits a fraction of a second for a lease or
@@ -596,6 +597,58 @@ mod tests {
         assert_eq!((s.pending_count, s.claimed_count), (0, 1));
         let acked = ack(&client, queue, &[&claimed[0]], "worker", &lease.lease_id).await;
         assert!(acked.unwrap().get_ref().success);
+    }
+
+    /// Goal: a broker that takes over a store reclaims the claims of the
+    /// one before it starts serving, so none of them acks behind the back
+    /// of a worker of the new broker. Method: claim under one broker, stop
+    /// it, and open its store under a second whose recovery task never
+    /// gets to run; its first claim returns the message, the delivery count
+    /// not raised, and the ack of the first broker's claim is refused.
+    #[tokio::test]
+    async fn test_grpc_restart_reclaims_claims_before_serving() {
+        let _clock = SimClock::acquire();
+        let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let start = || async {
+            let storage = AnvilStorage::open("db".to_string(), object_store.clone())
+                .await
+                .unwrap();
+            let config = AnvilConfig {
+                host: "127.0.0.1".to_string(),
+                recovery_interval_secs: LONG_TIMEOUT_SECS,
+                ..AnvilConfig::default()
+            };
+            let storage = Arc::new(storage);
+            let mut broker = AnvilBrokerInner::new_with_storage(config, storage.clone())
+                .await
+                .unwrap();
+            let port = broker.start().await.unwrap();
+            let client = AnvilClient::connect(format!("http://127.0.0.1:{port}"))
+                .await
+                .unwrap();
+            (broker, storage, client)
+        };
+        let queue = "e2e";
+
+        let (mut first, storage, client) = start().await;
+        create_queue(&client, queue).await;
+        push(&client, queue, &[b"work"]).await;
+        let old = Heartbeat::open(&client, "old").await;
+        let held = claim(&client, queue, "old", &old.lease_id, 1).await;
+        assert_eq!(held.len(), 1);
+        // A clean stop, so the claim is in the store the second broker opens.
+        first.stop_async().await;
+        storage.close().await.unwrap();
+
+        let (_second, _storage, client) = start().await;
+        let new = Heartbeat::open(&client, "new").await;
+        let redelivered = claim(&client, queue, "new", &new.lease_id, 1).await;
+        assert_eq!(redelivered.len(), 1);
+        assert_eq!(redelivered[0].msg_id, held[0].msg_id);
+        assert_eq!(redelivered[0].delivery_count, 1);
+        let late = ack(&client, queue, &[&held[0]], "old", &old.lease_id).await;
+        assert_eq!(late.unwrap_err().code(), tonic::Code::FailedPrecondition);
     }
 
     /// Goal: when a worker's `HeartbeatStream` goes away, its claims return to

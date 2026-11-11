@@ -47,6 +47,12 @@ pub struct AnvilState {
     /// itself: two would each see part of a key. One lock over the table,
     /// so a claim takes all the partitions it names or none.
     partition_owners: Mutex<HashMap<String, String>>,
+    /// Held shared by a group claim from its ownership check until its
+    /// claims are stored, and exclusively, for an instant, by a recovery
+    /// pass once it has pruned the dead leases. A dead lease passes no
+    /// ownership check, so the pass then sees every claim such a lease will
+    /// ever make on a partition, and may free the partition after it.
+    pub(crate) group_claims: tokio::sync::RwLock<()>,
 }
 
 impl AnvilState {
@@ -55,6 +61,7 @@ impl AnvilState {
             queues: DashMap::new(),
             leases: DashMap::new(),
             partition_owners: Mutex::new(HashMap::new()),
+            group_claims: tokio::sync::RwLock::new(()),
         }
     }
 
@@ -156,13 +163,36 @@ impl AnvilState {
 
     /// Frees the partitions of dead leases: those absent from `recovered`,
     /// the leases the recovery pass just run took for live, and not opened
-    /// since. That pass reclaimed every claim of such a lease, so its worker
-    /// can settle no message behind the next owner's back. Until then the
-    /// partition stays owned, as an ack of the dead lease may still land.
+    /// since. The pass reclaimed every claim such a lease made, group
+    /// claims in flight included (see `group_claims`), so its worker can
+    /// settle no message behind the next owner's back. Until then the
+    /// partitions stay owned, as an ack of the dead lease may still land.
     pub fn release_dead_owners(&self, recovered: &HashMap<String, Instant>) {
         self.partition_owners.lock().unwrap().retain(|_, lease_id| {
             recovered.contains_key(lease_id) || self.leases.contains_key(lease_id)
         });
+    }
+
+    /// Ends the leases of stuck owners: those that let a claim on a
+    /// partition they own age out, `reclaimed` being the queue and lease of
+    /// each claim a recovery pass took back. The message can only be
+    /// redelivered to the partition's owner, so a worker that stays stuck
+    /// would hold its partitions for good.
+    ///
+    /// Freeing the partitions here would not do: the worker may hold
+    /// younger claims on them, whose acks would land behind the next
+    /// owner's back. With its lease ended the worker is dead to the broker:
+    /// the next recovery pass reclaims everything it holds and frees its
+    /// partitions, and its heartbeat is given a new lease.
+    pub fn end_stuck_leases(&self, reclaimed: &[(String, String)]) {
+        let owners = self.partition_owners.lock().unwrap();
+        for (queue, lease_id) in reclaimed {
+            if owners.get(queue) == Some(lease_id) && self.leases.remove(lease_id).is_some() {
+                tracing::warn!(
+                    "Ended lease {lease_id}: its claim on partition queue {queue} aged out"
+                );
+            }
+        }
     }
 
     /// Get a snapshot of all leases (lease_id -> last_seen).

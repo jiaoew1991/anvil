@@ -814,6 +814,7 @@ mod tests {
             .recover_expired_claims(LONG_TIMEOUT_SECS, LONG_TIMEOUT_SECS, Some(&HashMap::new()))
             .await
             .unwrap()
+            .len()
     }
 
     // =====================================================================
@@ -1014,6 +1015,7 @@ mod tests {
                     .recover_expired_claims(LEASE_TIMEOUT_SECS, LONG_TIMEOUT_SECS, Some(&snapshot))
                     .await
                     .unwrap()
+                    .len()
             }
         };
 
@@ -1102,6 +1104,7 @@ mod tests {
                     .recover_expired_claims(lease_timeout, claim_age, Some(&snapshot))
                     .await
                     .unwrap()
+                    .len()
             }
         };
         let claim_one = |lease: &'static str| storage.claim_messages(queue, 1, "worker", lease);
@@ -1185,7 +1188,8 @@ mod tests {
                 Some(&leases.lease_snapshot()),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(recovered, 1, "a dead lease outlived its timeout");
     }
 
@@ -1224,7 +1228,8 @@ mod tests {
                 Some(&leases.lease_snapshot()),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .len();
         assert_eq!(recovered, 0, "a live worker's claim was reclaimed");
     }
 
