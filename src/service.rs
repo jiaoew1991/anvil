@@ -1101,7 +1101,7 @@ impl Anvil for AnvilService {
 mod tests {
     use super::*;
     use crate::recovery::RecoveryTask;
-    use crate::types::AnvilConfig;
+    use crate::types::{AnvilConfig, SimClock};
     use tonic::Code;
 
     async fn create_service() -> (AnvilService, Arc<AnvilStorage>) {
@@ -1361,6 +1361,8 @@ mod tests {
     #[tokio::test]
     async fn test_recovery_hands_a_dead_owners_partition_over() {
         const HANDOVER_DEADLINE: Duration = Duration::from_secs(10);
+        // Lease a must expire in real time.
+        let _clock = SimClock::acquire();
         let (service, storage) = create_service().await;
         let config = AnvilConfig {
             lease_timeout_secs: 0.2,
