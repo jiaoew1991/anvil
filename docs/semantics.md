@@ -127,7 +127,7 @@ A failed RPC's status code tells the caller what to do next:
 |------|---------|-------------------|
 | `FAILED_PRECONDITION` | The caller no longer holds a claim it acks, nacks, forwards, scatters or renews: its token, lease or worker does not match, the message is no longer claimed, or another settlement holds it. Or a redrive into a queue marked finished. Or a group claim on a lease the broker no longer holds (`lease_not_live`) | Drop the message; another worker owns it or it is done. A redrive: the queue's consumers may have exited. A group claim: the worker's claims are lost, so it reloads its state and claims on its new lease |
 | `NOT_FOUND` | The queue or queue group does not exist | Create it first |
-| `INVALID_ARGUMENT` | The request is malformed: claim tokens that do not pair up with message ids, a message id listed twice in one ack, nack, renewal, redrive or purge, an empty queue name (push, claim, create, forward target, dead letter calls), a state update with an empty namespace, a group claim that names no partition or one outside the group, a plain claim on a partition queue of a group, a redrive or purge of no or more than 1000 dead letters, a list limit outside 1 to 1000 | Fix the request |
+| `INVALID_ARGUMENT` | The request is malformed: claim tokens that do not pair up with message ids, a message id listed twice in one ack, nack, renewal, redrive or purge, an empty queue name (push, claim, create, forward target, dead letter calls), a state update with an empty namespace, a group claim that names no partition or one outside the group, a plain claim on a partition queue of a group or its deletion, a redrive or purge of no or more than 1000 dead letters, a list limit outside 1 to 1000 | Fix the request |
 | `ABORTED` | A group claim named a partition another worker's live lease consumes (message starts with `partition_owned`) | Retry later: the partition is freed once that lease is dead and its claims are reclaimed. If the other worker is alive, the assignment gives one partition to two workers |
 | `RESOURCE_EXHAUSTED` | A bounded queue is full (message starts with `QueueFull`) | Back off and retry |
 | `UNAVAILABLE` | The broker's database is closed for good: a newer broker opened it and fenced this one, or a storage background task failed | Fail over to the current broker; do not retry this one |
@@ -199,8 +199,10 @@ result needs every input must not emit it when that number is not zero.
 
 A partition is consumed only through its group: a plain `claim` on a
 partition queue would go around its owner, and is refused with
-`INVALID_ARGUMENT`. In every other respect a partition queue is an ordinary
-queue: it is pushed to, inspected and its dead letters handled by name.
+`INVALID_ARGUMENT`. So is the deletion of a partition queue: the group, the
+ownership of its consumers and their state would outlive it. In every other
+respect a partition queue is an ordinary queue: it is pushed to, inspected
+and its dead letters handled by name.
 
 ---
 
